@@ -1,0 +1,67 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ListExportPrefix",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<export-bucket>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "<export-prefix>*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "ReadExportFiles",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<export-bucket>/<export-prefix>*"
+    },
+    {
+      "Sid": "CreateAndWriteTheTable",
+      "Effect": "Allow",
+      "Action": [
+        "s3tables:GetTableBucket",
+        "s3tables:ListNamespaces",
+        "s3tables:GetNamespace",
+        "s3tables:CreateNamespace",
+        "s3tables:ListTables",
+        "s3tables:GetTable",
+        "s3tables:CreateTable",
+        "s3tables:GetTableMetadataLocation",
+        "s3tables:UpdateTableMetadataLocation",
+        "s3tables:GetTableData",
+        "s3tables:PutTableData"
+      ],
+      "Resource": [
+        "arn:aws:s3tables:<region>:<account-id>:bucket/<table-bucket>",
+        "arn:aws:s3tables:<region>:<account-id>:bucket/<table-bucket>/table/*"
+      ]
+    },
+    {
+      "Sid": "ReadWriteStateJson",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
+      "Resource": "arn:aws:s3:::<state-bucket>/<state-key>"
+    },
+    {
+      "Sid": "StateJsonMissingIs404NotDenied",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<state-bucket>",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "<state-key>*"
+          ]
+        }
+      }
+    }
+  ]
+}

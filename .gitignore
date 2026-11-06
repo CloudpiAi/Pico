@@ -218,3 +218,41 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---------------------------------------------------------------
+# Pico / CloudPi additions (from PurpleDataInc-TX/pico .gitignore)
+# ---------------------------------------------------------------
+
+# Secrets and local env: never commit real values
+.env.*
+.env.local
+!.env.example
+pico_client_secret*
+*.pem
+*.key
+
+# Analyst configs with real values (the *.example copies are committed)
+deploy/analyst/agent.yml
+deploy/analyst/analyst.yml
+
+# Local Claude Code settings
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Runtime output and logs
+output/
+logs/
+
+# Test artifacts
+tools/rebrand/baseline/junit-pico.xml
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# CloudPi Agent: .env holds the Gemini key and Slack tokens (.env.example is committed);
+# cloudpi-agent-iam/ holds the IAM files filled with real account ids (guide step 3)
+cloudpi-agent-iam/
