@@ -1,0 +1,50 @@
+# Runs the CloudPi Agent (standalone) on the customer's EC2. Setup and first run: CUSTOMER-SETUP-GUIDE.md.
+# One container, one process: data collection, the Lambda, notices and alerts, and Pico's Slack agent when both
+# Slack tokens are in .env. It opens no port (Slack is reached outbound). Host networking keeps the EC2's instance
+# role reachable with IMDSv2 hop limit 1; never add `ports:`.
+services:
+  agent:
+    # Required: the image tag to run, e.g. AGENT_IMAGE_TAG=Cloudpi_agent_nightly_2026-11-06-1200 in .env.
+    image: cloudpi1/cloudpi:${AGENT_IMAGE_TAG:?set AGENT_IMAGE_TAG in .env to the image tag to run}
+    container_name: cloudpi-agent
+    pull_policy: always
+    # The agent exits for a restart when Slack has been down 10 minutes or the scheduler is stuck (see the README's
+    # health table); this brings it back.
+    restart: unless-stopped
+    # A small init as PID 1: forwards `docker compose stop` to the agent and reaps a load's child processes.
+    init: true
+    env_file:
+      - ./.env
+    network_mode: host
+    volumes:
+      - agent_data:/data
+    read_only: true
+    # Owner and mode are set explicitly: without them Docker remounts these as root 755 after a restart,
+    # and the agent (uid 10001) can no longer write its logs and crashes.
+    tmpfs:
+      - /tmp:noexec,nosuid,nodev,mode=1777
+      - /pico-workspace:noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700
+      - /home/pico/.pico/data:noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700
+      - /home/pico/.pico/sessions:noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700
+      - /home/pico/.pico/logs:noexec,nosuid,nodev,uid=10001,gid=10001,mode=0700
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # `docker compose stop`: the agent stops within about 5 s (it waits up to 15 s for Slack); 30 s leaves room.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: 50m
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          cpus: '${AGENT_CPUS:-2}'
+          memory: ${AGENT_MEMORY:-3G}
+          pids: 512
+
+volumes:
+  agent_data:
+    driver: local
