@@ -1,0 +1,4 @@
+question,sql
+How many schools are in the California school directory?,SELECT COUNT(DISTINCT CDSCode) AS school_count FROM schools
+How many charter schools are in the California school directory?,SELECT SUM(Charter) AS charter_school_count FROM schools
+How many magnet schools are in the California school directory?,SELECT SUM(Magnet) AS magnet_school_count FROM schools

@@ -1,0 +1,8 @@
+{
+  "avro.duckdb_extension.gz@v1.5.2/linux_amd64": "c61ad7f37ec69fc433095ff07da64f957cbb43618ddd33b6ebcae6f9629bee81",
+  "aws.duckdb_extension.gz@v1.5.2/linux_amd64": "fb0690a653b9ff63117305d92df6e526d8c7ac86a87305fe5c06c03f86d1a3c7",
+  "duckdb-1.5.2-cp312-cp312-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl": "c99ef73a277c8921bc0a1f16dee38d924484251d9cfd20951748c20fcd5ed855",
+  "duckdb_version": "1.5.2",
+  "httpfs.duckdb_extension.gz@v1.5.2/linux_amd64": "bc1791dcbd424fc63c51713ff18be6d5d9c81d89cf9b9ff8991fc01b33cec1a1",
+  "iceberg.duckdb_extension.gz@v1.5.2/linux_amd64": "3cf8e0c22eca11c82d88ed0f380b64d917e3dea36b094b82752c4a9b77924081"
+}

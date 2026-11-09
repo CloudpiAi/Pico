@@ -1,0 +1,2190 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Chat-related commands for the Pico CLI.
+This module provides a class to handle all chat-related commands including
+chat execution, session management, and display utilities.
+"""
+
+import asyncio
+import json
+import platform
+import re
+import subprocess
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+
+from rich.panel import Panel
+from rich.syntax import Syntax
+
+from pico.agent.node.chat_agentic_node import ChatAgenticNode
+from pico.cli.action_display.display import ActionHistoryDisplay
+from pico.cli.action_display.renderers import render_assistant_response_markdown
+from pico.cli.cli_styles import (
+    CODE_THEME,
+    print_error,
+    print_success,
+    render_compact_progress_line,
+    render_compact_summary_panel,
+)
+from pico.cli.execution_state import ExecutionInterrupted, PendingInputQueue, auto_submit_interaction
+from pico.cli.list_selector_app import ListItem, ListSelectorApp
+from pico.schemas.action_history import INTERRUPTED_ACTION_TYPE, ActionHistory, ActionRole, ActionStatus
+from pico.schemas.node_models import SQLContext
+from pico.utils.loggings import get_logger
+from pico.utils.terminal_utils import EscapeGuard, interrupt_on_escape
+from pico.utils.time_utils import format_local_time
+
+
+@contextmanager
+def _noop_escape_guard():
+    """Context manager that yields an inert :class:`EscapeGuard`.
+
+    Used in TUI mode where prompt_toolkit owns stdin and installing the
+    termios-based ESC listener would conflict. The inert guard's
+    ``paused()`` is a no-op so callers written against the termios path
+    (e.g. ``_make_input_collector``) continue to work unchanged.
+    """
+    yield EscapeGuard()
+
+
+if TYPE_CHECKING:
+    from pico.agent.node.agentic_node import AgenticNode
+    from pico.cli.repl import DatusCLI
+
+logger = get_logger(__name__)
+
+_MODEL_CONFIG_ERROR_PATTERNS = re.compile(
+    r"no active model configured|not found in agent_config|unsupported model type"
+    r"|api.?key|invalid.{0,10}key",
+    re.IGNORECASE,
+)
+_AUTH_ERROR_PATTERNS = re.compile(r"unauthorized|authentication", re.IGNORECASE)
+_MODEL_CONTEXT_PATTERNS = re.compile(r"model|llm|provider|openai|anthropic|gemini|codex", re.IGNORECASE)
+
+
+def _is_model_config_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a model configuration or auth error."""
+    msg = str(exc)
+    if isinstance(exc, KeyError):
+        msg = exc.args[0] if exc.args else ""
+    msg = str(msg)
+    return bool(
+        _MODEL_CONFIG_ERROR_PATTERNS.search(msg)
+        or (_AUTH_ERROR_PATTERNS.search(msg) and _MODEL_CONTEXT_PATTERNS.search(msg))
+    )
+
+
+def _drop_if_matches_final(
+    pending: Optional[ActionHistory],
+    final_action: ActionHistory,
+    incremental_actions: list,
+) -> Optional[ActionHistory]:
+    """Reconcile a pending ASSISTANT action with an incoming *_response action.
+
+    The model layer tags the tail LLM text with is_thinking=False and the node
+    wraps the same text into a *_response action. When both are present we drop
+    the pending entry so the final response is not rendered twice. If the texts
+    differ (e.g. LLM emitted thinking before any tool call, then the node built
+    the final response from a later turn), flush the pending entry into the
+    incremental stream so the thinking is preserved.
+    """
+    if pending is None:
+        return None
+    # Reuse ChatCommands._action_response_text so both sides extract the body
+    # through the same string-guarded helper (response | raw_output) instead
+    # of comparing raw_output vs response asymmetrically.
+    pending_text = ChatCommands._action_response_text(pending)
+    final_text = ChatCommands._action_response_text(final_action)
+    # Drop the pending entry when it has nothing to contribute (empty text)
+    # or when its body duplicates the final response exactly.
+    if not pending_text or pending_text == final_text:
+        return None
+    incremental_actions.append(pending)
+    return None
+
+
+class ChatCommands:
+    """Handles all chat-related commands and functionality."""
+
+    def __init__(self, cli_instance: "DatusCLI"):
+        """Initialize with reference to the CLI instance for shared resources."""
+        self.cli = cli_instance
+        self.console = cli_instance.console
+
+        # Chat state management - unified node management
+        self.current_node: ChatAgenticNode | None = None  # Can be ChatAgenticNode or GenSQLAgenticNode
+        self.current_subagent_name: str | None = None  # Track current subagent name
+        # Serializes every ``current_node`` check-create-publish sequence.
+        # ``DatusCLI._warm_bang_node`` builds the default node from the
+        # background init thread while the input thread may start a chat turn,
+        # and node construction takes long enough (tool setup, skill/web/MCP
+        # mounting) for both to observe ``current_node is None`` and each
+        # publish its own node — the later writer then orphans the session the
+        # running turn is streaming into. Reentrant so a holder can call the
+        # nested node helpers.
+        self._node_lock = threading.RLock()
+        self.chat_history = []
+        self.last_actions = []
+        self.all_turn_actions: List[Tuple[str, List[ActionHistory]]] = []
+        self._trace_verbose = False  # toggle state for post-run Ctrl+O
+        # Live handle to the active streaming context, consumed by the TUI
+        # to route ESC (interrupt) and Ctrl+O (verbose toggle) key bindings
+        # to the currently running agent loop. ``None`` when idle.
+        self.current_streaming_ctx = None
+        # In-progress turn's ``incremental_actions`` reference, published by
+        # the chat stream so :meth:`_full_screen_reprint` (triggered by
+        # ``DatusCLI._reflow_for_sidebar`` when the todo sidebar appears /
+        # disappears) can replay the running turn after wiping the buffer.
+        # Without this, the buffer clear loses everything the user has
+        # streamed since the last finished turn. ``None`` while idle; reset
+        # when each turn completes so a stale reference never re-renders.
+        self._current_incremental_actions: Optional[List[ActionHistory]] = None
+
+    def _streaming_key_callbacks(self, streaming_ctx) -> dict[bytes, Callable[[], None]]:
+        """Return shortcuts handled by the legacy mid-stream stdin listener."""
+        return {
+            b"\x0f": streaming_ctx.toggle_verbose,
+            b"\x10": self.cli._cycle_permission_mode,
+        }
+
+    def update_chat_node_tools(self):
+        """Update current node tools when datasource/database changes."""
+        if self.current_node and hasattr(self.current_node, "setup_tools"):
+            # Bind the rebuilt DB tools to the active database (e.g. after ``/database <db>``).
+            if hasattr(self.current_node, "active_database"):
+                self.current_node.active_database = getattr(self.cli.cli_context, "current_db_name", "") or ""
+            self.current_node.setup_tools()
+
+    @contextmanager
+    def node_transaction(self) -> Iterator[None]:
+        """Hold the node lock across a check-create-publish of ``current_node``.
+
+        Every caller that decides whether to build a node and then publishes
+        the result must run inside this block, so a concurrent builder either
+        waits and reuses the published node or observes the decision that won.
+        Callers outside this module (the web executor) use it too — the lock
+        itself stays private.
+        """
+        with self._node_lock:
+            yield
+
+    def _should_create_new_node(self, subagent_name: str = None) -> bool:
+        """Determine if a new node should be created."""
+        if self.current_node is None:
+            return True
+
+        if subagent_name:
+            # Create new node if switching from regular to subagent, or subagent changed
+            return self.current_subagent_name != subagent_name
+        else:
+            # Create new node only if switching from subagent to regular
+            return bool(self.current_subagent_name)
+
+    def _is_agent_switch(self, subagent_name: str = None) -> bool:
+        """Check if this is a node type switch (not a fresh start)."""
+        if self.current_node is None:
+            return False
+        effective_current = self.current_subagent_name or ""
+        effective_new = subagent_name or ""
+        return effective_current != effective_new
+
+    def _copy_session_for_switch(self, prev_session_id: str, new_node_name: str) -> Optional[str]:
+        """Copy session data from the previous node to a new session matching the new node's name prefix.
+
+        Uses :meth:`SessionManager.copy_session` so that the new session_id prefix
+        matches ``new_node_name`` and :meth:`_extract_node_type_from_session_id`
+        resolves the correct type on ``.resume``.
+
+        Args:
+            prev_session_id: Source session id to clone from.
+            new_node_name: Target node name (``get_node_name()``) — used as the
+                copied session id's prefix. Resolved via
+                :func:`pico.agent.node.node_factory.resolve_node_name` so the
+                copy happens before the new node is constructed.
+
+        Returns:
+            New session_id with the correct node-name prefix, or ``None`` when
+            the copy fails — callers should then let the new node generate a
+            fresh id eagerly in ``__init__``.
+        """
+        from pico.models.session_manager import SessionManager
+
+        try:
+            session_manager = SessionManager(self.cli.agent_config.session_dir, scope=self.cli.scope)
+            return session_manager.copy_session(prev_session_id, new_node_name)
+        except Exception as e:
+            logger.warning(f"Failed to copy session on agent switch, starting fresh: {e}")
+            return None
+
+    def _create_new_node(self, subagent_name: Optional[str] = None, session_id: Optional[str] = None) -> "AgenticNode":
+        """Create new node based on subagent_name and configuration.
+
+        Delegates to the shared node factory for actual node creation.
+
+        ``session_id`` is forwarded so the node's plan-mode state and
+        todolist (persisted under ``~/.pico/data/{project}/``) are
+        rehydrated *before* the first turn — used by the resume flow.
+        """
+        from pico.agent.node.node_factory import create_interactive_node
+
+        node = create_interactive_node(
+            subagent_name,
+            self.cli.agent_config,
+            node_id_suffix="_cli",
+            scope=self.cli.scope,
+            session_id=session_id,
+        )
+        self._attach_status_dirty_callback(node)
+        return node
+
+    def _attach_status_dirty_callback(self, node: "AgenticNode") -> None:
+        """Wire ``TokenUsageHook`` mid-turn refreshes to ``DatusApp.invalidate``.
+
+        The hook fires after every LLM call; without an explicit invalidate
+        the status bar would only repaint on the periodic timer tick, which
+        defeats the purpose of streaming the usage updates. Looked up
+        lazily so the callback works regardless of whether ``tui_app`` is
+        already built when the node is created.
+        """
+        if node is None:
+            return
+        cli = self.cli
+
+        def _on_status_dirty() -> None:
+            app = getattr(cli, "tui_app", None)
+            if app is None:
+                return
+            try:
+                app.invalidate()
+            except Exception:  # noqa: BLE001 — never crash the run loop
+                pass
+
+        try:
+            node._status_dirty_callback = _on_status_dirty
+        except Exception:  # noqa: BLE001
+            pass
+
+    def get_or_create_node(self, subagent_name: Optional[str] = None) -> "AgenticNode":
+        """Return the active node, publishing a new one under the node lock if needed.
+
+        The plain check-create-publish, for callers that do not carry the
+        interactive chat path's agent-switch handling (session copy,
+        ``caller_node_name``, turn-action reset). Owning the transaction here
+        keeps :attr:`_node_lock` and the node-creation internals inside this
+        class instead of being reassembled by callers in other modules.
+        """
+        with self.node_transaction():
+            if self._should_create_new_node(subagent_name):
+                self.current_node = self._create_new_node(subagent_name)
+                self.current_subagent_name = subagent_name if subagent_name else None
+            return self.current_node
+
+    def ensure_node_for_bang(self) -> Optional["AgenticNode"]:
+        """Return the current chat node, lazily creating a default one if needed.
+
+        The ``!<tool>`` handler enumerates and invokes tools from the live chat
+        node's ``tools`` list, but ``current_node`` is created lazily on the
+        first chat turn. This builds the regular (non-subagent) node up front —
+        the same node the next chat turn would reuse (``_should_create_new_node``
+        returns ``False`` once ``current_node`` is set and no subagent is
+        active) — so a ``!<tool>`` call works before any chat has happened.
+
+        The node is built *fully* on a local reference (base tools via
+        ``setup_tools`` plus the skill/bash/memory/web tools that are otherwise
+        mounted lazily at execution time) before it is published to
+        ``self.current_node``, so ``!`` autocomplete lists the complete tool set
+        and never observes a half-mounted node. Returns ``None`` when node
+        construction fails.
+
+        Runs under :meth:`node_transaction` because this is the one caller that
+        builds a node nobody asked for yet: a chat turn starting concurrently
+        must never have its own node replaced by this warm-up. The publish is
+        therefore also re-checked — a turn that won the race keeps its node and
+        the warm one is dropped.
+        """
+        with self.node_transaction():
+            if self.current_node is not None:
+                return self.current_node
+            try:
+                node = self._create_new_node(None)
+                if hasattr(node, "active_database"):
+                    node.active_database = getattr(self.cli.cli_context, "current_db_name", "") or ""
+                if hasattr(node, "setup_tools"):
+                    node.setup_tools()
+                # Mount the tools that are otherwise injected lazily during a turn
+                # (skill / bash / memory / web) so the ``!`` list is complete.
+                if hasattr(node, "_ensure_lazy_tools_mounted"):
+                    node._ensure_lazy_tools_mounted()
+                if self.current_node is not None:
+                    logger.debug("Bang-node warm dropped: a chat turn published its own node first")
+                    return self.current_node
+                self.current_subagent_name = None
+                self.current_node = node
+            except Exception as exc:  # noqa: BLE001 - never crash the REPL on a ! call
+                logger.error(f"Failed to create chat node for '!' tool execution: {exc}", exc_info=True)
+                # ``current_node`` was ``None`` on entry, so a non-None value here
+                # was published by a reentrant caller inside the build. Clearing
+                # it would orphan that node's session — the very failure this
+                # method's re-check exists to prevent.
+                return self.current_node
+            return self.current_node
+
+    def create_node_input(
+        self,
+        user_message: str,
+        current_node,
+        at_tables,
+        at_metrics,
+        at_sqls,
+        plan_mode: bool = False,
+    ):
+        """Create node input based on node type - shared logic for CLI and web.
+
+        Returns:
+            Tuple of (node_input, node_type_string) for backward compatibility.
+        """
+        from pico.agent.node.node_factory import create_node_input as _create_node_input
+
+        catalog, database, db_schema = self._resolve_database_context()
+        node_input = _create_node_input(
+            user_message=user_message,
+            node=current_node,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+            at_tables=at_tables,
+            at_metrics=at_metrics,
+            at_sqls=at_sqls,
+            plan_mode=plan_mode,
+        )
+        return node_input, current_node.type
+
+    def _resolve_database_context(self):
+        """Resolve catalog/database/schema for chat node input.
+
+        The CLI context is the active interactive state, but it starts empty
+        before connection initialization. Fall back to the live connector and
+        then to the datasource configuration so configured database names still
+        reach the prompt when the context was not hydrated.
+        """
+        cli_context = self.cli.cli_context
+        connector = getattr(self.cli, "db_connector", None)
+        config = None
+        agent_config = getattr(self.cli, "agent_config", None)
+        if agent_config is not None:
+            try:
+                config = agent_config.current_db_config()
+            except Exception:
+                config = None
+
+        def first_string(*values):
+            for value in values:
+                if isinstance(value, str) and value:
+                    return value
+            return None
+
+        return (
+            first_string(
+                getattr(cli_context, "current_catalog", None),
+                getattr(connector, "catalog_name", None),
+                getattr(config, "catalog", None),
+            ),
+            first_string(
+                getattr(cli_context, "current_db_name", None),
+                getattr(connector, "database_name", None),
+                getattr(config, "database", None),
+            ),
+            first_string(
+                getattr(cli_context, "current_schema", None),
+                getattr(connector, "schema_name", None),
+                getattr(config, "schema", None),
+            ),
+        )
+
+    @staticmethod
+    def _render_agent_dispatch_hint(message: str, agent_name: str) -> str:
+        """Append a routing hint that nudges the chat agent to delegate.
+
+        The chat agent already exposes a ``task`` FunctionTool wired to
+        :class:`SubAgentTaskTool`; ``@Agent <name>`` is therefore a soft
+        routing instruction rather than a node switch. Keeping the user's
+        original text intact (and only appending an ``[Agent dispatch]``
+        annotation) preserves the visible transcript while making the
+        delegation deterministic when the model reads the prompt.
+        """
+        annotation = (
+            f"[Agent dispatch] The user invoked @Agent {agent_name}. "
+            f'Use the task tool with type="{agent_name}" to delegate this request '
+            f"to that subagent rather than handling it directly."
+        )
+        return f"{message.rstrip()}\n\n{annotation}"
+
+    def execute_chat_command(
+        self,
+        message: str,
+        plan_mode: bool = False,
+        subagent_name: Optional[str] = None,
+    ):
+        """Execute a chat command in interactive REPL mode.
+
+        Wraps :meth:`_execute_chat` in an auto-continuation loop: when the
+        agent finishes a run but the pending-input queue is non-empty
+        (final-turn residue — messages pushed by the user / API after the
+        SDK has already left its per-turn ``call_model_input_filter``
+        hook), drain those messages and feed them into a fresh run so they
+        are not silently dropped.
+        """
+        current_message = message
+        while True:
+            self._execute_chat(
+                current_message,
+                plan_mode=plan_mode,
+                subagent_name=subagent_name,
+                interactive=True,
+            )
+
+            node = self.current_node
+            queue = node.pending_input_queue if node is not None else None
+            if queue is None or len(queue) == 0:
+                break
+
+            if node.interrupt_controller.is_interrupted:
+                queue.clear()
+                break
+
+            residual = queue.drain()
+            current_message = "\n\n".join(residual)
+
+    def _resolve_clean_output(
+        self,
+        sql: Optional[str],
+        response: Optional[str],
+        extracted_output: Optional[str],
+    ) -> Optional[str]:
+        """Resolve clean output text from response and extraction results.
+
+        Used by execute_chat_command to resolve clean output text.
+        """
+        if sql:
+            return extracted_output or response
+        elif isinstance(extracted_output, dict):
+            return extracted_output.get("raw_output", str(extracted_output))
+        else:
+            clean_output = self._extract_report_from_json(response)
+            if not clean_output:
+                if response is None:
+                    clean_output = ""
+                else:
+                    try:
+                        import ast
+
+                        response_dict = ast.literal_eval(response)
+                        clean_output = (
+                            response_dict.get("raw_output", response) if isinstance(response_dict, dict) else response
+                        )
+                    except (ValueError, SyntaxError, TypeError):
+                        clean_output = response
+            return clean_output
+
+    def _execute_chat(
+        self,
+        message: str,
+        plan_mode: bool = False,
+        subagent_name: Optional[str] = None,
+        interactive: bool = True,
+    ):
+        """Core chat execution logic shared by interactive and non-interactive modes."""
+        if not message.strip():
+            self.console.print("[yellow]Please provide a message to chat with the AI.[/]")
+            return
+
+        editable_message = message
+        try:
+            # Manual-execution turns (SQL/bash run from the input bar) carry a
+            # marker-encoded payload whose command may legitimately contain
+            # ``@`` / ``[`` — skip ``@``-reference parsing and the dispatch
+            # hint so the payload round-trips verbatim for resume.
+            from pico.cli.manual_exec import is_exec_message
+
+            if is_exec_message(message):
+                at_tables, at_metrics, at_sqls = [], [], []
+                from pico.cli.manual_exec import decode_exec_message
+
+                exec_payload = decode_exec_message(message)
+                if exec_payload is not None:
+                    command = str(exec_payload.get("command", ""))
+                    editable_message = f"!{command}" if exec_payload.get("kind") == "tool" else command
+            else:
+                at_tables, at_metrics, at_sqls, at_agent = self.cli.at_completer.parse_at_context(message)
+                # ``@Agent <name>`` is a per-turn routing hint, not a default-agent
+                # override: ``current_subagent_name`` and the active node remain
+                # unchanged. The hint is appended to the message so the chat
+                # agent's existing ``task`` tool fires deterministically rather
+                # than relying on the LLM to spot the bare ``@Agent`` token.
+                if at_agent:
+                    message = self._render_agent_dispatch_hint(message, at_agent)
+
+            if interactive:
+                # The decision and the publish share one lock hold: a
+                # background ``!`` warm-up must not slip a node in between
+                # ``_should_create_new_node`` and the assignment below, nor
+                # replace this turn's node once it is published.
+                with self.node_transaction():
+                    # Decision logic: determine if we need to create a new node
+                    need_new_node = self._should_create_new_node(subagent_name)
+                    is_switch = self._is_agent_switch(subagent_name)
+
+                    # Get or create node
+                    if need_new_node:
+                        # Copy session when switching agents to preserve conversation
+                        # while keeping the session_id prefix consistent with the new
+                        # node type. The copy runs *before* construction so the new
+                        # node opens the cloned .db directly — no post-construct mutation.
+                        from pico.agent.node.node_factory import resolve_node_name
+
+                        prev_session_id = None
+                        prev_node_name = None
+                        new_session_id: Optional[str] = None
+                        if is_switch and self.current_node:
+                            prev_session_id = getattr(self.current_node, "session_id", None)
+                            prev_node_name = self.current_node.get_node_name()
+                        if prev_session_id:
+                            new_session_id = self._copy_session_for_switch(
+                                prev_session_id, resolve_node_name(subagent_name)
+                            )
+                        self.current_node = self._create_new_node(subagent_name, session_id=new_session_id)
+                        if prev_node_name:
+                            # Pass the previous node's name explicitly so downstream
+                            # nodes (e.g. feedback) can route memory to the caller
+                            # without having to parse the session id prefix.
+                            self.current_node.caller_node_name = prev_node_name
+                        self.current_subagent_name = subagent_name if subagent_name else None
+                        if not is_switch:
+                            self.all_turn_actions = []
+
+                    current_node = self.current_node
+            else:
+                # Non-interactive: always create a new node
+                with self.node_transaction():
+                    self.current_node = self._create_new_node(None)
+                    current_node = self.current_node
+
+            # Ensure the node has a pending-input queue so the TUI Enter
+            # handler, the API ``/insert`` route, and the model layer's
+            # ``call_model_input_filter`` can all push and drain through
+            # the same instance. Lazy-init keeps non-interactive callers
+            # (which never reach here) at their default ``None``.
+            if current_node.pending_input_queue is None:
+                current_node.pending_input_queue = PendingInputQueue()
+
+            # Create input using shared method
+            node_input, node_type = self.create_node_input(
+                message, current_node, at_tables, at_metrics, at_sqls, plan_mode
+            )
+            current_node.input = node_input
+            # Bind the node's DB tools to the active database (e.g. after ``/database <db>``),
+            # so connector-routed tools (list_tables/read_query/...) target the selected db.
+            active_db = getattr(node_input, "database", "") or ""
+            db_tool = getattr(current_node, "db_func_tool", None)
+            if (
+                active_db
+                and db_tool is not None
+                and hasattr(current_node, "_update_database_connection")
+                and active_db != getattr(db_tool.connector, "database_name", None)
+            ):
+                current_node._update_database_connection(active_db)
+            from pico.utils.trace_context import build_chat_trace_context
+
+            trace_ctx = build_chat_trace_context(
+                session_id=current_node.session_id,
+                llm_session_id=current_node.session_id,
+                node_name=current_node.get_node_name() if hasattr(current_node, "get_node_name") else None,
+                subagent_id=subagent_name,
+                datasource=getattr(self.cli.agent_config, "current_datasource", None),
+                source="cli",
+                agent_home=getattr(self.cli.agent_config, "home", None),
+            )
+
+            # Initialize action history display
+            action_display = ActionHistoryDisplay(self.console, live_state=getattr(self.cli, "live_state", None))
+            incremental_actions = []
+            # Publish the live reference so ``_full_screen_reprint`` (driven
+            # by the sidebar reflow listener) can replay the running turn
+            # after wiping the buffer. The list grows by mutation, so the
+            # reference stays current without resync. Cleared in ``finally``.
+            self._current_incremental_actions = incremental_actions
+            # Streaming text deltas (thinking_delta, depth=0) are routed to a
+            # per-message bucket keyed by ``action.action_id`` (the
+            # ``thinking_stream_id`` shared across all deltas + the paired
+            # terminal response in one message). The producer only appends
+            # to its own bucket; the TUI streaming context drains buckets
+            # via per-bucket cursors and drops a bucket when it processes
+            # the matching terminal response. A dict avoids the data race
+            # the previous shared-list approach had between the producer
+            # (asyncio bg loop) and the consumer (refresh daemon thread).
+            streaming_deltas: dict[str, list[ActionHistory]] = {}
+            # Will be set True after the streaming context exits if it has
+            # already flushed the main-agent body to the scrollback. When True,
+            # ``_render_final_response`` skips the one-shot
+            # ``_display_markdown_response`` step to avoid painting the body
+            # twice.
+            streamed_body = False
+            node_final_action = None  # Node's final ASSISTANT action (e.g. chat_response)
+            # Buffer for ASSISTANT text tagged as non-thinking by the model layer.
+            # Tail text often duplicates the node's *_response; defer rendering
+            # so we can drop it when the *_response arrives, but flush it on any
+            # other action so mid-turn thinking before a tool call is preserved.
+            pending_non_thinking = None
+
+            if interactive:
+                action_checkpoint = self.cli.actions.checkpoint()
+                node_action_checkpoint = len(getattr(current_node, "actions", []))
+                session_manager = current_node.session_manager
+                session_checkpoint = session_manager.checkpoint_turn(current_node.session_id)
+                output_checkpoint = None
+                execution_interrupted = False
+
+                async def run_chat_stream():
+                    """Run chat stream — INTERACTION actions flow into incremental_actions."""
+                    from pico.utils.trace_context import trace_context
+
+                    nonlocal node_final_action, pending_non_thinking
+                    streaming_ctx.set_event_loop(asyncio.get_running_loop())
+                    with trace_context(trace_ctx, replace=True):
+                        action_stream = current_node.execute_stream_with_interactions(
+                            action_history_manager=self.cli.actions
+                        )
+                        async for action in action_stream:
+                            if action.role in {
+                                ActionRole.ASSISTANT,
+                                ActionRole.TOOL,
+                                ActionRole.INTERACTION,
+                            } and action.action_type not in {"compact_progress", "compact_summary"}:
+                                streaming_ctx.mark_model_response_started()
+                            # Token-usage updates drive the status bar / API
+                            # ``usage`` events only; they carry no chat content
+                            # and must never render as a transcript line. Sub-agent
+                            # usage (depth>0) is the exception: route it to the
+                            # display so the pinned subagent header shows a live
+                            # token counter (the display consumes it into group
+                            # state, still without drawing a transcript line).
+                            if action.action_type == "token_usage":
+                                if action.depth > 0:
+                                    incremental_actions.append(action)
+                                continue
+                            # Streaming text deltas go to their own queue. Sub-agent
+                            # deltas (depth > 0) are ignored here — they'd pollute
+                            # the main-agent accumulator; sub-agents have their own
+                            # pinned-region path.
+                            if action.action_type == "thinking_delta":
+                                if action.depth == 0 and action.action_id:
+                                    streaming_deltas.setdefault(action.action_id, []).append(action)
+                                continue
+                            # Node final actions (e.g. chat_response) — keep for
+                            # final response rendering but skip streaming trace.
+                            # Only capture depth-0 (main node) responses; sub-agent
+                            # responses (depth=1) should flow into incremental_actions
+                            # so they are not mistakenly rendered as the final answer
+                            # when the user interrupts execution via ESC.
+                            if (
+                                action.role == ActionRole.ASSISTANT
+                                and action.action_type
+                                and action.action_type.endswith("_response")
+                                and action.depth == 0
+                            ):
+                                node_final_action = action
+                                pending_non_thinking = _drop_if_matches_final(
+                                    pending_non_thinking, action, incremental_actions
+                                )
+                                continue
+                            # Plain "response" from the model layer (openai_compatible /
+                            # codex) is the paired terminal action for the delta
+                            # stream. Push it to the trace list; the consumer drops
+                            # the matching delta bucket when it processes this
+                            # action via ``_print_completed_action``.
+                            if (
+                                action.role == ActionRole.ASSISTANT
+                                and action.depth == 0
+                                and action.action_type == "response"
+                                and action.status == ActionStatus.SUCCESS
+                            ):
+                                if pending_non_thinking is not None:
+                                    incremental_actions.append(pending_non_thinking)
+                                    pending_non_thinking = None
+                                incremental_actions.append(action)
+                                continue
+                            # Defer ASSISTANT text flagged as non-thinking — it may
+                            # be the tail text that duplicates the upcoming *_response.
+                            # If a previous pending is still buffered, flush it first
+                            # so back-to-back non-thinking chunks are not dropped.
+                            if (
+                                action.role == ActionRole.ASSISTANT
+                                and isinstance(action.output, dict)
+                                and not action.output.get("is_thinking", True)
+                            ):
+                                if pending_non_thinking is not None:
+                                    incremental_actions.append(pending_non_thinking)
+                                pending_non_thinking = action
+                                continue
+                            # Any other action: flush pending first to preserve order.
+                            if pending_non_thinking is not None:
+                                incremental_actions.append(pending_non_thinking)
+                                pending_non_thinking = None
+                            incremental_actions.append(action)
+                    # Stream ended: flush remaining pending only when no node
+                    # final action captured it (otherwise it was already handled).
+                    if pending_non_thinking is not None and node_final_action is None:
+                        incremental_actions.append(pending_non_thinking)
+                        pending_non_thinking = None
+
+                streaming_ctx = action_display.display_streaming_actions(
+                    incremental_actions,
+                    history_turns=self.all_turn_actions,
+                    current_user_message=message,
+                    interaction_broker=current_node.interaction_broker,
+                    streaming_deltas=streaming_deltas,
+                )
+                streaming_ctx.set_editable_user_message(editable_message)
+                # Reprint the CLI banner at the top after Ctrl+O clears the screen.
+                banner_callback = getattr(self.cli, "_print_welcome", None)
+                if banner_callback is not None:
+                    streaming_ctx.set_clear_header_callback(banner_callback)
+
+                # TUI mode binds Rich to TUIOutputBuffer, where Console.clear()
+                # + ESC[3J only injects unrecognised ANSI bytes. Hand the
+                # streaming context the buffer's own clear primitive so the
+                # mid-stream Ctrl+O verbose toggle wipes the viewport for real.
+                tui_output_buffer = getattr(self.cli, "_tui_output_buffer", None)
+                if tui_output_buffer is not None:
+                    output_checkpoint = tui_output_buffer.checkpoint()
+                    streaming_ctx.set_clear_screen_callback(tui_output_buffer.clear)
+
+                # In TUI mode the persistent prompt_toolkit Application owns
+                # stdin, so the termios-based ``interrupt_on_escape`` listener
+                # would fight the main input loop. Skip it and rely on
+                # dedicated ESC / Ctrl+O / Ctrl+P key bindings registered on the TUI
+                # (see ``DatusCLI._init_tui_app``), which consult this
+                # streaming_ctx and the node's interrupt_controller directly.
+                if getattr(self.cli, "_use_tui", False):
+                    esc_cm = _noop_escape_guard()
+                else:
+                    esc_cm = interrupt_on_escape(
+                        current_node.interrupt_controller,
+                        key_callbacks=self._streaming_key_callbacks(streaming_ctx),
+                    )
+
+                # Publish the streaming context so the TUI Ctrl+O / Ctrl+P / ESC
+                # bindings can locate it while the agent runs.
+                self.current_streaming_ctx = streaming_ctx
+                try:
+                    with esc_cm as esc_guard, streaming_ctx:
+                        streaming_ctx.set_input_collector(self._make_input_collector(esc_guard))
+                        try:
+                            self.cli.run_on_bg_loop(
+                                run_chat_stream(),
+                                interrupt_controller=current_node.interrupt_controller,
+                            )
+                        except KeyboardInterrupt:
+                            execution_interrupted = True
+                            current_node.interrupt_controller.interrupt()
+                            if current_node.pending_input_queue is not None:
+                                current_node.pending_input_queue.clear()
+                            logger.info("KeyboardInterrupt caught, execution interrupted gracefully")
+                        except ExecutionInterrupted:
+                            execution_interrupted = True
+                            current_node._drop_running_turn_usage_on_exit = True
+                            if current_node.pending_input_queue is not None:
+                                current_node.pending_input_queue.clear()
+                            logger.info("ExecutionInterrupted caught, execution stopped gracefully")
+                    # A cooperative controller checkpoint can finish the
+                    # stream normally before Task.cancel is delivered. The
+                    # ESC-time latch, rather than the exception path, is the
+                    # authoritative rollback decision.
+                    rollback_unanswered = bool(getattr(streaming_ctx, "unanswered_rollback_requested", False))
+                    turn_interrupted = execution_interrupted or bool(
+                        getattr(streaming_ctx, "interrupt_requested", False)
+                    )
+                    if rollback_unanswered:
+                        self._rollback_unanswered_turn(
+                            current_node=current_node,
+                            incremental_actions=incremental_actions,
+                            action_checkpoint=action_checkpoint,
+                            node_action_checkpoint=node_action_checkpoint,
+                            session_manager=session_manager,
+                            session_checkpoint=session_checkpoint,
+                            output_buffer=tui_output_buffer,
+                            output_checkpoint=output_checkpoint,
+                        )
+                        current_node.interrupt_controller.reset()
+                        return
+                    if turn_interrupted:
+                        # Partial output (and the Interrupted notice) has
+                        # already been flushed by the streaming context. Do
+                        # not reinterpret the last intermediate/tool action as
+                        # a final response.  The turn is nevertheless durable:
+                        # the node/session layer has already recorded its user
+                        # message and any partial actions.  Keep the same turn
+                        # in the in-memory replay list before returning, or a
+                        # later full-screen repaint (Ctrl+O/sidebar reflow)
+                        # clears the visible user row even though /resume can
+                        # reconstruct it from SQLite.
+                        interrupted_actions = list(incremental_actions)
+                        interrupted_actions.append(
+                            ActionHistory.create_action(
+                                role=ActionRole.SYSTEM,
+                                action_type=INTERRUPTED_ACTION_TYPE,
+                                messages="Interrupted",
+                                input_data={},
+                                output_data={},
+                                status=ActionStatus.SUCCESS,
+                            )
+                        )
+                        self.last_actions = interrupted_actions
+                        self.all_turn_actions.append((message, interrupted_actions))
+                        # Clear the reusable controller before the next Enter
+                        # starts a fresh run.
+                        current_node.interrupt_controller.reset()
+                        return
+                    streamed_body = bool(getattr(streaming_ctx, "has_streamed_response", False))
+                finally:
+                    self.current_streaming_ctx = None
+            else:
+
+                async def run_stream():
+                    from pico.utils.trace_context import trace_context
+
+                    nonlocal node_final_action, pending_non_thinking
+                    with trace_context(trace_ctx, replace=True):
+                        action_stream = current_node.execute_stream_with_interactions(
+                            action_history_manager=self.cli.actions
+                        )
+                        async for action in action_stream:
+                            # Token-usage updates feed the status bar / API
+                            # ``usage`` events only — skip before any rendering.
+                            # Sub-agent usage (depth>0) is routed to the display
+                            # so the pinned subagent header's live token counter
+                            # updates; it is still never drawn as a transcript line.
+                            if action.action_type == "token_usage":
+                                if action.depth > 0:
+                                    incremental_actions.append(action)
+                                continue
+                            if action.role == ActionRole.INTERACTION:
+                                # In non-interactive mode, auto-submit default choice for
+                                # PROCESSING interactions so the node is not left hanging.
+                                if action.status == ActionStatus.PROCESSING:
+                                    broker = current_node.interaction_broker
+                                    if broker:
+                                        await auto_submit_interaction(broker, action)
+                                continue
+                            if action.action_type == "thinking_delta":
+                                if action.depth == 0 and action.action_id:
+                                    streaming_deltas.setdefault(action.action_id, []).append(action)
+                                continue
+                            # Node final actions (e.g. chat_response) — keep for
+                            # final response rendering but skip streaming trace.
+                            # Only capture depth-0 (main node) responses; sub-agent
+                            # responses (depth=1) should flow into incremental_actions
+                            # so they are not mistakenly rendered as the final answer
+                            # when the user interrupts execution via ESC.
+                            if (
+                                action.role == ActionRole.ASSISTANT
+                                and action.action_type
+                                and action.action_type.endswith("_response")
+                                and action.depth == 0
+                            ):
+                                node_final_action = action
+                                pending_non_thinking = _drop_if_matches_final(
+                                    pending_non_thinking, action, incremental_actions
+                                )
+                                continue
+                            if (
+                                action.role == ActionRole.ASSISTANT
+                                and action.depth == 0
+                                and action.action_type == "response"
+                                and action.status == ActionStatus.SUCCESS
+                            ):
+                                if pending_non_thinking is not None:
+                                    incremental_actions.append(pending_non_thinking)
+                                    pending_non_thinking = None
+                                incremental_actions.append(action)
+                                continue
+                            # Defer ASSISTANT text flagged as non-thinking — it may
+                            # be the tail text that duplicates the upcoming *_response.
+                            # If a previous pending is still buffered, flush it first
+                            # so back-to-back non-thinking chunks are not dropped.
+                            if (
+                                action.role == ActionRole.ASSISTANT
+                                and isinstance(action.output, dict)
+                                and not action.output.get("is_thinking", True)
+                            ):
+                                if pending_non_thinking is not None:
+                                    incremental_actions.append(pending_non_thinking)
+                                pending_non_thinking = action
+                                continue
+                            if pending_non_thinking is not None:
+                                incremental_actions.append(pending_non_thinking)
+                                pending_non_thinking = None
+                            incremental_actions.append(action)
+                    if pending_non_thinking is not None and node_final_action is None:
+                        incremental_actions.append(pending_non_thinking)
+                        pending_non_thinking = None
+
+                ns_streaming_ctx = action_display.display_streaming_actions(
+                    incremental_actions, streaming_deltas=streaming_deltas
+                )
+                with ns_streaming_ctx:
+                    try:
+                        self.cli.run_on_bg_loop(
+                            run_stream(),
+                            interrupt_controller=current_node.interrupt_controller,
+                        )
+                    except KeyboardInterrupt:
+                        current_node.interrupt_controller.interrupt()
+                        logger.info("KeyboardInterrupt caught, execution interrupted gracefully")
+                    except ExecutionInterrupted:
+                        current_node._drop_running_turn_usage_on_exit = True
+                        if current_node.pending_input_queue is not None:
+                            current_node.pending_input_queue.clear()
+                        logger.info("ExecutionInterrupted caught, execution stopped gracefully")
+                streamed_body = bool(getattr(ns_streaming_ctx, "has_streamed_response", False))
+
+            # Display final response from the node's final action
+            # (separated from incremental_actions to avoid streaming trace rendering)
+            if node_final_action:
+                final_action = node_final_action
+            elif incremental_actions:
+                final_action = incremental_actions[-1]
+            else:
+                final_action = None
+
+            if final_action:
+                if final_action.output and isinstance(final_action.output, dict):
+                    is_success = final_action.status == ActionStatus.SUCCESS
+                    has_validation_report = bool(final_action.output.get("validation_report"))
+
+                    if is_success:
+                        sql = final_action.output.get("sql")
+                        response = final_action.output.get("response")
+
+                        extracted_sql, extracted_output = self._extract_sql_and_output_from_content(response)
+                        sql = sql or extracted_sql
+
+                        clean_output = self._resolve_clean_output(sql, response, extracted_output)
+
+                        if sql:
+                            self.add_in_sql_context(sql, clean_output, incremental_actions)
+
+                    # Always render when either the action succeeded OR it failed
+                    # with a validation_report — otherwise users of exhausted-retry
+                    # runs don't see why their deliverable was blocked. The helper
+                    # itself gates downstream SQL / markdown rendering by status;
+                    # ``skip_markdown_body`` is forwarded so the streaming
+                    # context's already-flushed body does not get reprinted.
+                    if is_success or has_validation_report:
+                        self._render_final_response(final_action, skip_markdown_body=streamed_body)
+
+                    if is_success or has_validation_report:
+                        # Merge node_final_action back for history tracking.
+                        # FAILED-with-validation_report turns are kept so
+                        # Ctrl+O (``_full_screen_reprint``) can replay them;
+                        # without this, the new "render on FAILED" branch in
+                        # ``_render_turn_response`` is unreachable because
+                        # ``all_turn_actions`` never sees the failed turn.
+                        all_actions = incremental_actions + ([node_final_action] if node_final_action else [])
+                        self.last_actions = all_actions
+                        self.all_turn_actions.append((message, all_actions))
+                        self._trace_verbose = False  # reset toggle for new chat round
+
+            if interactive:
+                self.chat_history.append(
+                    {
+                        "user": message,
+                        "response": (
+                            final_action.output.get("response", "")
+                            if final_action and final_action.output and isinstance(final_action.output, dict)
+                            else ""
+                        ),
+                        "actions": len(incremental_actions),
+                    }
+                )
+
+        except Exception as e:
+            logger.error(f"Chat error: {str(e)}")
+            self.console.print(f"[red]Error:[/] {str(e)}")
+            if _is_model_config_error(e):
+                self.console.print("[yellow]Hint: Use /model to configure or switch your model.[/]")
+        finally:
+            # Drop the in-progress reference so a later sidebar reflow does
+            # not replay actions from a turn that has already finished.
+            self._current_incremental_actions = None
+
+    def _rollback_unanswered_turn(
+        self,
+        *,
+        current_node,
+        incremental_actions: List[ActionHistory],
+        action_checkpoint: int,
+        node_action_checkpoint: int,
+        session_manager,
+        session_checkpoint,
+        output_buffer,
+        output_checkpoint,
+    ) -> None:
+        """Remove an ESC-cancelled, unanswered turn from every transcript."""
+        # A mid-turn compaction rewrites the whole session, so every row —
+        # including the compacted view of earlier turns — is newer than the
+        # checkpoint taken before the turn. Rolling back to that checkpoint
+        # would empty the session; the node publishes a fresh checkpoint right
+        # after each rewrite, and that one is the safe boundary.
+        rewrite_checkpoint = getattr(current_node, "mid_turn_rewrite_checkpoint", None)
+        effective_checkpoint = (
+            rewrite_checkpoint
+            if getattr(current_node, "_session_rewritten_this_turn", False) or rewrite_checkpoint is not None
+            else session_checkpoint
+        )
+        try:
+            session_manager.rollback_turn(current_node.session_id, effective_checkpoint)
+        except Exception:  # pragma: no cover - rollback remains best-effort on damaged DBs
+            logger.exception("Failed to roll back unanswered SQLite turn")
+
+        self.cli.actions.rollback_to(action_checkpoint)
+        node_actions = getattr(current_node, "actions", None)
+        if isinstance(node_actions, list):
+            del node_actions[node_action_checkpoint:]
+        incremental_actions.clear()
+        current_node.running_turn_usage = None
+        current_node._invalidate_context_usage()
+        pending_queue = getattr(current_node, "pending_input_queue", None)
+        if pending_queue is not None:
+            pending_queue.clear()
+
+        if output_buffer is not None and output_checkpoint is not None:
+            output_buffer.rollback(output_checkpoint)
+
+    def _render_final_response(self, final_action: "ActionHistory", skip_markdown_body: bool = False) -> None:
+        """Render the final response output (SQL, markdown, etc.) from a node action.
+
+        This is used both after streaming completes and when Ctrl+O re-renders.
+        Side-effect free — does not modify history or state.
+
+        Args:
+            final_action: The node's terminal assistant action.
+            skip_markdown_body: When True, skip the final Markdown render of
+                the response body (the ``_display_markdown_response`` step).
+                Used when the streaming context has already flushed the
+                accumulated body to the scrollback — without this guard the
+                user sees the same answer twice.
+        """
+        if not final_action or not final_action.output or not isinstance(final_action.output, dict):
+            return
+
+        # Render the validation report regardless of success/failure. When the
+        # retry budget is exhausted the node emits status=FAILED with a
+        # ``validation_report`` payload — that's precisely when the user needs
+        # to see *why* things blocked, so this cannot live behind the SUCCESS
+        # guard below.
+        validation_report = final_action.output.get("validation_report")
+        if validation_report:
+            self._display_validation_report(validation_report)
+
+        if final_action.status != ActionStatus.SUCCESS:
+            return
+
+        sql = final_action.output.get("sql")
+        response = final_action.output.get("response") or final_action.output.get("raw_output")
+
+        extracted_sql, extracted_output = self._extract_sql_and_output_from_content(response)
+        sql = sql or extracted_sql
+
+        clean_output = self._resolve_clean_output(sql, response, extracted_output)
+
+        if sql:
+            self._display_sql_with_copy(sql)
+
+        semantic_models = final_action.output.get("semantic_models")
+        if semantic_models:
+            self._display_semantic_model(semantic_models)
+
+        sql_summary_file = final_action.output.get("sql_summary_file")
+        if sql_summary_file:
+            self._display_sql_summary_file(sql_summary_file)
+
+        if clean_output and not skip_markdown_body:
+            self._display_markdown_response(clean_output)
+
+    def _display_validation_report(self, report: Any) -> None:
+        """Render a compact validation panel for ValidationHook output.
+
+        Shows a per-check list with icons / severity colors plus any warnings
+        (e.g. malformed validator skill output). Rendered between other
+        artifacts (SQL, semantic model) and the main markdown response so the
+        user sees it inline with the final assistant turn.
+
+        All interpolated user / connector / validator values are run through
+        :func:`rich.markup.escape` — they can legitimately contain ``[`` (list
+        reprs, error messages, path names) which Rich would otherwise parse
+        as markup tags (potentially raising ``MarkupError`` or swallowing
+        subsequent text).
+        """
+        from rich.markup import escape as _rich_escape
+
+        if not isinstance(report, dict):
+            return
+        checks = report.get("checks") or []
+        warnings = report.get("warnings") or []
+        if not checks and not warnings:
+            return
+
+        passed = sum(1 for c in checks if isinstance(c, dict) and c.get("passed"))
+        failed = sum(1 for c in checks if isinstance(c, dict) and not c.get("passed"))
+        has_blocking = any(
+            isinstance(c, dict) and not c.get("passed") and c.get("severity") == "blocking" for c in checks
+        )
+
+        if has_blocking:
+            border_style = "red"
+            header_mark = "✗"
+            header_label = "FAILED"
+        elif failed > 0:
+            border_style = "yellow"
+            header_mark = "⚠"
+            header_label = "WARNINGS"
+        else:
+            border_style = "green"
+            header_mark = "✓"
+            header_label = "PASSED"
+
+        target = report.get("target") or {}
+        target_str = ""
+        if isinstance(target, dict):
+            ttype = target.get("type")
+            if ttype == "table":
+                schema = target.get("schema") or target.get("db_schema")
+                tname = target.get("table")
+                db = target.get("database")
+                fqn = f"{schema}.{tname}" if schema else tname
+                target_str = f"table [cyan]{_rich_escape(str(db))}.{_rich_escape(str(fqn))}[/]"
+            elif ttype == "transfer":
+                src = (target.get("source") or {}).get("name", "?")
+                tgt = target.get("target") or {}
+                tgt_schema = tgt.get("schema") or tgt.get("db_schema")
+                tgt_name = tgt.get("table")
+                tgt_fqn = f"{tgt_schema}.{tgt_name}" if tgt_schema else tgt_name
+                target_str = (
+                    f"transfer [cyan]{_rich_escape(str(src))}[/] → "
+                    f"[cyan]{_rich_escape(str(tgt.get('database')))}.{_rich_escape(str(tgt_fqn))}[/]"
+                )
+            elif ttype == "session":
+                n = len(target.get("targets") or [])
+                target_str = f"session with [cyan]{n}[/] target(s)"
+
+        lines = []
+        header = f"[bold]{header_mark} {header_label}[/]"
+        if target_str:
+            header += f" — {target_str}"
+        lines.append(header)
+        lines.append(f"[dim]{passed} passed, {failed} failed[/]")
+
+        for c in checks:
+            if not isinstance(c, dict):
+                continue
+            mark = "✓" if c.get("passed") else "✗"
+            if c.get("passed"):
+                color = "green"
+            elif c.get("severity") == "blocking":
+                color = "red"
+            else:
+                color = "yellow"
+            source = _rich_escape(str(c.get("source", "?")))
+            name = _rich_escape(str(c.get("name", "?")))
+            detail_parts = []
+            observed = c.get("observed")
+            if observed:
+                detail_parts.append(_rich_escape(f"observed={observed}"))
+            if not c.get("passed"):
+                err = c.get("error")
+                if err:
+                    detail_parts.append(_rich_escape(str(err)))
+            detail = f" — [dim]{'; '.join(detail_parts)}[/]" if detail_parts else ""
+            lines.append(f"  [{color}]{mark}[/] {name} [dim]({source})[/]{detail}")
+
+        for w in warnings:
+            lines.append(f"  [yellow]⚠[/] [dim]{_rich_escape(str(w))}[/]")
+
+        panel = Panel(
+            "\n".join(lines),
+            title="Validation Report",
+            border_style=border_style,
+            expand=False,
+        )
+        self.cli.console.print(panel)
+
+    def _get_turn_token_usage_from_node(self, node) -> Optional[dict]:
+        """Get detailed token usage from the node's session manager."""
+        try:
+            if (
+                hasattr(node, "session_manager")
+                and node.session_manager
+                and hasattr(node, "session_id")
+                and node.session_id
+            ):
+                return node.session_manager.get_detailed_usage(node.session_id)
+        except Exception:
+            pass
+        return None
+
+    def _find_node_final_action(self, actions: List["ActionHistory"]) -> Optional["ActionHistory"]:
+        """Find the node final action (e.g. chat_response) from an action list."""
+        return self._find_turn_response_action(actions)
+
+    @staticmethod
+    def _action_response_text(action: "ActionHistory") -> str:
+        """Best-effort user-facing body for an assistant action."""
+        if isinstance(action.output, dict):
+            for key in ("response", "raw_output"):
+                value = action.output.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+        return (action.messages or "").removeprefix("Thinking: ").strip()
+
+    @staticmethod
+    def _find_turn_response_action(actions: List["ActionHistory"]) -> Optional["ActionHistory"]:
+        """Find the response action that owns a restored/reprinted turn body."""
+        wrapper = None
+        plain = None
+        for action in reversed(actions or []):
+            if (
+                action.role != ActionRole.ASSISTANT
+                or action.depth != 0
+                or action.status != ActionStatus.SUCCESS
+                or not action.action_type
+            ):
+                continue
+            if action.action_type.endswith("_response") and action.action_type != "response":
+                wrapper = action
+                break
+            if action.action_type == "response" and plain is None:
+                plain = action
+        return wrapper or plain
+
+    def _should_display_restored_content(
+        self,
+        content: str,
+        actions: Optional[List["ActionHistory"]],
+        sql: Optional[str],
+    ) -> bool:
+        """Return whether session ``content`` should be rendered after actions."""
+        if not content:
+            return False
+        stripped = content.strip()
+        is_json = stripped.startswith("{") and stripped.endswith("}")
+        if is_json and (sql or actions):
+            return False
+
+        actions = actions or []
+        final_action = self._find_turn_response_action(actions)
+        if final_action is not None and stripped == self._action_response_text(final_action):
+            # The final response action is intentionally skipped by the trace
+            # renderer, so restored session content is the one visible copy.
+            return True
+
+        for action in actions:
+            if (
+                action.role == ActionRole.ASSISTANT
+                and action.depth == 0
+                and stripped == self._action_response_text(action)
+            ):
+                return False
+        return True
+
+    def _render_restored_messages(self, messages: List[dict]) -> List["ActionHistory"]:
+        """Render session messages using the same turn shell as replay paths."""
+        action_display = ActionHistoryDisplay(self.console, live_state=getattr(self.cli, "live_state", None))
+        last_assistant_actions: List[ActionHistory] = []
+        current_user_msg = ""
+
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if role == "user":
+                current_user_msg = content
+                action_display.renderer.print_renderables(
+                    self.console,
+                    [action_display.renderer.render_user_header(content)],
+                )
+                continue
+
+            actions = msg.get("actions") or []
+            if actions:
+                action_display.render_action_history(actions)
+                last_assistant_actions = actions
+            sql = msg.get("sql")
+            if sql:
+                self._display_sql_with_copy(sql)
+            if self._should_display_restored_content(content, actions, sql):
+                self._display_markdown_response(content)
+            if actions and current_user_msg:
+                self.all_turn_actions.append((current_user_msg, actions))
+            current_user_msg = ""
+            self.console.print()
+
+        return last_assistant_actions
+
+    def _display_sql_with_copy(self, sql: str):
+        """
+        Display SQL in a formatted panel with automatic clipboard copy functionality.
+
+        Args:
+            sql: SQL query string to display and copy
+        """
+        try:
+            # Store SQL for reference
+            self.cli.last_sql = sql
+
+            # Try to copy to clipboard
+            copied_indicator = ""
+            try:
+                # Try pyperclip first
+                try:
+                    import pyperclip
+
+                    pyperclip.copy(sql)
+                    copied_indicator = " (copied)"
+                except ImportError:
+                    # Fallback to system clipboard commands
+                    system = platform.system()
+                    if system == "Darwin":  # macOS
+                        subprocess.run("pbcopy", input=sql.encode(), check=True)
+                        copied_indicator = " (copied)"
+                    elif system == "Linux":
+                        subprocess.run("xclip", input=sql.encode(), check=True)
+                        copied_indicator = " (copied)"
+                    elif system == "Windows":
+                        subprocess.run("clip", input=sql.encode(), shell=True, check=True)
+                        copied_indicator = " (copied)"
+            except Exception:
+                # Clipboard copy failed, continue without it
+                pass
+
+            # Display the SQL in a formatted panel
+            self.console.print()
+            sql_panel = Panel(
+                Syntax(sql, "sql", theme=CODE_THEME, word_wrap=True),
+                title=f"[bold cyan]Generated SQL{copied_indicator}[/]",
+                border_style="cyan",
+                expand=False,
+            )
+            self.console.print(sql_panel)
+
+        except Exception as e:
+            logger.error(f"Error displaying SQL: {e}")
+            # Fallback to simple display
+            self.console.print(f"\n[bold cyan]Generated SQL:[/]\n```sql\n{sql}\n```")
+
+    def _display_markdown_response(self, response: str):
+        """
+        Display clean response content as formatted markdown.
+
+        Skip JSON responses since they are for backend processing only.
+
+        Args:
+            response: Clean response text to display as markdown
+        """
+        try:
+            # Handle JSON responses - try to extract user-facing content
+            stripped = response.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                # Try to extract report field from JSON
+                extracted = self._extract_report_from_json(response)
+                if extracted:
+                    response = extracted
+                # If extraction fails, fall through to display raw content
+
+            # Display as markdown with the same assistant prefix used by history.
+            markdown_content = render_assistant_response_markdown(response)
+            self.console.print()  # Add spacing
+            self.console.print(markdown_content)
+
+        except Exception as e:
+            logger.error(f"Error displaying markdown: {e}")
+            # Fallback to plain text display
+            self.console.print(f"\n\u23fa {response}")
+
+    def _display_semantic_model(self, semantic_models: Optional[List[str]]):
+        """
+        Display semantic model file paths.
+
+        Args:
+            semantic_models: List of semantic model file paths, or None
+        """
+        try:
+            self.console.print()
+            if not semantic_models:
+                self.console.print("[bold magenta]Semantic Model Files:[/] None")
+            elif len(semantic_models) == 1:
+                self.console.print(f"[bold magenta]Semantic Model File:[/] [cyan]{semantic_models[0]}[/]")
+            else:
+                self.console.print("[bold magenta]Semantic Model Files:[/]")
+                for model_file in semantic_models:
+                    self.console.print(f"  [cyan]{model_file}[/]")
+
+        except Exception as e:
+            logger.error(f"Error displaying semantic models: {e}")
+            # Fallback to simple display
+            if semantic_models:
+                models_str = ", ".join(semantic_models)
+                self.console.print(f"\n[bold magenta]Semantic Model Files:[/] {models_str}")
+            else:
+                self.console.print("\n[bold magenta]Semantic Model Files:[/] None")
+
+    def _display_sql_summary_file(self, sql_summary_file: str):
+        """
+        Display SQL summary file path.
+
+        Args:
+            sql_summary_file: SQL summary file path
+        """
+        try:
+            self.console.print()
+            self.console.print(f"[bold yellow]SQL Summary File:[/] [cyan]{sql_summary_file}[/]")
+
+        except Exception as e:
+            logger.error(f"Error displaying SQL summary file: {e}")
+            # Fallback to simple display
+            self.console.print(f"\n[bold yellow]SQL Summary File:[/] {sql_summary_file}")
+
+    def _make_input_collector(self, esc_guard):
+        """Create a synchronous input collector callback for INTERACTION actions.
+
+        Returns ``List[List[str]]`` via :class:`InteractionApp`.
+        """
+
+        def collect(action: ActionHistory, console) -> Optional[List[List[str]]]:
+            try:
+                from pico.cli.interaction_app import InteractionApp
+                from pico.schemas.interaction_event import InteractionEvent
+
+                events = InteractionEvent.from_broker_input(action.input or {})
+                if not events:
+                    return None
+
+                with esc_guard.paused():
+                    app = InteractionApp(events)
+                    tui_app = getattr(self.cli, "tui_app", None)
+                    result = app.run(tui_app=tui_app)
+                    return result.answers
+            except Exception as e:
+                logger.error(f"Error collecting interaction input: {e}")
+                return None
+
+        return collect
+
+    def _extract_report_from_json(self, response: str) -> Optional[str]:
+        """
+        Extract 'report' field from gen_report JSON format response.
+
+        Args:
+            response: Response string that may contain JSON with 'report' field
+
+        Returns:
+            Extracted report content or None if not found
+        """
+        if not response or not isinstance(response, str):
+            return None
+
+        try:
+            import json_repair
+
+            from pico.utils.json_utils import strip_json_str
+
+            # First try to extract JSON from code blocks or other wrappers
+            stripped = response.strip()
+            cleaned_json = strip_json_str(stripped)
+            if not cleaned_json:
+                return None
+            # Check if cleaned content looks like JSON
+            if not (cleaned_json.startswith("{") and cleaned_json.endswith("}")):
+                return None
+
+            parsed = json_repair.loads(cleaned_json)
+            if isinstance(parsed, dict) and "report" in parsed:
+                return parsed.get("report", "")
+        except ValueError as e:
+            logger.debug(f"Failed to extract report from JSON: {e}")
+        except TypeError as e:
+            logger.debug(f"Invalid input type for JSON extraction: {e}")
+
+        return None
+
+    def _extract_sql_and_output_from_content(self, content: str) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extract SQL and output from content string that might contain JSON or debug format.
+
+        Args:
+            content: Content string to parse
+
+        Returns:
+            Tuple of (sql_string, output_string) - both can be None if not found
+        """
+        try:
+            # Try to extract JSON from various patterns
+            # Pattern 1: json\n{...} format
+            json_match = re.search(r"json\s*\n\s*({.*?})\s*$", content, re.DOTALL)
+            if json_match:
+                try:
+                    json_content = json.loads(json_match.group(1))
+                    sql = json_content.get("sql")
+                    output = json_content.get("output") or json_content.get("raw_output")
+                    if output:
+                        output = output.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
+                    return sql, output
+                except json.JSONDecodeError:
+                    pass
+
+            # Pattern 2: Direct JSON in content
+            try:
+                # Handle escaped quotes in the JSON string
+                unescaped_content = content.replace("\\'", "'").replace('\\"', '"')
+                json_content = json.loads(unescaped_content)
+                sql = json_content.get("sql")
+                output = json_content.get("output") or json_content.get("raw_output")
+                if output and isinstance(output, str):
+                    output = output.replace("\\n", "\n").replace('\\"', '"').replace("\\'", "'")
+                return sql, output
+            except json.JSONDecodeError as e:
+                logger.debug(f"DEBUG: JSON decode failed for content: {content[:100]}... Error: {e}")
+
+            # Pattern 3: Look for SQL code blocks
+            sql_pattern = r"```sql\s*(.*?)\s*```"
+            sql_matches = re.findall(sql_pattern, content, re.DOTALL | re.IGNORECASE)
+            sql = sql_matches[0].strip() if sql_matches else None
+
+            return sql, None
+
+        except Exception as e:
+            logger.warning(f"Failed to extract SQL and output from content: {e}")
+            return None, None
+
+    # Chat management commands
+
+    def cmd_clear_chat(self, args: str):
+        """Clear the console screen and current session."""
+        # Clear the console screen using Rich
+        self.console.clear()
+
+        # Clear current session
+        with self.node_transaction():
+            if self.current_node:
+                try:
+                    self.current_node.delete_session()
+                    print_success(self.console, "Console and current session cleared.")
+                except Exception as e:
+                    logger.error(f"Error deleting session: {e}")
+                    print_success(self.console, "Console cleared. Next chat will create a new session.")
+            else:
+                print_success(self.console, "Console cleared. Next chat will create a new session.")
+
+            # Reset all node references
+            self.current_node = None
+            self.all_turn_actions = []
+
+    def cmd_chat_info(self, args: str):
+        """Display information about the current session."""
+        if self.current_node:
+            session_info = asyncio.run(self.current_node.get_session_info())
+            if session_info.get("session_id"):
+                # Determine node type for display
+                node_type = "Chat" if isinstance(self.current_node, ChatAgenticNode) else "Subagent"
+
+                self.console.print(f"[green]{node_type} Session Info:[/]")
+                self.console.print(f"  Session ID: {session_info['session_id']}")
+                self.console.print(f"  Action Count: {session_info['action_count']}")
+                self.console.print(f"  Total Conversations: {len(self.chat_history)}")
+
+                # Detailed token usage
+                turn_usage = self._get_turn_token_usage_from_node(self.current_node)
+                if turn_usage:
+                    total = turn_usage.get("total", {})
+                    total_tokens = total.get("total_tokens", 0)
+                    inp = total.get("input_tokens", 0)
+                    out = total.get("output_tokens", 0)
+                    cached = total.get("cached_tokens", 0)
+                    self.console.print(f"  Token Usage: {total_tokens:,} total ({inp:,} in / {out:,} out)")
+                    if cached > 0:
+                        rate = cached / inp * 100 if inp > 0 else 0
+                        self.console.print(f"  Cached Tokens: {cached:,} ({rate:.1f}% hit rate)")
+                else:
+                    token_count = session_info.get("token_count", 0)
+                    self.console.print(f"  Token Count: {token_count}")
+
+                ctx_length = session_info.get("context_length", 0)
+                ctx_tokens = self.current_node.get_context_usage().last_call_input_tokens
+                if ctx_length and ctx_tokens:
+                    ratio = ctx_tokens / ctx_length * 100
+                    self.console.print(f"  Context: {ctx_tokens:,}/{ctx_length:,} ({ratio:.1f}%)")
+
+                if self.chat_history:
+                    self.console.print("\n[bold blue]Recent Conversations:[/]")
+                    for i, chat in enumerate(self.chat_history[-3:]):  # Show last 3
+                        user_msg = chat["user"][:50] + "..." if len(chat["user"]) > 50 else chat["user"]
+                        self.console.print(f"  {i + 1}. User: {user_msg}")
+                        self.console.print(f"     Actions: {chat['actions']}")
+            else:
+                self.console.print("[yellow]No active session.[/]")
+        else:
+            self.console.print("[yellow]No active session.[/]")
+
+    def _clear_scrollback(self) -> None:
+        """Wipe the scrollable output region in a TUI-safe way.
+
+        Full-screen TUI binds Rich to ``TUIOutputBuffer``; writing ANSI
+        clear-screen escapes via ``Console.clear()`` would just inject
+        raw bytes into the buffer instead of clearing it. Reset the
+        buffer directly in TUI mode, and fall back to terminal escapes
+        for the legacy console path.
+        """
+        tui_output_buffer = getattr(self.cli, "_tui_output_buffer", None)
+        if tui_output_buffer is not None:
+            tui_output_buffer.clear()
+        else:
+            self.console.clear()
+            self.console.file.write("\033[3J")
+            self.console.file.flush()
+
+    def _full_screen_reprint(
+        self,
+        verbose: bool,
+        *,
+        mode_label: Optional[str] = None,
+        fallback_actions: Optional[List[ActionHistory]] = None,
+        in_progress_actions: Optional[List[ActionHistory]] = None,
+    ) -> None:
+        """Clear the screen and re-render the full multi-turn history.
+
+        The viewport ends up with exactly what Ctrl+O produces: banner →
+        optional mode label → every turn's trace + final response.
+
+        Two clearing strategies depending on TUI mode:
+
+        * **Full-screen TUI (current default)**: the Rich console is bound
+          to the in-memory :class:`TUIOutputBuffer`. ``Console.clear()`` /
+          ``sys.stdout.write("\\x1b[3J")`` would just inject raw ANSI
+          escapes into the buffer (which the ANSI parser does not
+          recognise as clear-screen) and corrupt the real terminal,
+          respectively. Instead, reset the buffer in place — the next
+          ``console.print`` lands in an empty buffer and produces the
+          same banner-then-history viewport.
+        * **Legacy non-full-screen** path: behave as before, using
+          terminal escape codes to wipe the viewport while leaving the
+          terminal-native scrollback intact.
+
+        Args:
+            verbose: Render style for action trace lines.
+            mode_label: Optional banner text printed between the CLI banner
+                and the trace (used by Ctrl+O to show "switched to <mode>").
+            fallback_actions: When ``all_turn_actions`` is empty, render this
+                single action list instead. Used by Ctrl+O on the very first
+                turn before ``all_turn_actions.append`` runs.
+        """
+        self._clear_scrollback()
+        banner_callback = getattr(self.cli, "_print_welcome", None)
+        if banner_callback is not None:
+            banner_callback()
+        if mode_label:
+            self.console.print(f"[bold bright_black]  \u23af switched to {mode_label} mode \u23af[/]")
+        action_display = ActionHistoryDisplay(self.console, live_state=getattr(self.cli, "live_state", None))
+
+        def _render_turn_response(turn_actions: List[ActionHistory]) -> None:
+            """Callback to render the final response for each turn.
+
+            Render on SUCCESS, or on FAILED when a ``validation_report`` was
+            attached — otherwise Ctrl+O verbose mode hides blocking validation
+            details from runs whose retry budget was exhausted.
+            """
+            # Response-started ESC turns intentionally have no final response.
+            # Their partial trace plus the replay-only Interrupted marker were
+            # already rendered by ``render_action_history`` above.
+            if any(action.action_type == INTERRUPTED_ACTION_TYPE for action in turn_actions):
+                return
+            final_action = self._find_node_final_action(turn_actions)
+            if not final_action or final_action.depth != 0:
+                return
+            # The viewport was just cleared — render the final Markdown
+            # body here. ``skip_markdown_body`` stays False because the
+            # streaming context's scrollback push is not visible in the
+            # viewport after the clear.
+            if final_action.status == ActionStatus.SUCCESS:
+                self._render_final_response(final_action)
+                return
+            output = final_action.output if isinstance(final_action.output, dict) else None
+            if output and output.get("validation_report"):
+                self._render_final_response(final_action)
+
+        if self.all_turn_actions:
+            action_display.render_multi_turn_history(
+                self.all_turn_actions, verbose=verbose, per_turn_callback=_render_turn_response
+            )
+        elif fallback_actions:
+            action_display.render_action_history(fallback_actions, verbose=verbose)
+            _render_turn_response(fallback_actions)
+        # Append the running turn's actions (driven by the sidebar reflow
+        # listener) after completed history so the user's in-flight stream
+        # survives the buffer wipe. Skipped when empty.
+        if in_progress_actions:
+            action_display.render_action_history(in_progress_actions, verbose=verbose)
+
+    def display_inline_trace_details(self, actions: List[ActionHistory]) -> None:
+        """Toggle action history between compact and verbose modes (post-run Ctrl+O)."""
+        if not actions:
+            self.console.print("[dim]No actions to display[/dim]")
+            return
+        self._trace_verbose = not self._trace_verbose
+        mode_label = "verbose" if self._trace_verbose else "compact"
+        self._full_screen_reprint(
+            verbose=self._trace_verbose,
+            mode_label=mode_label,
+            fallback_actions=actions,
+        )
+
+        self.cli.console.print("[bold bright_black]Press Ctrl+O to toggle trace details.[/]")
+
+    def cmd_compact(self, args: str):
+        """Manually trigger a major compact on the current session.
+
+        ``/compact`` always runs the LLM-driven major summarization pass.
+        Minor compact is driven by the rolling-window trigger inside the
+        agent loop and has no useful manual variant — if its conditions
+        aren't met, the call would be a no-op; if they are, it has already
+        run automatically. So the CLI only exposes ``major``.
+        """
+        if not self.current_node:
+            self.console.print("[yellow]No active session to compact.[/]")
+            return
+
+        session_info = asyncio.run(self.current_node.get_session_info())
+        if not session_info.get("session_id"):
+            self.console.print("[yellow]No active session to compact.[/]")
+            return
+
+        try:
+            # In-progress hint (reuses the same helper as the auto path).
+            self.console.print(render_compact_progress_line())
+
+            async def run_compact():
+                return await self.current_node.compact(mode="major", reason="cli_manual")
+
+            result = asyncio.run(run_compact())
+
+            if result.get("success"):
+                # Clear the screen and surface the summary panel — identical to
+                # the auto (mid-turn) path's rendering, so both entry points
+                # present the compacted context the same way. Use the TUI-safe
+                # helper: ``console.clear()`` only injects escape bytes into the
+                # full-screen ``TUIOutputBuffer`` instead of wiping the viewport.
+                self._clear_scrollback()
+                self.console.print(
+                    render_compact_summary_panel(
+                        str(result.get("summary", "") or ""),
+                        int(result.get("summary_token", 0) or 0),
+                        str(result.get("history_jsonl", "") or ""),
+                    )
+                )
+
+                # Reload in-memory state from the compacted session
+                self._reload_state_from_session()
+            else:
+                error_msg = result.get("error", "Unknown error occurred")
+                self.console.print(f"[red]✗ Failed to compact session:[/] {error_msg}")
+
+        except Exception as e:
+            logger.error(f"Error during manual compact: {e}")
+            self.console.print(f"[red]Error:[/] {str(e)}")
+
+    def _reload_state_from_session(self):
+        """Reload in-memory state from the current session after compaction.
+
+        Clears accumulated action/chat history and rebuilds it from the
+        persisted session messages, then re-renders the conversation on
+        screen so the CLI display matches the compacted DB state.
+        """
+        from pico.models.session_manager import SessionManager
+
+        session_id = self.current_node.session_id
+        session_manager = SessionManager(self.cli.agent_config.session_dir, scope=self.cli.scope)
+        messages = session_manager.get_session_messages(session_id)
+
+        # Reset in-memory state
+        self.all_turn_actions = []
+        self.last_actions = []
+        self.chat_history = []
+        self._trace_verbose = False
+        if self.current_node:
+            self.current_node.actions = []
+
+        # Rebuild state from session messages
+        if messages:
+            self.console.print()
+            last_assistant_actions = self._render_restored_messages(messages)
+
+            if last_assistant_actions:
+                self.last_actions = last_assistant_actions
+
+    @staticmethod
+    def _extract_node_type_from_session_id(session_id: str) -> str:
+        """Extract node type from session_id format {node_name}_session_{uuid}."""
+        from pico.models.session_manager import extract_agent_from_session_id
+
+        return extract_agent_from_session_id(session_id)
+
+    def cmd_resume(self, args: str):
+        """Resume a previous chat session for the active agent."""
+        from pico.models.session_manager import SessionManager, session_matches_agent
+
+        try:
+            session_manager = SessionManager(self.cli.agent_config.session_dir, scope=self.cli.scope)
+
+            # If session_id provided directly, use it
+            target_session_id = args.strip() if args else None
+            intended_agent = getattr(self.cli, "default_agent", "") or None
+            agent_label = intended_agent or "chat"
+
+            if not target_session_id:
+                # List sessions for the current agent only
+                sessions = session_manager.list_sessions(sort_by_modified=True)
+                sessions = [sid for sid in sessions if session_matches_agent(sid, intended_agent)]
+                if not sessions:
+                    self.console.print(f"[yellow]No sessions found for agent '{agent_label}'.[/]")
+                    return
+
+                # Get session info and filter empty sessions
+                session_infos = []
+                for sid in sessions:
+                    info = session_manager.get_session_info(sid)
+                    if info.get("exists") and info.get("message_count", 0) > 0:
+                        session_infos.append(info)
+
+                if not session_infos:
+                    self.console.print(f"[yellow]No sessions with messages found for agent '{agent_label}'.[/]")
+                    return
+
+                # Sort by updated_at descending (newest first)
+                session_infos.sort(
+                    key=lambda x: x.get("updated_at") or x.get("latest_message_at") or "",
+                    reverse=True,
+                )
+
+                items = []
+                from pico.cli.manual_exec import exec_preview
+
+                for info in session_infos:
+                    sid = info["session_id"]
+                    raw_first_msg = info.get("first_user_message", "") or ""
+                    if not isinstance(raw_first_msg, str):
+                        raw_first_msg = str(raw_first_msg)
+                    # A manual-execution first message renders as its raw
+                    # marker+JSON; show the friendly ``sql>``/``bash>`` preview.
+                    raw_first_msg = exec_preview(raw_first_msg)
+                    first_msg = raw_first_msg.replace("\n", " ").replace("\r", " ")
+                    if not first_msg:
+                        first_msg = "(empty)"
+                    updated = format_local_time(info.get("updated_at") or info.get("latest_message_at")) or "N/A"
+                    msg_count = str(info.get("message_count", 0))
+                    items.append(
+                        ListItem(key=sid, primary=first_msg, secondary=f"{sid}  Updated: {updated}  Msgs: {msg_count}")
+                    )
+
+                app = ListSelectorApp(title=f"Resume session ({agent_label})", items=items)
+                tui_app = getattr(self.cli, "tui_app", None)
+                if tui_app is not None and getattr(tui_app, "_loop", None) is not None:
+                    selection = tui_app.run_wizard(app.build_embedded_panel)
+                else:
+                    selection = app.run()
+                if selection is None:
+                    self.console.print("[dim]Cancelled.[/]")
+                    return
+
+                target_session_id = selection.key
+
+            # Validate the session exists
+            if not session_manager.session_exists(target_session_id):
+                self.console.print(f"[red]Session not found:[/] {target_session_id}")
+                return
+
+            # Extract node type and create the appropriate node
+            node_name = self._extract_node_type_from_session_id(target_session_id)
+            subagent_name = node_name if node_name != "chat" else None
+
+            self.console.print(f"[dim]Resuming session: {target_session_id} (type: {node_name})...[/]")
+
+            # Pass session_id at construction so ``AgenticNode.__init__`` can
+            # rehydrate persisted plan-mode state (and the todolist disk-load
+            # path) before the first turn — see ``restore_plan_mode_state``.
+            with self.node_transaction():
+                new_node = self._create_new_node(subagent_name, session_id=target_session_id)
+
+                # Update state
+                self.current_node = new_node
+                self.current_subagent_name = subagent_name
+
+            # Mirror restored plan-mode flag back to the REPL toggle so the
+            # bottom status bar reflects what the node believes (PLAN vs CHAT).
+            if hasattr(self.cli, "plan_mode_active"):
+                self.cli.plan_mode_active = bool(getattr(new_node, "plan_mode_active", False))
+
+            messages = session_manager.get_session_messages(target_session_id)
+            self.all_turn_actions = []
+            self.last_actions = []
+            self.chat_history = []
+            self._trace_verbose = False
+            if messages:
+                self._clear_scrollback()
+                self.console.print()
+                print_success(self.console, f"Session resumed! Showing {len(messages)} message(s):")
+                self.console.print()
+                last_assistant_actions = self._render_restored_messages(messages)
+                if last_assistant_actions:
+                    self.last_actions = last_assistant_actions
+
+            print_success(self.console, "You can now continue the conversation.")
+
+        except Exception as e:
+            logger.error(f"Error resuming session: {e}")
+            print_error(self.console, str(e))
+
+    def cmd_rewind(self, args: str) -> Optional[str]:
+        """Rewind the current session to before a specific user turn.
+
+        Creates a new branched session containing all messages before the selected
+        user turn, and returns the selected user message so the caller can prefill
+        the input buffer.
+
+        Returns:
+            The selected user message text, or None if cancelled/error.
+        """
+        from pico.models.session_manager import SessionManager
+
+        try:
+            # Check for an active session
+            if not self.current_node or not self.current_node.session_id:
+                self.console.print("[yellow]No active session. Start a conversation first or use .resume.[/]")
+                return
+
+            source_session_id = self.current_node.session_id
+            session_manager = SessionManager(self.cli.agent_config.session_dir, scope=self.cli.scope)
+
+            # Load conversation history
+            messages = session_manager.get_session_messages(source_session_id)
+            if not messages:
+                self.console.print("[yellow]Current session has no messages.[/]")
+                return
+
+            # Build a table of user turns
+            user_turns = []
+            for msg in messages:
+                if msg.get("role") == "user":
+                    user_turns.append(msg)
+
+            if not user_turns:
+                self.console.print("[yellow]No user turns found in current session.[/]")
+                return
+
+            # Get user choice (from args or interactive list)
+            turn_str = args.strip() if args else None
+            if turn_str:
+                # Direct turn number from args
+                if turn_str.lower() == "q":
+                    self.console.print("[dim]Cancelled.[/]")
+                    return
+                try:
+                    turn_num = int(turn_str)
+                except ValueError:
+                    self.console.print("[red]Invalid input. Please enter a number.[/]")
+                    return
+                if turn_num < 1 or turn_num > len(user_turns):
+                    self.console.print(f"[red]Invalid turn number. Must be between 1 and {len(user_turns)}.[/]")
+                    return
+            else:
+                items = []
+                for idx, turn_msg in enumerate(user_turns, 1):
+                    content = (turn_msg.get("content", "") or "").replace("\n", " ").replace("\r", " ")
+                    if not content:
+                        content = "(empty)"
+                    timestamp = format_local_time(turn_msg.get("created_at"))
+                    items.append(ListItem(key=str(idx), primary=content, secondary=f"Turn: {idx}  {timestamp}"))
+
+                app = ListSelectorApp(title="Session Rewind", items=items)
+                tui_app = getattr(self.cli, "tui_app", None)
+                if tui_app is not None and getattr(tui_app, "_loop", None) is not None:
+                    selection = tui_app.run_wizard(app.build_embedded_panel)
+                else:
+                    selection = app.run()
+                if selection is None:
+                    self.console.print("[dim]Cancelled.[/]")
+                    return
+                turn_num = int(selection.key)
+
+            # Get the selected user message to return for input prefill
+            rewind_user_message = user_turns[turn_num - 1].get("content", "")
+
+            # Create the rewound session (keep everything BEFORE the selected turn)
+            if turn_num == 1:
+                # First turn selected — no prior messages, create a fresh session
+                node_name = self._extract_node_type_from_session_id(source_session_id)
+                with self.node_transaction():
+                    new_node = self._create_new_node(node_name if node_name != "chat" else None)
+                    self.current_node = new_node
+                    self.current_subagent_name = node_name if node_name != "chat" else None
+                self.chat_history = []
+                self.all_turn_actions = []
+                self.last_actions = []
+                self._clear_scrollback()
+                self.console.print()
+                self.console.print(f"[green]Rewound to before turn 1.[/] New session: [cyan]{new_node.session_id}[/]")
+                self.console.print()
+                print_success(self.console, "Selected message placed in input buffer.")
+                return rewind_user_message
+
+            new_session_id = session_manager.rewind_session(
+                source_session_id, turn_num - 1, include_assistant_response=True
+            )
+
+            # Switch to the new session (same pattern as cmd_resume)
+            node_name = self._extract_node_type_from_session_id(new_session_id)
+            subagent_name = node_name if node_name != "chat" else None
+
+            with self.node_transaction():
+                new_node = self._create_new_node(subagent_name, session_id=new_session_id)
+
+                self.current_node = new_node
+                self.current_subagent_name = subagent_name
+            if hasattr(self.cli, "plan_mode_active"):
+                self.cli.plan_mode_active = bool(getattr(new_node, "plan_mode_active", False))
+
+            new_messages = session_manager.get_session_messages(new_session_id)
+            if new_messages:
+                self._clear_scrollback()
+                self.console.print()
+                self.console.print(
+                    f"[green]Rewound to before turn {turn_num}.[/] "
+                    f"New session: [cyan]{new_session_id}[/] ({len(new_messages)} messages)"
+                )
+                self.console.print()
+                self.all_turn_actions = []
+                self.last_actions = []
+                self.chat_history = []
+                self._trace_verbose = False
+                last_assistant_actions = self._render_restored_messages(new_messages)
+                if last_assistant_actions:
+                    self.last_actions = last_assistant_actions
+
+            print_success(self.console, "Selected message placed in input buffer.")
+            return rewind_user_message
+
+        except Exception as e:
+            logger.error(f"Error rewinding session: {e}")
+            self.console.print(f"[red]Error:[/] {str(e)}")
+        return None
+
+    def add_in_sql_context(self, sql: str, explanation: str, incremental_actions: List[ActionHistory]):
+        def _is_success(value) -> bool:
+            if isinstance(value, str):
+                return value.strip().lower() not in {"", "0", "false", "no"}
+            return bool(value)
+
+        def _maybe_parse_json(value):
+            if not isinstance(value, str):
+                return value
+            stripped = value.strip()
+            if not stripped or stripped[0] not in "[{":
+                return value
+            try:
+                return json.loads(stripped)
+            except json.JSONDecodeError:
+                return value
+
+        from pico.utils.constants import SQLType
+        from pico.utils.sql_utils import parse_sql_type
+
+        def _action_sql(act) -> str:
+            # Tool actions store params under ``input["arguments"]`` (a dict or a
+            # JSON string); fall back to the top-level shape for older payloads.
+            inp = _maybe_parse_json(act.input)
+            if not isinstance(inp, dict):
+                return ""
+            args = _maybe_parse_json(inp.get("arguments", inp))
+            if not isinstance(args, dict):
+                return ""
+            return args.get("sql") or args.get("query", "") or ""
+
+        def _is_read_sql_action(act) -> bool:
+            # ``execute_sql`` is the unified entry point; only seed SQL context
+            # from read-type statements (by input SQL), so a write/DDL never
+            # clobbers the last query's context. Covers failed reads too.
+            if act.function_name() != "execute_sql":
+                return False
+            return parse_sql_type(_action_sql(act), "") in (SQLType.SELECT, SQLType.METADATA_SHOW, SQLType.EXPLAIN)
+
+        last_sql_action = None
+        for i in range(len(incremental_actions) - 1, -1, -1):
+            action = incremental_actions[i]
+            if action and action.is_done() and action.role == ActionRole.TOOL and _is_read_sql_action(action):
+                last_sql_action = action
+                break
+
+        if last_sql_action is None:
+            # No SQL action found, skip adding to context
+            action_types = [
+                (a.action_type, a.role.value if hasattr(a.role, "value") else a.role) for a in incremental_actions
+            ]
+            logger.warning(f"No SQL action found in incremental_actions. Actions: {action_types}")
+            return
+
+        action_output = _maybe_parse_json(last_sql_action.output)
+        if not isinstance(action_output, dict):
+            logger.warning("execute_sql action output is not a dict; storing it as SQL context error")
+            error = str(action_output or "")
+            sql_return = None
+            row_count = 0
+        elif not _is_success(action_output.get("success", True)):
+            error = action_output.get("error", "") or str(action_output.get("raw_output", ""))
+            sql_return = None
+            row_count = 0
+        else:
+            tool_result = _maybe_parse_json(action_output.get("raw_output", {}))
+            if not isinstance(tool_result, dict):
+                logger.warning("execute_sql raw_output is not a dict; storing it as SQL context error")
+                error = str(tool_result or "")
+                sql_return = ""
+                row_count = 0
+            elif _is_success(tool_result.get("success", 0)):
+                data_result = tool_result.get("result")
+                error = None
+                if isinstance(data_result, dict):
+                    row_count = data_result.get("original_rows", 0)
+                    sql_return = data_result.get("compressed_data", "")
+                else:
+                    row_count = 0
+                    sql_return = str(data_result or "")
+            else:
+                error = tool_result.get("error", "")
+                sql_return = ""
+                row_count = 0
+
+        # Seed the context with the SQL of the matched read action, not the
+        # caller-supplied ``sql`` — a later write/DDL turn must not pair the
+        # read result with the wrong statement. Fall back to ``sql`` when the
+        # action carries no parseable input.
+        matched_sql = _action_sql(last_sql_action) or sql
+        sql_context = SQLContext(
+            sql_query=matched_sql,
+            sql_error=error,
+            sql_return=sql_return,
+            row_count=row_count,
+            explanation=explanation,
+        )
+        self.cli.cli_context.add_sql_context(sql_context)

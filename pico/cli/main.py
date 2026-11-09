@@ -1,0 +1,849 @@
+#!/usr/bin/env python3
+
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+"""
+Pico-CLI: Data engineering agent builds evolvable context for your data system.
+Main entry point for the CLI application.
+"""
+
+import argparse
+
+from pico import __version__
+from pico.utils.async_utils import setup_windows_policy
+from pico.utils.constants import DBType
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import configure_logging, get_logger
+from pico.utils.multiprocessing_utils import configure_multiprocessing_start_method
+
+logger = get_logger(__name__)
+
+
+class ArgumentParser:
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            description="Pico FinOps Agent",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=(
+                "subcommands:\n"
+                "  upgrade            Upgrade pico-agent and installed datus-* packages to the latest release\n"
+                "  upgrade --check    Report the latest version without installing\n"
+                "  package            Pack this project into a self-contained zip (interactive; -y for defaults)"
+            ),
+        )
+        self._setup_arguments()
+
+    def _setup_arguments(self):
+        # Add version argument
+        self.parser.add_argument("-v", "--version", action="version", version=f"Pico CLI {__version__}")
+
+        # Database connection settings
+        self.parser.add_argument(
+            "--db_type",
+            dest="db_type",
+            choices=[DBType.SQLITE, "snowflake", DBType.DUCKDB],
+            default=DBType.SQLITE,
+            metavar="DB_TYPE",
+            help="Database type to connect to (%(choices)s)",
+        )
+        self.parser.add_argument(
+            "--db_path", dest="db_path", type=str, help="Path to database file (for SQLite/DuckDB)"
+        )
+
+        # General settings
+        self.parser.add_argument(
+            "--history_file",
+            dest="history_file",
+            type=str,
+            default=None,
+            help="Path to history file (default: {agent.home}/history)",
+        )
+        self.parser.add_argument(
+            "--config",
+            dest="config",
+            type=str,
+            help="Path to configuration file (default: ./conf/agent.yml > {agent.home}/conf/agent.yml)",
+        )
+        self.parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+        self.parser.add_argument("--no_color", dest="no_color", action="store_true", help="Disable colored output")
+        # storage_path parameter deprecated - data path is now fixed at {agent.home}/data
+
+        self.parser.add_argument(
+            "--datasource",
+            type=str,
+            help="Datasource name to connect",
+            default="",
+        )
+
+        # LLM trace settings
+        self.parser.add_argument(
+            "--save_llm_trace",
+            action="store_true",
+            help="Enable saving LLM input/output traces to YAML files",
+        )
+
+        # Filesystem strict mode: fail-closed for paths outside the project
+        # root instead of prompting the broker. ``default=None`` preserves
+        # ``agent.filesystem.strict`` in YAML when neither flag is passed.
+        filesystem_strict_group = self.parser.add_mutually_exclusive_group()
+        filesystem_strict_group.add_argument(
+            "--filesystem-strict",
+            dest="filesystem_strict",
+            action="store_true",
+            default=None,
+            help="Reject filesystem reads/writes outside the project root at the "
+            "tool layer (fail-closed; no interactive prompt). Overrides "
+            "agent.filesystem.strict from YAML.",
+        )
+        filesystem_strict_group.add_argument(
+            "--no-filesystem-strict",
+            dest="filesystem_strict",
+            action="store_false",
+            help="Force-disable filesystem strict mode even if agent.filesystem.strict is true in YAML.",
+        )
+
+        # Execution mode: --web and --print are mutually exclusive
+        mode_group = self.parser.add_mutually_exclusive_group()
+        mode_group.add_argument(
+            "--web",
+            action="store_true",
+            help="Launch web-based chatbot interface",
+        )
+        mode_group.add_argument(
+            "-p",
+            "--print",
+            dest="print_mode",
+            type=str,
+            default=None,
+            help="Run a single prompt and stream MessagePayload JSON lines to stdout",
+        )
+
+        # Web interface settings
+        self.parser.add_argument(
+            "--port",
+            type=int,
+            default=8501,
+            help="Port for web interface (default: 8501)",
+        )
+
+        self.parser.add_argument(
+            "--host",
+            type=str,
+            default="localhost",
+            help="Host for web interface (default: localhost)",
+        )
+
+        self.parser.add_argument(
+            "--subagent",
+            type=str,
+            default="",
+            help="Subagent name to open directly (for web and print modes)",
+        )
+
+        self.parser.add_argument(
+            "--resume",
+            type=str,
+            default=None,
+            help="Resume an existing session by session_id (REPL or --print mode)",
+        )
+
+        self.parser.add_argument(
+            "--proxy_tools",
+            dest="proxy_tools",
+            type=str,
+            default=None,
+            help="Comma-separated tool patterns to proxy in print mode (e.g. 'filesystem_tools.*')",
+        )
+
+        self.parser.add_argument(
+            "--session-scope",
+            dest="session_scope",
+            type=str,
+            default=None,
+            help="Session scope for directory isolation (sessions stored under {session_dir}/{scope}/)",
+        )
+
+        self.parser.add_argument(
+            "--chatbot-dist",
+            dest="chatbot_dist",
+            type=str,
+            default=None,
+            help="Path to @datus/web-chatbot dist directory (for --web mode)",
+        )
+
+        self.parser.add_argument(
+            "--report-dist",
+            dest="report_dist",
+            type=str,
+            default=None,
+            help=(
+                "Path to a local @datus/web-artifact-render dist directory. When provided, "
+                "gen_visual_report copies index.css/.umd.js next to the generated "
+                "index.html so the report opens via file:// without network access. "
+                "Overrides agentic_nodes.gen_visual_report.report_dist from agent.yml."
+            ),
+        )
+
+        self.parser.add_argument(
+            "--no-open-report",
+            dest="no_open_report",
+            action="store_true",
+            default=False,
+            help=(
+                "Do not auto-open the generated report HTML in the system browser after "
+                "gen_visual_report finishes (REPL mode only — print mode never opens). "
+                "Default is to open."
+            ),
+        )
+
+        self.parser.add_argument(
+            "--stream",
+            dest="stream_thinking",
+            action="store_true",
+            default=False,
+            help="Enable streaming thinking deltas in print mode (token-by-token output)",
+        )
+
+        self.parser.add_argument(
+            "--orchestrator-tools",
+            dest="orchestrator_tools",
+            action="store_true",
+            default=False,
+            help="Expose orchestrator issue lifecycle tools in print mode",
+        )
+
+        self.parser.add_argument(
+            "--plan-mode",
+            dest="plan_mode",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable plan mode in print mode: the agent writes a plan first, the plan is "
+                "auto-confirmed (no interactive approval), then executed in the same run"
+            ),
+        )
+
+        self.parser.add_argument(
+            "--permission-mode",
+            dest="permission_mode",
+            type=str,
+            choices=["normal", "auto", "dangerous"],
+            default=None,
+            help=(
+                "Override permissions.profile from agent.yml for this run (REPL and --print). "
+                "In --print mode the run uses the configured profile by default (bash and other "
+                "tools only auto-run when an allow rule matches); pass 'dangerous' to restore "
+                "the legacy allow-everything print-mode behavior."
+            ),
+        )
+
+        self.parser.add_argument(
+            "--execution-mode",
+            dest="execution_mode",
+            type=str,
+            choices=["interactive", "workflow"],
+            default=None,
+            help=(
+                "--print only. 'workflow' (default): headless — ASK permissions fail fast with "
+                "PERMISSION_DENIED. 'interactive': permission/interaction prompts are streamed "
+                "as MessagePayload JSON on stdout and answers are read from stdin, so a driving "
+                "program can approve or deny each request."
+            ),
+        )
+
+    def parse_args(self):
+        return self.parser.parse_args()
+
+
+class Application:
+    def __init__(self):
+        self.arg_parser = ArgumentParser()
+        # Pico patch P10: set by _resolve_default_datasource when the config has no datasource at
+        # all, so --print and --web can run without one (e.g. an agent that reads its data through MCP tools).
+        self._no_datasources_configured = False
+
+    def run(self):
+        args = self.arg_parser.parse_args()
+
+        configure_logging(args.debug, console_output=False)
+
+        # REPL-only: ensure ./.pico/config.yml exists before anything touches
+        # agent config. Must run before _resolve_default_datasource so the
+        # project-level default_datasource can win over the base agent.yml's.
+        if args.print_mode is None and not args.web:
+            self._ensure_project_config(args)
+
+        is_repl = args.print_mode is None and not args.web
+        if not args.datasource:
+            # Try to auto-select: default datasource or single datasource
+            args.datasource = self._resolve_default_datasource(args, allow_empty=is_repl)
+            if not args.datasource and not is_repl and not self._no_datasources_configured:
+                return
+
+        if args.proxy_tools and args.print_mode is None:
+            self.arg_parser.parser.error("--proxy_tools requires --print mode")
+
+        if getattr(args, "orchestrator_tools", False) and args.print_mode is None:
+            self.arg_parser.parser.error("--orchestrator-tools requires --print mode")
+
+        if getattr(args, "plan_mode", False) and args.print_mode is None:
+            self.arg_parser.parser.error("--plan-mode requires --print mode (use Shift+Tab in the REPL)")
+
+        if getattr(args, "execution_mode", None) and args.print_mode is None:
+            self.arg_parser.parser.error("--execution-mode requires --print mode (the REPL is always interactive)")
+
+        if args.print_mode is not None:
+            from pico.cli.print_mode import PrintModeRunner
+
+            PrintModeRunner(args).run()
+        elif args.web:
+            self._run_web_interface(args)
+        else:
+            # Import lazily so the 'upgrade' interceptor in main() can run even
+            # when pico.cli.repl is broken (the whole point of self-upgrade).
+            from pico.cli.repl import DatusCLI
+
+            cli = DatusCLI(args)
+            cli.run()
+
+    def _resolve_default_datasource(self, args, allow_empty: bool = False) -> str:
+        """Auto-select datasource when --datasource is not specified."""
+        from rich.console import Console
+        from rich.table import Table
+
+        from pico.configuration.agent_config_loader import load_agent_config
+
+        console = Console()
+        try:
+            config = load_agent_config(config=args.config or "", action="service", reload=True, create_if_missing=True)
+        except Exception:
+            if not allow_empty:
+                self.arg_parser.parser.print_help()
+            return ""
+
+        datasources = config.services.datasources
+        if not datasources:
+            self._no_datasources_configured = True
+            return ""
+
+        # default_datasource reflects the project-level overlay when present — it
+        # is applied inside load_agent_config via _apply_project_override which
+        # flips datasources[*].default before AgentConfig is built.
+        default_db = config.services.default_datasource
+        if default_db:
+            return default_db
+
+        if allow_empty:
+            return ""
+
+        # Multiple datasources, no default — show list and ask user to specify
+        console.print("[yellow]Multiple datasources configured. Please specify --datasource <name>[/yellow]\n")
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("Name", style="cyan")
+        table.add_column("Type")
+        for name, cfg in datasources.items():
+            table.add_row(name, cfg.type)
+        console.print(table)
+        return ""
+
+    def _ensure_project_config(self, args) -> None:
+        """Ensure ``./.pico/config.yml`` exists; create a minimal one when absent.
+
+        Unlike the previous first-run wizard, this no longer prompts the user
+        to pick a model — the CLI starts with no active model and the user
+        can configure one later via ``/model``.  Only ``default_datasource``
+        is auto-selected (first DB from agent.yml) so that the REPL can
+        function immediately for database browsing.
+
+        When the file exists but references stale values, repair silently
+        (clear the model target instead of prompting).
+        """
+        from pico.configuration.agent_config_loader import load_agent_config
+        from pico.configuration.project_config import (
+            ProjectOverride,
+            project_config_path,
+            save_project_override,
+        )
+
+        if not project_config_path().exists():
+            try:
+                base_config = load_agent_config(config=args.config or "", reload=True, create_if_missing=True)
+            except Exception as e:
+                logger.error(f"Cannot create project config: base agent.yml failed to load: {e}")
+                raise
+            default_datasource = base_config.services.default_datasource
+            if not default_datasource and base_config.services.datasources:
+                default_datasource = next(iter(base_config.services.datasources))
+            override = ProjectOverride(default_datasource=default_datasource)
+            written = save_project_override(override)
+            from rich.console import Console
+
+            console = Console()
+            console.print(f"[green]Created project config:[/] {written}")
+            console.print("[dim]No model configured yet — use /model inside the CLI to set one.[/]")
+            return
+
+        self._repair_project_overrides(args)
+
+    def _repair_project_overrides(self, args) -> None:
+        """Clear stale model target silently; re-prompt only for datasource.
+
+        Model target validation is deferred to runtime — if it is stale we
+        simply clear it so the CLI starts with no active model. The user
+        can pick one later via ``/model``.
+
+        For ``default_datasource`` we still prompt interactively because the
+        REPL needs a valid DB connection to be useful.
+        """
+        import sys
+
+        from rich.console import Console
+
+        from pico.cli._cli_utils import select_choice
+        from pico.configuration.agent_config_loader import configuration_manager
+        from pico.configuration.project_config import (
+            load_project_override,
+            project_config_path,
+            save_project_override,
+        )
+
+        override = load_project_override()
+        if override is None or override.is_empty():
+            return
+
+        try:
+            raw = dict(configuration_manager(config_path=args.config or "", reload=True).data)
+        except Exception as e:
+            logger.error(f"Cannot validate project overrides: base agent.yml failed to load: {e}")
+            raise
+
+        model_names = list((raw.get("models") or {}).keys())
+        db_names = list(((raw.get("services") or {}).get("datasources") or {}).keys())
+
+        target_invalid, stale_desc = self._classify_target(override.target, raw, model_names)
+        db_invalid = override.default_datasource is not None and override.default_datasource not in db_names
+        if not (target_invalid or db_invalid):
+            return
+
+        console = Console()
+        changed = False
+
+        if target_invalid:
+            override.target = None
+            console.print(
+                f"[yellow]Cleared stale model target ({stale_desc}) from {project_config_path()}. "
+                f"Use /model to configure a new one.[/]"
+            )
+            changed = True
+
+        if db_invalid:
+            if not db_names:
+                raise DatusException(
+                    code=ErrorCode.COMMON_CONFIG_ERROR,
+                    message_args={
+                        "config_error": (
+                            "Base agent.yml has no 'agent.services.datasources' defined; cannot repair "
+                            f"default_datasource={override.default_datasource!r} in .pico/config.yml."
+                        )
+                    },
+                )
+            if not sys.stdin.isatty():
+                raise DatusException(
+                    code=ErrorCode.COMMON_CONFIG_ERROR,
+                    message_args={
+                        "config_error": (
+                            f"Project config {project_config_path()} has stale "
+                            f"default_datasource={override.default_datasource!r} and stdin is not a TTY. "
+                            f"Edit .pico/config.yml manually or rerun in an interactive terminal."
+                        )
+                    },
+                )
+            console.print(
+                f"[yellow]default_datasource[/] = {override.default_datasource!r} not found in agent.yml "
+                f"services.datasources ({sorted(db_names)}). Please pick a replacement:"
+            )
+            db_types = (raw.get("services") or {}).get("datasources") or {}
+            choices = {name: f"{name}  ({(db_types.get(name) or {}).get('type', 'unknown')})" for name in db_names}
+            picked = select_choice(console, choices, default=db_names[0])
+            override.default_datasource = picked or db_names[0]
+            changed = True
+
+        if changed:
+            save_project_override(override)
+
+    @staticmethod
+    def _classify_target(target, raw, model_names):
+        """Return ``(invalid, description)`` for a project-level target.
+
+        Each target shape is validated against the right source:
+          - legacy string / ``ProjectTarget(custom=...)`` → ``agent.models``.
+          - ``ProjectTarget(provider=..., model=...)`` → credentials must be
+            resolvable for that provider via ``agent.providers`` or the
+            catalog's ``api_key_env``; otherwise we flag it stale so the
+            caller can fall back to a custom model.
+
+        ``description`` is a human-friendly string embedded in the prompt
+        and the non-TTY error message.
+        """
+        from pico.configuration.project_config import ProjectTarget
+
+        if target is None:
+            return False, ""
+        if isinstance(target, ProjectTarget):
+            if target.custom:
+                return target.custom not in model_names, f"custom={target.custom!r}"
+            if target.provider and target.model:
+                provider = target.provider
+                desc = f"provider={provider!r} model={target.model!r}"
+                if not Application._provider_has_credentials(provider, raw):
+                    return True, desc
+                return False, desc
+            return True, repr(target)
+        return target not in model_names, f"target={target!r}"
+
+    @staticmethod
+    def _provider_has_credentials(provider: str, raw: dict) -> bool:
+        """Lightweight credential check that mirrors
+        :meth:`AgentConfig.provider_available` without instantiating the
+        full config (which would re-run override validation and defeat the
+        whole repair flow).
+        """
+        import os
+
+        from pico.configuration.agent_config import _load_provider_catalog, resolve_env
+
+        providers_raw = raw.get("providers") or {}
+        user_entry = providers_raw.get(provider) if isinstance(providers_raw, dict) else None
+        if not isinstance(user_entry, dict):
+            user_entry = {}
+
+        try:
+            catalog = _load_provider_catalog()
+        except Exception:
+            catalog = {}
+        meta = {}
+        if isinstance(catalog, dict):
+            providers_meta = catalog.get("providers") or {}
+            if isinstance(providers_meta, dict):
+                meta = providers_meta.get(provider) or {}
+                if not isinstance(meta, dict):
+                    meta = {}
+
+        auth_type = meta.get("auth_type") or user_entry.get("auth_type") or "api_key"
+        if auth_type == "subscription":
+            try:
+                from pico.auth.claude_credential import get_claude_subscription_token
+
+                token, _ = get_claude_subscription_token(api_key_from_config=user_entry.get("api_key") or "")
+                return bool(token)
+            except Exception:
+                return False
+        if auth_type == "oauth":
+            try:
+                from pico.auth.oauth_manager import OAuthManager
+
+                return OAuthManager().is_authenticated()
+            except Exception:
+                return False
+
+        api_key = user_entry.get("api_key")
+        if api_key and resolve_env(str(api_key)).strip() and not resolve_env(str(api_key)).startswith("<MISSING:"):
+            return True
+        env_name = meta.get("api_key_env")
+        if env_name and os.getenv(str(env_name), "").strip():
+            return True
+        return False
+
+    def _run_web_interface(self, args):
+        """Launch web chatbot interface"""
+        from pico.cli.web import run_web_interface
+
+        run_web_interface(args)
+
+
+# Subcommand tokens owned by built-in handlers in ``main()``. An installed
+# adapter/plugin must never shadow these via the ``pico.cli_commands`` /
+# ``pico.plugins`` entry-point groups. Kept in one place so the reserved set
+# is easy to extend.
+_RESERVED_SUBCOMMANDS = frozenset({"upgrade", "skill", "plugin", "package"})
+
+
+def _coerce_exit_code(rc: object, name: str) -> int:
+    """Map a handler's return value onto a process exit code.
+
+    The documented contract is ``int | None`` (``None`` meaning success), but
+    legacy handlers cannot be assumed compliant — a non-int return after an
+    otherwise successful run must not crash the CLI. ``True``/``False`` map to
+    success/failure (``int(True)`` would read success as exit code 1).
+    """
+    if rc is None or rc is True:
+        return 0
+    if rc is False:
+        return 1
+    if isinstance(rc, int):
+        return rc
+    logger.warning("Command '%s' returned non-int %r; treating as success.", name, rc)
+    return 0
+
+
+def _dispatch_external_command(argv: "list[str]") -> "int | None":
+    """Dispatch ``pico <name> ...`` to a ``pico.cli_commands`` entry point.
+
+    Adapter packages register a console handler under the
+    ``pico.cli_commands`` group — ``hello = datus_hello.cli:main`` — so
+    installing the adapter adds a ``pico hello ...`` subcommand without any
+    change to pico-agent.
+
+    Runs before argparse (the main parser declares only optional flags, so an
+    unknown positional would otherwise error out). Returns the handler's exit
+    code, or ``None`` when no entry point matches so the caller falls through to
+    the REPL / argparse path. The handler contract is ``main(argv: list[str]) ->
+    int | None``; it receives the arguments *after* the subcommand name.
+    """
+    import sys
+
+    if not argv or argv[0].startswith("-") or argv[0] in _RESERVED_SUBCOMMANDS:
+        return None
+
+    name = argv[0]
+    from pico.plugins.registry import entry_points_for_group
+
+    candidates = entry_points_for_group("pico.cli_commands", name=name)
+    if not candidates:
+        return None
+    if len(candidates) > 1:
+        logger.warning("Multiple pico.cli_commands entry points named %r; using the first.", name)
+
+    try:
+        handler = candidates[0].load()
+    except Exception as exc:  # noqa: BLE001 - a broken adapter must not crash the CLI
+        logger.error("Failed to load '%s' command from adapter: %s", name, exc)
+        return 1
+
+    try:
+        rc = handler(argv[1:])
+    except Exception as exc:  # noqa: BLE001 - a broken adapter must not crash the CLI
+        logger.error("Adapter command '%s' failed: %s", name, exc)
+        print(f"pico {name}: {exc}", file=sys.stderr)
+        return 1
+    return _coerce_exit_code(rc, name)
+
+
+def _split_plugin_globals(args: "list[str]") -> "tuple[str | None, str | None, list[str]]":
+    """Consume leading pico globals ``--profile`` / ``--config`` for a plugin.
+
+    Only options appearing *before* the first non-option token are treated as
+    pico globals; everything from the first command token onward belongs to
+    the plugin. Returns ``(profile, config, remaining_args)``.
+
+    The permission layer mirrors the ``--profile`` part of this stripping
+    (``bash_rules._normalize_datus_plugin_argv``) so plugin-declared rules
+    match profile-qualified invocations — keep the two in sync.
+    """
+    from pico.plugins.runtime_context import split_plugin_globals
+
+    return split_plugin_globals(args)
+
+
+def _dispatch_plugin_command(argv: "list[str]") -> "int | None":
+    """Dispatch ``pico <plugin> ...`` to a ``pico.plugins`` manifest plugin.
+
+    A plugin package registers its package name under the ``pico.plugins``
+    group (``hello = datus_plugin_hello``) and declares a ``cli`` code ref in
+    its bundled ``pico-plugin.yml``. pico strips its own leading
+    ``--profile`` / ``--config`` globals, resolves the active profile from
+    ``agent.plugins.<name>.<profile>`` (env-expanded), and calls the declared
+    entry as ``main(rest, profile)``.
+
+    Runs before :func:`_dispatch_external_command` (the legacy
+    ``pico.cli_commands`` path). Returns the plugin's exit code, or ``None``
+    when no plugin claims the token so the caller falls through.
+    """
+    if not argv or argv[0].startswith("-") or argv[0] in _RESERVED_SUBCOMMANDS:
+        return None
+
+    name = argv[0]
+    from rich.console import Console
+
+    from pico.cli.cli_styles import print_error
+    from pico.plugins import store
+    from pico.plugins.registry import load_plugin_manifest, plugin_entry_point_exists, resolve_code_ref
+
+    # Route plugin dispatch errors through the shared CLI styling on an
+    # stderr-backed Console (so stdout stays reserved for the plugin's output).
+    err_console = Console(stderr=True)
+
+    profile_name, config_path, rest = _split_plugin_globals(argv[1:])
+    runtime_context = None
+    try:
+        from pico.plugins.runtime_context import has_plugin_config_global, load_runtime_context_from_env
+
+        runtime_context = load_runtime_context_from_env(expected_plugin=name)
+        if runtime_context is not None and has_plugin_config_global(argv[1:]):
+            raise ValueError(
+                "`--config` is unavailable for managed plugin commands; the AuthProvider AgentConfig is authoritative"
+            )
+    except Exception as exc:  # noqa: BLE001 - malformed runtime data must fail closed
+        logger.error("Failed to decode runtime config for plugin '%s': %s", name, exc)
+        print_error(err_console, f"pico {name}: {exc}")
+        return 3
+
+    # A managed plugin lives in its own ``~/.pico/plugins/{name}/`` directory;
+    # append it to ``sys.path`` so the entry-point probe can see it. Plugins
+    # mounted through ``agent.plugin_paths`` live elsewhere, so when no managed
+    # directory claims the token the configured paths are injected instead.
+    # Both are path-only — they do NOT import the plugin package (reading the
+    # manifest never executes plugin code, and the ``cli`` ref is imported only
+    # after every gate below has passed), so the ``plugins_enabled`` master
+    # switch is still honoured before any third-party module-level code runs.
+    if runtime_context is not None and runtime_context.plugin_path:
+        store.activate_paths([runtime_context.plugin_path])
+    elif runtime_context is not None:
+        # A site-packages plugin is already visible to this interpreter.
+        pass
+    elif store.plugin_dir(name).is_dir():
+        store.activate_name(name)
+    else:
+        from pico.configuration.agent_config_loader import get_plugin_paths
+
+        store.activate_paths(get_plugin_paths(config_path or ""))
+
+    # Metadata-only probe: with ``plugins_enabled: false`` the plugin package
+    # must not even be imported, so the master switch is checked before
+    # ``resolve_code_ref`` runs the plugin's module-level code.
+    if not plugin_entry_point_exists(name):
+        if runtime_context is not None:
+            print_error(err_console, f"pico {name}: runtime plugin `{name}` is not installed or discoverable")
+            return 3
+        return None
+
+    try:
+        if runtime_context is not None:
+            profile = runtime_context.profile
+        else:
+            from pico.configuration.agent_config_loader import load_agent_config
+
+            kwargs = {"config": config_path} if config_path else {}
+            agent_config = load_agent_config(**kwargs)
+            if not getattr(agent_config, "plugins_enabled", True):
+                print_error(err_console, f"pico {name}: plugins are disabled (`agent.plugins_enabled: false`)")
+                return 3
+            # Respect per-project activation: a plugin the project's
+            # ``plugins:`` whitelist does not enable is inactive.
+            if hasattr(agent_config, "plugin_active") and not agent_config.plugin_active(name):
+                print_error(
+                    err_console,
+                    f"pico {name}: plugin `{name}` is not active for this project. "
+                    f"Enable it with `pico plugin enable {name}` or via `/plugins`.",
+                )
+                return 3
+            profile = agent_config.get_plugin_profile(name, profile_name)
+    except Exception as exc:  # noqa: BLE001 - surface a clean error, do not crash
+        logger.error("Failed to resolve config for plugin '%s': %s", name, exc)
+        print_error(err_console, f"pico {name}: {exc}")
+        return 3
+
+    manifest = load_plugin_manifest(name)
+    if manifest is None:
+        if runtime_context is not None:
+            print_error(err_console, f"pico {name}: runtime plugin `{name}` has no valid manifest")
+            return 3
+        # Entry point exists but the manifest is missing/rejected (already
+        # warned about); fall through so a same-named ``pico.cli_commands``
+        # handler still gets its chance.
+        return None
+
+    if not manifest.cli:
+        print_error(err_console, f"pico {name}: plugin declares no CLI command in its manifest")
+        return 2
+
+    func = resolve_code_ref(manifest.cli, name)
+    if not callable(func):
+        print_error(err_console, f"pico {name}: plugin CLI entry `{manifest.cli}` could not be loaded")
+        return 1
+
+    try:
+        rc = func(rest, profile)
+    except Exception as exc:  # noqa: BLE001 - a broken plugin must not crash the CLI
+        logger.error("Plugin '%s' failed: %s", name, exc)
+        print_error(err_console, f"pico {name}: {exc}")
+        return 1
+    return _coerce_exit_code(rc, name)
+
+
+def main():
+    """Entry point for console scripts"""
+    import signal
+    import sys
+
+    configure_multiprocessing_start_method()
+
+    # Intercept 'upgrade' subcommand: self-upgrade pico-agent and the installed
+    # datus-* adapter packages. Handled before the REPL is built so it works even
+    # when the installed CLI is otherwise broken.
+    if len(sys.argv) > 1 and sys.argv[1] == "upgrade":
+        from pico.cli.upgrade_cli import run_upgrade_command
+
+        configure_logging(False, console_output=False)
+        sys.exit(run_upgrade_command(sys.argv[2:]))
+
+    # Intercept 'plugin' management subcommand (install/uninstall/list/info/
+    # enable/disable). Handled before the REPL and never gated by a plugin's
+    # own ``enabled`` flag, so a disabled plugin can still be re-enabled.
+    if len(sys.argv) > 1 and sys.argv[1] == "plugin":
+        from pico.cli.plugin_cli import run_plugin_command
+
+        configure_logging(False, console_output=False)
+        sys.exit(run_plugin_command(sys.argv[2:]))
+
+    # Intercept 'package' — export the current project as a self-contained
+    # zip. Interactive wizard; handled before the REPL like plugin/upgrade.
+    if len(sys.argv) > 1 and sys.argv[1] == "package":
+        from pico.cli.package_cli import run_package_command
+
+        configure_logging(False, console_output=False)
+        sys.exit(run_package_command(sys.argv[2:]))
+
+    # Intercept 'skill' subcommand and delegate to pico.main's skill handler
+    if len(sys.argv) > 1 and sys.argv[1] == "skill":
+        from pico.main import create_parser as create_main_parser
+
+        parser = create_main_parser()
+        args = parser.parse_args()
+        configure_logging(getattr(args, "debug", False), console_output=False)
+        from pico.cli.skill_cli import run_skill_command
+
+        sys.exit(run_skill_command(args))
+
+    # Intercept plugin subcommands (``pico hello ...``) registered under the
+    # ``pico.plugins`` entry-point group, then legacy adapter subcommands under
+    # ``pico.cli_commands`` (``pico mwaa ...``). Plugins win when both claim a
+    # name. Falls through to the REPL when nothing claims the token.
+    if len(sys.argv) > 1 and not sys.argv[1].startswith("-") and sys.argv[1] not in _RESERVED_SUBCOMMANDS:
+        configure_logging(False, console_output=False)
+        rc = _dispatch_plugin_command(sys.argv[1:])
+        if rc is None:
+            rc = _dispatch_external_command(sys.argv[1:])
+        if rc is not None:
+            sys.exit(rc)
+
+    app = Application()
+    try:
+        app.run()
+    finally:
+        # Ignore further SIGINT once the REPL has returned. Python's interpreter
+        # shutdown (threading._shutdown, atexit handlers) acquires locks while
+        # waiting for non-daemon threads from third-party libraries (agents SDK
+        # tracing worker, httpx pools, MCP clients). A user Ctrl+C during that
+        # wait raises KeyboardInterrupt mid-`lock.acquire()` and surfaces as
+        # noisy "Exception ignored in: <module 'threading'>" tracebacks.
+        try:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass
+
+
+if __name__ == "__main__":
+    setup_windows_policy()
+    main()

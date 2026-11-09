@@ -1,0 +1,100 @@
+# Pico FinOps Agent profile: Pico's agent.yml for the agent (in the image: ~/.pico/conf/agent.yml).
+#
+# Local-only: the agent is one process (pico_finops_agent/agent.py: the scheduler + Pico's Slack gateway) and runs no
+# API server; it opens no port. Slack is reached outbound (Socket Mode).
+#
+# Every customer value comes from the environment (pico_finops_agent/.env.example lists them); nothing here
+# is a secret. In the image this file is ~/.pico/conf/agent.yml, so `pico focus-data ...` run by the
+# agent's bash tool (cwd = project_root) finds it without --config.
+# Bash is ON but limited to `pico focus-data` (allowed_patterns + the plugin's permission rules).
+# Guarded by tests/fork/test_pico_finops_agent_config.py.
+agent:
+  home: ~/.pico
+  project_name: focus
+  project_root: /pico-workspace
+
+  providers:
+    openai:
+      api_key: ${OPENAI_API_KEY:-}
+    claude:
+      api_key: ${ANTHROPIC_API_KEY:-}
+    deepseek:
+      api_key: ${DEEPSEEK_API_KEY:-}
+    gemini:
+      api_key: ${GEMINI_API_KEY:-}
+
+  # The default model: Pico's provider-level selection. The agent replaces it at start with the .env choice
+  # (AGENT_LLM_PROVIDER / AGENT_LLM_MODEL, pico_finops_agent/llm.py), so this applies only to Pico run without the
+  # agent. Plain values: Pico does not expand environment placeholders in these two keys.
+  target_provider: gemini
+  target_model: gemini-3.8-flash
+
+  # No statement that writes, on any datasource (one-way switch).
+  sql_read_only: true
+
+  services:
+    datasources:
+      focus:
+        type: duckdb
+        uri: duckdb:////data/focus.duckdb
+        read_only: true
+        # Agent SQL may read only this file: no read_csv('/etc/...'), no URLs.
+        enable_external_access: false
+        default: true
+
+  permissions:
+    profile: normal
+    rules:
+      - tool: filesystem_tools
+        pattern: "*"
+        permission: deny
+      # No web access (web_fetch would otherwise be on): the agent needs none, and a fetched URL is
+      # an easy way to leak cost data.
+      - tool: web_tool
+        pattern: "*"
+        permission: deny
+
+  bash:
+    enabled: true
+    allowed_patterns: ["pico:focus-data"]
+
+  filesystem:
+    strict: true
+    allow_read: []
+    allow_write: []
+
+  skills:
+    directories:
+      - ~/.pico/skills
+
+  plugins:
+    focus-data:
+      default:
+        default: true
+        cache_path: /data/focus.duckdb
+        region: ${FOCUS_REGION}
+        export_bucket: ${FOCUS_EXPORT_BUCKET}
+        export_prefix: ${FOCUS_EXPORT_PREFIX}
+        table_bucket_arn: ${FOCUS_TABLE_BUCKET_ARN}
+        namespace: ${FOCUS_NAMESPACE:-pico_finops_agent}
+        table: ${FOCUS_TABLE:-focus}
+        state_bucket: ${FOCUS_STATE_BUCKET}
+        state_key: ${FOCUS_STATE_KEY:-pico-finops-agent/state.json}
+        months: ${FOCUS_MONTHS:-4}
+        lambda_role_arn: ${FOCUS_LAMBDA_ROLE_ARN}
+
+  # Slack is off when the tokens are unset (the adapter needs both non-empty).
+  # When on, Slack is NOT authenticated per user: anyone who can message the bot in the workspace
+  # can ask cost questions and run `pico focus-data status|load`. A user/channel allow-list is
+  # not built yet and needs a Slack adapter change; until then, install
+  # the app only in a workspace whose members may all see the cost data.
+  channels:
+    slack:
+      adapter: slack
+      enabled: true
+      datasource: focus
+      # Post only the answer (no "load_skill / execute_sql" step lines).
+      verbose: quiet
+      extra:
+        app_token: ${SLACK_APP_TOKEN:-}
+        bot_token: ${SLACK_BOT_TOKEN:-}

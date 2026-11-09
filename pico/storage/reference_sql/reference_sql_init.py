@@ -1,0 +1,579 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+import asyncio
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import yaml
+
+from pico.agent.node.sql_summary_agentic_node import SqlSummaryAgenticNode
+from pico.configuration.agent_config import AgentConfig
+from pico.schemas.action_history import ActionHistoryManager, ActionStatus
+from pico.schemas.batch_events import BatchEventEmitter, BatchEventHelper
+from pico.schemas.sql_summary_agentic_node_models import SqlSummaryNodeInput
+from pico.storage.knowledge_provenance import (
+    REFERENCE_SQL_ARTIFACT_TYPE,
+    KnowledgeProvenanceStore,
+    build_reference_sql_provenance_rows,
+    is_knowledge_provenance_enabled,
+    reference_sql_artifact_ids_for_items,
+)
+from pico.storage.reference_sql.init_utils import exists_reference_sql, gen_reference_sql_id
+from pico.storage.reference_sql.sql_file_processor import process_sql_files
+from pico.storage.reference_sql.store import ReferenceSqlRAG
+from pico.utils.loggings import get_logger
+from pico.utils.sql_utils import normalize_sql
+from pico.utils.terminal_utils import suppress_keyboard_input
+
+logger = get_logger(__name__)
+
+BIZ_NAME = "reference_sql_init"
+
+
+def _sync_reference_sql_provenance(agent_config: AgentConfig, items: list[Dict[str, Any]]) -> int:
+    if not items or not is_knowledge_provenance_enabled(agent_config):
+        return 0
+
+    artifact_ids = reference_sql_artifact_ids_for_items(items)
+    if not artifact_ids:
+        return 0
+
+    rows = build_reference_sql_provenance_rows(items)
+    try:
+        written = KnowledgeProvenanceStore(agent_config).replace_for_artifact_ids(
+            REFERENCE_SQL_ARTIFACT_TYPE, artifact_ids, rows
+        )
+        logger.info(
+            "Synced %d reference SQL provenance row(s) for %d reference SQL artifact(s)",
+            written,
+            len(artifact_ids),
+        )
+        return written
+    except Exception as exc:
+        logger.warning("Failed to sync reference SQL provenance sidecar: %s", exc)
+        return 0
+
+
+def _action_status_value(action: Any) -> Optional[str]:
+    status = getattr(action, "status", None)
+    if status is None:
+        return None
+    return status.value if hasattr(status, "value") else str(status)
+
+
+def _resolve_generated_summary_file_path(
+    agent_config: AgentConfig,
+    node: SqlSummaryAgenticNode,
+    sql_summary_file: str,
+) -> Optional[Path]:
+    """Resolve a generated SQL summary path reported by the workflow node."""
+    knowledge_base_dir = getattr(node, "knowledge_base_dir", None)
+    if isinstance(knowledge_base_dir, (str, os.PathLike)) and not hasattr(knowledge_base_dir, "mock_calls"):
+        from pico.storage.artifact_path import resolve_kb_sandbox_path
+
+        resolved = resolve_kb_sandbox_path(sql_summary_file, "sql_summary", str(knowledge_base_dir))
+        return Path(resolved) if resolved else None
+
+    reported_path = Path(sql_summary_file)
+    if reported_path.is_absolute():
+        return reported_path
+
+    parts = reported_path.parts
+    if "sql_summaries" in parts:
+        summary_dir_index = parts.index("sql_summaries")
+        summary_relative_parts = parts[summary_dir_index + 1 :]
+        if summary_relative_parts:
+            return Path(agent_config.path_manager.sql_summary_path()).joinpath(*summary_relative_parts)
+
+    return Path(agent_config.path_manager.sql_summary_path()) / reported_path
+
+
+async def process_sql_item(
+    item: dict,
+    agent_config: AgentConfig,
+    subject_tree: Optional[list] = None,
+    event_helper: Optional[BatchEventHelper] = None,
+    sql_id: Optional[str] = None,
+    extra_instructions: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Process a single SQL item using SqlSummaryAgenticNode in workflow mode.
+
+    Args:
+        item: Dict containing sql, comment, summary, filepath fields
+        agent_config: Agent configuration
+        subject_tree: Optional predefined subject tree categories
+        event_helper: Optional BatchEventHelper to stream progress events
+        sql_id: Optional precomputed SQL identifier
+
+    Returns:
+        SQL summary file path if successful, None otherwise
+    """
+    logger.debug(f"Processing SQL item: {item.get('filepath', '')}, {item.get('sql', '')}, {item.get('comment', '')}")
+    sql_id = sql_id or gen_reference_sql_id(item.get("sql", ""))
+    filepath = item.get("filepath")
+
+    try:
+        # Create input for SqlSummaryAgenticNode
+        user_message = "Analyze and summarize this SQL query"
+        if extra_instructions:
+            user_message = f"{user_message}\n\n## Additional Instructions\n{extra_instructions}"
+
+        sql_input = SqlSummaryNodeInput(
+            user_message=user_message,
+            sql_query=item.get("sql"),
+        )
+
+        # Create SqlSummaryAgenticNode in workflow mode (no user interaction)
+        node = SqlSummaryAgenticNode(
+            node_name="gen_sql_summary",
+            agent_config=agent_config,
+            execution_mode="workflow",
+            subject_tree=subject_tree,
+        )
+
+        action_history_manager = ActionHistoryManager()
+        sql_summary_file = None
+
+        # Execute and collect results
+        node.input = sql_input
+        async for action in node.execute_stream(action_history_manager):
+            if event_helper:
+                event_helper.item_processing(
+                    item_id=sql_id,
+                    action_name="gen_sql_summary",
+                    status=_action_status_value(action),
+                    group_id=filepath,
+                    messages=action.messages,
+                    output=action.output,
+                )
+            if action.status == ActionStatus.SUCCESS and action.output:
+                output = action.output
+                if isinstance(output, dict):
+                    sql_summary_file = output.get("sql_summary_file")
+
+        if not sql_summary_file:
+            logger.error(
+                f"Failed to generate SQL summary for {item.get('filepath', '')},"
+                f"sql: {item.get('sql', '')}, comment: {item.get('comment', '')}"
+            )
+            return None
+
+        logger.info(f"Generated SQL summary: {sql_summary_file}")
+
+        file_path = _resolve_generated_summary_file_path(agent_config, node, sql_summary_file)
+        import yaml
+
+        try:
+            # Load YAML file to get name and subject_tree
+            if not file_path:
+                logger.warning(f"SQL summary file rejected by sandbox check: {sql_summary_file!r}")
+                return None
+            with open(file_path, "r", encoding="utf-8") as f:
+                doc = yaml.safe_load(f)
+                if not item.get("name"):
+                    item["name"] = doc.get("name", "")
+                item["subject_tree"] = doc.get("subject_tree")
+        except Exception as e:
+            logger.warning(f"Failed to open summary file for {file_path}: {e}")
+        return sql_summary_file
+
+    except Exception as e:
+        logger.error(f"Error processing SQL item {item.get('filepath', '')}: {e}")
+        return None
+
+
+async def init_reference_sql_async(
+    storage: ReferenceSqlRAG,
+    global_config: AgentConfig,
+    sql_dir: str,
+    validate_only: bool = False,
+    build_mode: str = "overwrite",
+    pool_size: int = 1,
+    subject_tree: Optional[list] = None,
+    emit: Optional[BatchEventEmitter] = None,
+    extra_instructions: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Async version: Initialize reference SQL from SQL files directory.
+
+    Args:
+        storage: ReferenceSqlRAG instance
+        sql_dir: The path to the SQL files directory
+        validate_only: If true, only validate SQL queries.
+        global_config: Global agent configuration for LLM model creation
+        build_mode: "overwrite" to replace all data, "incremental" to add new entries
+        pool_size: Number of threads for parallel processing
+        subject_tree: Optional predefined subject tree categories
+        emit: Optional callback to stream BatchEvent progress events
+        extra_instructions: Optional extra instructions for the LLM
+
+    Returns:
+        Dict containing initialization results and statistics
+    """
+    event_helper = BatchEventHelper(BIZ_NAME, emit)
+
+    if not sql_dir:
+        logger.warning("No --sql_dir provided, reference SQL storage initialized but empty")
+        return {
+            "status": "success",
+            "message": "reference_sql storage initialized (empty - no --sql_dir provided)",
+            "valid_entries": 0,
+            "processed_entries": 0,
+            "invalid_entries": 0,
+            "total_stored_entries": storage.get_reference_sql_size(),
+        }
+
+    logger.info(f"Processing SQL files from directory: {sql_dir}")
+
+    # Emit task started
+    event_helper.task_started(sql_dir=sql_dir)
+
+    # Process and validate SQL files
+    valid_items, invalid_items = process_sql_files(sql_dir)
+    validate_errors = (
+        []
+        if not invalid_items
+        else [
+            f"Failed to validate SQL item at {i['filepath']}:{i['line_number']} with error `{i['error']}`. "
+            "Please check that the SQL meets expectations (e.g., valid syntax, tables exist)."
+            for i in invalid_items
+        ]
+    )
+
+    # Emit task validated
+    event_helper.task_validated(
+        total_items=len(valid_items) + len(invalid_items) if invalid_items else len(valid_items),
+        valid_items=len(valid_items) if valid_items else 0,
+        invalid_items=len(invalid_items) if invalid_items else 0,
+    )
+
+    # If validate-only mode, exit after processing files
+    if validate_only:
+        logger.info(
+            f"Validate-only mode: Processed {len(valid_items)} valid items and "
+            f"{len(invalid_items) if invalid_items else 0} invalid items"
+        )
+
+        return {
+            "status": "success",
+            "message": "SQL files processing completed (validate-only mode)",
+            "valid_entries": len(valid_items) if valid_items else 0,
+            "processed_entries": 0,
+            "invalid_entries": len(invalid_items) if invalid_items else 0,
+            "total_stored_entries": 0,
+            "validation_errors": "\n".join(validate_errors),
+        }
+
+    if not valid_items:
+        logger.info("No valid SQL items found to process")
+        return {
+            "status": "success",
+            "message": f"No valid SQL items found in directory: {sql_dir}. Please ensure the directory is correct.",
+            "valid_entries": 0,
+            "processed_entries": 0,
+            "invalid_entries": len(invalid_items) if invalid_items else 0,
+            "total_stored_entries": storage.get_reference_sql_size(),
+            "validation_errors": "\n".join(validate_errors),
+        }
+
+    # Filter out existing items in incremental mode
+    if build_mode == "incremental":
+        # Check for existing entries
+        existing_ids = exists_reference_sql(storage, build_mode)
+
+        new_items = []
+        for item_dict in valid_items:
+            item_id = gen_reference_sql_id(item_dict["sql"])
+            if item_id not in existing_ids:
+                new_items.append(item_dict)
+
+        logger.info(f"Incremental mode: found {len(valid_items)} items, {len(new_items)} new items to process")
+        items_to_process = new_items
+    else:
+        items_to_process = valid_items
+
+    # Force serial processing when subject_tree is not predefined
+    # to avoid race conditions in subject tree creation
+    effective_pool_size = pool_size
+    if subject_tree is None and pool_size > 1:
+        logger.info(
+            f"No predefined subject_tree provided, forcing serial processing "
+            f"(pool_size: {pool_size} -> 1) to avoid race conditions"
+        )
+        effective_pool_size = 1
+
+    processed_count = 0
+    process_errors = []
+    if items_to_process:
+        # Emit task processing
+        event_helper.task_processing(total_items=len(items_to_process))
+
+        semaphore = asyncio.Semaphore(effective_pool_size)
+        logger.info(f"Processing {len(items_to_process)} SQL items with concurrency={effective_pool_size}")
+        file_counts: Dict[str, int] = {}
+        for item in items_to_process:
+            file_key = str(item.get("filepath") or "unknown_file")
+            file_counts[file_key] = file_counts.get(file_key, 0) + 1
+        file_remaining = dict(file_counts)
+        file_started: set[str] = set()
+        file_lock = asyncio.Lock()
+
+        async def emit_group_started_if_needed(file_key: str, filepath: Optional[str]) -> None:
+            async with file_lock:
+                if file_key in file_started:
+                    return
+                file_started.add(file_key)
+            event_helper.group_started(
+                group_id=file_key,
+                total_items=file_counts.get(file_key),
+                filepath=filepath,
+            )
+
+        async def emit_group_completed_if_done(file_key: str, filepath: Optional[str]) -> None:
+            async with file_lock:
+                remaining = file_remaining.get(file_key)
+                if remaining is None:
+                    return
+                remaining -= 1
+                file_remaining[file_key] = remaining
+                if remaining != 0:
+                    return
+            event_helper.group_completed(
+                group_id=file_key,
+                total_items=file_counts.get(file_key),
+                filepath=filepath,
+            )
+
+        async def process_with_semaphore(item):
+            sql_id = gen_reference_sql_id(item.get("sql", ""))
+            filepath = item.get("filepath")
+            file_key = str(filepath or "unknown_file")
+            async with semaphore:
+                await emit_group_started_if_needed(file_key, filepath)
+                event_helper.item_started(
+                    item_id=sql_id,
+                    group_id=file_key,
+                    sql=item.get("sql"),
+                )
+                error = None
+                result = None
+                try:
+                    result = await process_sql_item(
+                        item,
+                        global_config,
+                        subject_tree,
+                        event_helper=event_helper,
+                        sql_id=sql_id,
+                        extra_instructions=extra_instructions,
+                    )
+                except Exception as exc:
+                    error = exc
+                    event_helper.item_failed(
+                        item_id=sql_id,
+                        error=str(exc),
+                        group_id=file_key,
+                        exception_type=type(exc).__name__,
+                    )
+                if result:
+                    event_helper.item_completed(
+                        item_id=sql_id,
+                        group_id=file_key,
+                        sql_summary_file=result,
+                    )
+                elif error is None:
+                    event_helper.item_failed(
+                        item_id=sql_id,
+                        error="Failed to generate SQL summary",
+                        group_id=file_key,
+                    )
+                await emit_group_completed_if_done(file_key, filepath)
+                return item, sql_id, result, error
+
+        # Process all items in parallel
+        tasks = [asyncio.create_task(process_with_semaphore(item)) for item in items_to_process]
+        _errors = []
+        # Count successful results
+        success_count = 0
+        success_items = []
+        for task in asyncio.as_completed(tasks):
+            item, _sql_id, result, error = await task
+            sql = normalize_sql(item["sql"])
+            if error:
+                logger.error(f"SQL processing failed with exception `{error}`. SQL: {sql};")
+                _errors.append(f"SQL processing failed with exception `{str(error)}`. SQL: {sql};")
+            elif result:
+                success_items.append(item)
+                success_count += 1
+            else:
+                logger.error(f"SQL processing returned no result. SQL: {sql};")
+                _errors.append(f"SQL processing returned no result. SQL: {sql};")
+
+        logger.info(f"Completed processing: {success_count}/{len(items_to_process)} successful")
+        processed_count = success_count
+        process_items = success_items
+        if _errors:
+            process_errors.extend(_errors)
+        logger.info(f"Processed {processed_count} reference SQL entries")
+    else:
+        logger.info("No new items to process in incremental mode")
+        process_items = []
+
+    provenance_entries = _sync_reference_sql_provenance(global_config, process_items)
+
+    # Emit task completed
+    event_helper.task_completed(
+        total_items=len(items_to_process) if items_to_process else 0,
+        completed_items=processed_count,
+        failed_items=len(process_errors),
+    )
+
+    # Initialize indices
+    storage.after_init()
+
+    return {
+        "status": "success",
+        "message": f"reference_sql bootstrap completed ({build_mode} mode)",
+        "valid_entries": len(valid_items) if valid_items else 0,
+        "processed_entries": processed_count,
+        "processed_items": process_items,
+        "invalid_entries": len(invalid_items) if invalid_items else 0,
+        "total_stored_entries": storage.get_reference_sql_size(),
+        "provenance_entries": provenance_entries,
+        "validation_errors": "\n".join(validate_errors) if validate_errors else None,
+        "process_errors": "\n".join(process_errors) if process_errors else None,
+    }
+
+
+def init_reference_sql_from_summaries(
+    storage: ReferenceSqlRAG,
+    global_config: AgentConfig,
+    summaries_dir: str = "",
+    build_mode: str = "overwrite",
+) -> Dict[str, Any]:
+    """Rebuild reference-SQL vector rows from committed summary YAML — no LLM.
+
+    ``init_reference_sql`` derives a summary for every statement by calling the
+    LLM, which is the right thing when the corpus is raw ``.sql``. Once those
+    summaries exist under ``subject/sql_summaries/`` they already carry
+    everything a vector row needs (``sql``, ``summary``, ``search_text``,
+    ``subject_tree``, ``tags``), so re-deriving them costs time and API credit
+    and can drift from the reviewed originals. This path re-indexes the
+    committed YAML verbatim — the restore route for a fresh checkout, a
+    machine migration, or an unzipped ``pico package``.
+
+    Args:
+        storage: ReferenceSqlRAG instance
+        global_config: Global agent configuration
+        summaries_dir: Directory holding the summary YAML files; defaults to
+            the project's ``subject/sql_summaries``
+        build_mode: ``overwrite`` truncates first, ``incremental`` upserts
+
+    Returns:
+        Dict with the same shape as :func:`init_reference_sql`
+    """
+    directory = Path(summaries_dir) if summaries_dir else Path(global_config.path_manager.sql_summary_path())
+    if not directory.is_dir():
+        return {
+            "status": "success",
+            "message": f"reference_sql summaries directory not found: {directory}",
+            "valid_entries": 0,
+            "processed_entries": 0,
+            "total_stored_entries": storage.get_reference_sql_size(),
+        }
+
+    items: List[Dict[str, Any]] = []
+    invalid: List[str] = []
+    for path in sorted(directory.rglob("*.y*ml")):
+        if not path.is_file():
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                doc = yaml.safe_load(fh)
+        except (OSError, yaml.YAMLError) as exc:
+            invalid.append(f"{path.name}: unreadable ({exc})")
+            continue
+        if not isinstance(doc, dict):
+            invalid.append(f"{path.name}: not a YAML mapping")
+            continue
+
+        subject_path = [part.strip() for part in str(doc.get("subject_tree") or "").split("/") if part.strip()]
+        item = {
+            "id": doc.get("id"),
+            "name": doc.get("name"),
+            "sql": doc.get("sql"),
+            "comment": doc.get("comment", ""),
+            "summary": doc.get("summary"),
+            "search_text": doc.get("search_text") or doc.get("summary"),
+            "subject_path": subject_path,
+            "tags": doc.get("tags", ""),
+            "filepath": doc.get("filepath") or str(path),
+        }
+        missing = [key for key in ("name", "sql", "summary", "search_text") if not item.get(key)]
+        if missing or not subject_path:
+            invalid.append(f"{path.name}: missing {', '.join(missing + ([] if subject_path else ['subject_tree']))}")
+            continue
+        items.append(item)
+
+    if build_mode == "overwrite":
+        storage.truncate()
+        storage.store_batch(items)
+    else:
+        storage.upsert_batch(items)
+    storage.after_init()
+
+    logger.info("Reindexed %d reference SQL entries from %s (no LLM)", len(items), directory)
+    return {
+        "status": "success",
+        "message": f"reference_sql reindexed from summaries ({build_mode} mode)",
+        "valid_entries": len(items),
+        "processed_entries": len(items),
+        "invalid_entries": len(invalid),
+        "total_stored_entries": storage.get_reference_sql_size(),
+        "validation_errors": "\n".join(invalid) if invalid else None,
+    }
+
+
+def init_reference_sql(
+    storage: ReferenceSqlRAG,
+    global_config: AgentConfig,
+    sql_dir: str,
+    validate_only: bool = False,
+    build_mode: str = "overwrite",
+    pool_size: int = 1,
+    subject_tree: Optional[list] = None,
+    emit: Optional[BatchEventEmitter] = None,
+    extra_instructions: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Sync wrapper: Initialize reference SQL from SQL files directory.
+
+    Args:
+        storage: ReferenceSqlRAG instance
+        sql_dir: The path to the SQL files directory
+        validate_only: If true, only validate SQL queries.
+        global_config: Global agent configuration for LLM model creation
+        build_mode: "overwrite" to replace all data, "incremental" to add new entries
+        pool_size: Number of threads for parallel processing
+        subject_tree: Optional predefined subject tree categories
+        emit: Optional callback to stream BatchEvent progress events
+        extra_instructions: Optional extra instructions for the LLM
+
+    Returns:
+        Dict containing initialization results and statistics
+    """
+    with suppress_keyboard_input():
+        return asyncio.run(
+            init_reference_sql_async(
+                storage,
+                global_config,
+                sql_dir,
+                validate_only,
+                build_mode,
+                pool_size,
+                subject_tree,
+                emit,
+                extra_instructions,
+            )
+        )

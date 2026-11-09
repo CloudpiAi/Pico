@@ -96,8 +96,8 @@ The agent creates the Lambda function and the cost table **by itself** on its fi
 |---|---|
 | An AWS account with admin access for the one-time setup | To create the buckets, the roles and the EC2 |
 | A Slack workspace where you can create an app | So the agent can answer in Slack |
-| A Gemini API key, from [Google AI Studio](https://aistudio.google.com/) | The agent's language model. The default is `gemini-3.8-flash`. You can switch to OpenAI, Anthropic Claude or DeepSeek; see [Choosing the language model](#choosing-the-language-model-llm) |
-| The Pico FinOps Agent image name and tag, from Pico FinOps | For example `cloudpi1/cloudpi:Cloudpi_agent_v1.0.0` |
+| An API key for one LLM provider: Google Gemini (default), OpenAI, Anthropic Claude or DeepSeek | The agent's language model, which answers questions in Slack. See [Choosing the language model](#choosing-the-language-model-llm) |
+| This repository, and Docker with the compose plugin on the EC2 | The agent's image is built from this repo on the EC2 (step 7) |
 
 ### How long it takes
 
@@ -156,15 +156,12 @@ The agent creates the table inside the table bucket by itself.
 ## Step 3: Get the permission files
 
 The permission files are in this repo under [`policies/aws/`](../policies/aws/): `ec2-role-policy.json`,
-`ec2-role-trust.json`, `loader-role-policy.json` and `loader-role-trust.json`. Copy them, or take them from the
-image. On any machine with Docker, run:
+`ec2-role-trust.json`, `loader-role-policy.json` and `loader-role-trust.json`. Copy them into a new folder:
 
 ```bash
-IMAGE=cloudpi1/cloudpi:<tag-from-Pico-FinOps>
-mkdir pico-finops-agent-iam && cd pico-finops-agent-iam
-for f in ec2-role-policy.json loader-role-policy.json loader-role-trust.json; do  # ec2-role-trust.json: policies/aws/
-  docker run --rm --entrypoint cat "$IMAGE" /app/cloudpi_agent/iam/$f > $f
-done
+git clone https://github.com/CloudpiAi/Pico.git pico-finops-agent
+mkdir pico-finops-agent-iam && cp pico-finops-agent/policies/aws/*.json pico-finops-agent-iam/
+cd pico-finops-agent-iam
 ```
 
 Fill in your own values. Use the names from steps 1 and 2:
@@ -176,7 +173,7 @@ sed -i -e 's|<region>|us-east-1|g' \
        -e 's|<export-prefix>|focus/acme-focus-export/data/|g' \
        -e 's|<table-bucket>|acme-cost-agent|g' \
        -e 's|<state-bucket>|acme-cost-agent-state|g' \
-       -e 's|<state-key>|cloudpi-agent/state.json|g' *.json
+       -e 's|<state-key>|pico-finops-agent/state.json|g' *.json
 grep -l '<' *.json || echo "All placeholders filled."
 ```
 
@@ -187,15 +184,15 @@ grep -l '<' *.json || echo "All placeholders filled."
 **4a. The Lambda role**, which the agent's data loader uses:
 
 ```bash
-aws iam create-role --role-name cloudpi-agent-loader-role \
+aws iam create-role --role-name pico-finops-agent-loader-role \
   --assume-role-policy-document file://loader-role-trust.json
-aws iam put-role-policy --role-name cloudpi-agent-loader-role \
+aws iam put-role-policy --role-name pico-finops-agent-loader-role \
   --policy-name pico-finops-agent-loader --policy-document file://loader-role-policy.json
-aws iam attach-role-policy --role-name cloudpi-agent-loader-role \
+aws iam attach-role-policy --role-name pico-finops-agent-loader-role \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 ```
 
-Note the role's **ARN**: `arn:aws:iam::<account-id>:role/cloudpi-agent-loader-role`.
+Note the role's **ARN**: `arn:aws:iam::<account-id>:role/pico-finops-agent-loader-role`.
 
 **4b. The EC2 role**, which the agent itself uses:
 
@@ -210,7 +207,7 @@ aws iam add-role-to-instance-profile --instance-profile-name pico-finops-agent-e
 
 **What these roles allow, in plain words:**
 - **The EC2 role:**
-  - Manage and run **only** the `cloudpi-agent-loader` Lambda function and its `cloudpi-agent-duckdb` layer.
+  - Manage and run **only** the `pico-finops-agent-loader` Lambda function and its `pico-finops-agent-duckdb` layer.
   - Hand **only** the loader role to Lambda.
   - Read the agent's progress file.
   - **Read** the cost table.
@@ -222,7 +219,7 @@ aws iam add-role-to-instance-profile --instance-profile-name pico-finops-agent-e
 - **Neither role** can touch anything else in your account. No access keys are created or stored anywhere.
 
 > **Is your export bucket encrypted with your own KMS key (SSE-KMS)?** Then also allow `kms:Decrypt` on that key for
-> `cloudpi-agent-loader-role`. S3-managed encryption (the default) needs nothing extra.
+> `pico-finops-agent-loader-role`. S3-managed encryption (the default) needs nothing extra.
 
 ---
 
@@ -280,11 +277,11 @@ Keep both tokens private: they work like passwords.
 On the EC2:
 
 ```bash
-mkdir ~/pico-finops-agent && cd ~/pico-finops-agent
-# Put the docker-compose.yml from Pico FinOps in this folder, then:
+sudo dnf install -y git                     # or: sudo apt-get install -y git
+git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent && cd ~/pico-finops-agent
+docker compose build                        # builds the image pico-finops-agent:local (a few minutes)
 umask 077                                   # the settings file holds keys: readable by you only
-IMAGE=cloudpi1/cloudpi:<tag-from-Pico-FinOps>
-cp .env.example .env                        # from this repo (or from the image: /app/cloudpi_agent/.env.example)
+cp .env.example .env
 nano .env                                   # fill in the values below
 ```
 
@@ -292,14 +289,14 @@ nano .env                                   # fill in the values below
 
 | Setting | Your value |
 |---|---|
-| `AGENT_IMAGE_TAG` | The tag from Pico FinOps, e.g. `Cloudpi_agent_v1.0.0` |
 | `FOCUS_REGION` | e.g. `us-east-1` |
 | `FOCUS_EXPORT_BUCKET` | from step 1, e.g. `acme-cost-export` |
 | `FOCUS_EXPORT_PREFIX` | from step 1, ends with `data/` |
 | `FOCUS_TABLE_BUCKET_ARN` | from step 2 |
 | `FOCUS_STATE_BUCKET` | from step 2, e.g. `acme-cost-agent-state` |
 | `FOCUS_LAMBDA_ROLE_ARN` | from step 4a |
-| `GEMINI_API_KEY` | your Gemini key (always needed, see below) |
+| `AGENT_LLM_PROVIDER` | Optional: `gemini` (default), `openai`, `anthropic` or `deepseek` (see below) |
+| `GEMINI_API_KEY` | your Gemini key, when the provider is Gemini (or the key of the provider you chose, see below) |
 | `SLACK_APP_TOKEN` | `xapp-…` from step 6 |
 | `SLACK_BOT_TOKEN` | `xoxb-…` from step 6 |
 | `SLACK_NOTIFY_CHANNEL` | `pico-finops-agent` (the channel for notices and alerts) |
@@ -315,17 +312,25 @@ The agent uses an LLM to understand questions and write the answers. These provi
 | **Anthropic Claude** | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/) |
 | **DeepSeek** | `DEEPSEEK_API_KEY` | [platform.deepseek.com](https://platform.deepseek.com/) |
 
-- **To keep the default:** set only `GEMINI_API_KEY`. Nothing else is needed.
-- **To use another provider:** add that provider's key to `.env`, then switch the model with Pico's `/model` command.
-- **Keep `GEMINI_API_KEY` set either way.** In this version the agent's start-up check and `check` command always
-  test the Gemini key, even if you switch to another provider.
+- **To keep the default (Gemini):** set only `GEMINI_API_KEY`. Nothing else is needed.
+- **To use another provider:** set `AGENT_LLM_PROVIDER` and that provider's key. For example, for Anthropic Claude:
+  ```
+  AGENT_LLM_PROVIDER=anthropic
+  ANTHROPIC_API_KEY=<your key>
+  ```
+  A Gemini key isn't needed then.
+- **To pick a specific model** (optional): set `AGENT_LLM_MODEL`, e.g. `AGENT_LLM_MODEL=gpt-5.4-mini`. Without it the
+  agent uses the provider's default: `gemini-3.8-flash`, `gpt-5.5`, `claude-sonnet-4-6` or `deepseek-v4-pro`.
+- **To change provider later:** edit `.env`, then run `docker compose up -d`. The agent reads the choice on every start.
+- The start-up check and `docker compose run --rm agent check` test the key of the provider you chose, without
+  using any tokens. If the provider name or its key is missing or wrong, they name the setting to fix.
 - Whichever provider you use, only the question and the rows that answer it are sent to it.
 
 **Check first** (posts nothing, changes nothing). It checks:
 - the AWS role
 - the agent's buckets and data
 - the Slack tokens
-- the Gemini key
+- the key of your LLM provider
 
 Fix any `ALERT:` line it prints before you start:
 
@@ -337,10 +342,10 @@ docker compose run --rm agent check
 
 ```bash
 docker compose up -d                       # starts the agent (one container: data loading, notices and the Slack bot)
-docker logs -f cloudpi-agent               # watch the first setup (Ctrl+C to stop watching)
+docker logs -f pico-finops-agent               # watch the first setup (Ctrl+C to stop watching)
 ```
 
-Everything runs in **one container**, `cloudpi-agent`, from one image. The Slack bot starts by itself when both Slack
+Everything runs in **one container**, `pico-finops-agent`, from one image. The Slack bot starts by itself when both Slack
 tokens are in `.env`. Without them the agent still loads the data, and the log says it's running without the bot.
 
 On the first start the agent sets itself up:
@@ -385,12 +390,12 @@ The agent tells you in Slack what's wrong. The most common messages:
 | Message says | What to do |
 |---|---|
 | "the EC2 role isn't allowed to …" | Add the named permission to `pico-finops-agent-ec2-role` from `ec2-role-policy.json` (step 4b) |
-| "the loader Lambda's role isn't allowed to …" | Add it to `cloudpi-agent-loader-role` from `loader-role-policy.json` (step 4a) |
+| "the loader Lambda's role isn't allowed to …" | Add it to `pico-finops-agent-loader-role` from `loader-role-policy.json` (step 4a) |
 | "the loader Lambda's role is missing or can't be used" | Recreate the role exactly as in step 4a. The agent picks it up on its next run |
 | "the state bucket doesn't exist" | Create the bucket from step 2, or fix `FOCUS_STATE_BUCKET` in `.env` |
 | "the EC2 has no working AWS credentials" | Attach `pico-finops-agent-ec2-role` to the EC2 (step 5) |
 | "No new AWS cost data for N days" | Check Billing and Cost Management → Data Exports; the export may be paused or deleted |
-| The bot doesn't answer | Check the bot is invited to the channel, and that you @mention it. Run `docker logs cloudpi-agent` |
+| The bot doesn't answer | Check the bot is invited to the channel, and that you @mention it. Run `docker logs pico-finops-agent` |
 | `docker compose ps` shows **unhealthy**: "Slack tokens rejected" | A Slack token is wrong or revoked: fix `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` in `.env`, then `docker compose up -d`. Data collection keeps running meanwhile |
 | **unhealthy**: "Slack unreachable" or "disconnected" | Usually the network or Slack itself; the agent retries and restarts itself after 10 minutes |
 
@@ -400,8 +405,8 @@ IAM changes can take a few minutes to apply. The agent retries on its next run, 
 
 ```bash
 docker compose ps                         # is it running? (shows "healthy"; "unhealthy" says why below)
-docker inspect cloudpi-agent --format '{{json .State.Health.Log}}' | tail -c 400   # the last health check result
-docker logs --tail 50 cloudpi-agent       # data loading, notices and the Slack bot
+docker inspect pico-finops-agent --format '{{json .State.Health.Log}}' | tail -c 400   # the last health check result
+docker logs --tail 50 pico-finops-agent       # data loading, notices and the Slack bot
 docker compose restart                    # restart the agent
 docker compose run --rm agent check       # re-run the pre-flight check (posts nothing)
 ```
@@ -410,12 +415,11 @@ docker compose run --rm agent check       # re-run the pre-flight check (posts n
 
 ## Updating to a new version
 
-When Pico FinOps gives you a new tag:
-
 ```bash
 cd ~/pico-finops-agent
-sed -i 's/^AGENT_IMAGE_TAG=.*/AGENT_IMAGE_TAG=<new-tag>/' .env
-docker compose up -d                      # pulls the new image and restarts
+git pull                                  # the newest code (or: git checkout <release-tag>)
+docker compose build                      # rebuilds the image
+docker compose up -d                      # restarts the agent on the new image
 ```
 
 Your data is kept. If the agent's own data is ever lost, it rebuilds itself from the S3 table on its next start.
@@ -428,8 +432,8 @@ docker compose down -v                    # stop and delete the agent's local da
 ```
 
 To remove everything, also delete these in AWS:
-- the Lambda function `cloudpi-agent-loader`
-- the layer `cloudpi-agent-duckdb`
+- the Lambda function `pico-finops-agent-loader`
+- the layer `pico-finops-agent-duckdb`
 - the two roles
 - the table bucket and the state bucket
 - the export, if you no longer need it
@@ -447,6 +451,6 @@ To remove everything, also delete these in AWS:
 - **Hardened containers:** they run as a normal user, read-only, with no extra privileges.
 - **Keep `.env` private:** it holds the LLM API keys and the Slack tokens.
 
-**Questions or problems:** contact your Pico FinOps contact, and include the output of
-`docker logs --tail 100 cloudpi-agent`. The agent doesn't print your keys or tokens, but please look through it
+**Questions or problems:** open an issue at [github.com/CloudpiAi/Pico](https://github.com/CloudpiAi/Pico/issues) and include the output of
+`docker logs --tail 100 pico-finops-agent`. The agent doesn't print your keys or tokens, but please look through it
 before you send it.

@@ -1,0 +1,74 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Build sub-agent scope filters for RAG classes.
+
+RAG classes call ``_build_sub_agent_filter`` to restrict data access
+based on a sub-agent's scoped context (table filter or subject filter).
+"""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, Optional
+
+from datus_storage_base.conditions import Node
+
+from pico.schemas.agent_models import SubAgentConfig
+from pico.storage.scoped_filter import ScopedFilterBuilder
+from pico.utils.loggings import get_logger
+
+if TYPE_CHECKING:
+    from pico.configuration.agent_config import AgentConfig
+    from pico.storage.base import BaseEmbeddingStore
+
+logger = get_logger(__name__)
+
+
+def _build_sub_agent_filter(
+    agent_config: "AgentConfig",
+    sub_agent_name: Optional[str],
+    storage: "BaseEmbeddingStore",
+    check_scope_attr: str,
+    table_column: str = "table_name",
+) -> Optional[Node]:
+    """Build scope filter from sub-agent's scoped context.
+
+    ``table_column`` names the column holding the physical table name in the
+    target store, and only applies to the ``tables`` scope.
+    """
+    if not sub_agent_name:
+        return None
+
+    raw_config = agent_config.sub_agent_config(sub_agent_name)
+    if not raw_config:
+        return None
+
+    sub_agent_config = SubAgentConfig.model_validate(raw_config)
+    if not sub_agent_config.has_scoped_context_by(check_scope_attr):
+        return None
+
+    scope_value = getattr(sub_agent_config.scoped_context, check_scope_attr, None)
+    if not scope_value:
+        return None
+
+    if check_scope_attr == "tables":
+        dialect = getattr(agent_config, "db_type", "")
+        return ScopedFilterBuilder.build_table_filter(scope_value, dialect, table_column)
+    elif check_scope_attr in ("metrics", "sqls"):
+        subject_tree = getattr(storage, "subject_tree", None)
+        if subject_tree is None:
+            from pico.utils.exceptions import DatusException, ErrorCode
+
+            raise DatusException(
+                code=ErrorCode.COMMON_VALIDATION_FAILED,
+                message=(
+                    f"Cannot build scope filter for sub-agent '{sub_agent_name}' "
+                    f"(scope attr='{check_scope_attr}'): storage has no subject_tree. "
+                    "Refusing to return unscoped storage."
+                ),
+            )
+        return ScopedFilterBuilder.build_subject_filter(scope_value, subject_tree)
+
+    return None

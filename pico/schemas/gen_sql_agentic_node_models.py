@@ -1,0 +1,58 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Schema models for GenSQL Agentic Node.
+
+This module defines the input and output models for the GenSQLAgenticNode,
+providing structured validation for SQL generation interactions with limited
+context support and streaming capabilities.
+"""
+
+from typing import Optional
+
+from pydantic import Field
+
+from pico.schemas.at_context import AtContextInput
+from pico.schemas.base import BaseResult
+
+
+class GenSQLNodeInput(AtContextInput):
+    """
+    Input model for GenSQLAgenticNode interactions.
+
+    @-context fields (``schemas`` / ``metrics`` / ``reference_sql`` /
+    ``external_knowledge``) are inherited from :class:`AtContextInput`.
+    """
+
+    user_message: str = Field(..., description="User's input message")
+    catalog: Optional[str] = Field(default=None, description="Database catalog for context")
+    database: Optional[str] = Field(default=None, description="Database name for context")
+    db_schema: Optional[str] = Field(default=None, description="Database schema for context")
+    max_turns: int = Field(default=30, description="Maximum conversation turns per interaction")
+    workspace_root: Optional[str] = Field(default=None, description="Root directory path for filesystem MCP server")
+    prompt_version: Optional[str] = Field(default=None, description="Version for prompt template")
+    prompt_language: Optional[str] = Field(default="en", description="Language for prompt template")
+    reference_date: Optional[str] = Field(
+        default=None,
+        description="Pinned reference date for deterministic SQL generation and validation",
+    )
+    plan_mode: bool = Field(default=False, description="Enable plan mode for multi-step task planning")
+    auto_execute_plan: bool = Field(default=False, description="Auto-execute plan without confirmation")
+
+
+class GenSQLNodeResult(BaseResult):
+    """
+    Result model for GenSQLAgenticNode interactions.
+    """
+
+    response: str = Field(..., description="AI assistant's response")
+    sql: Optional[str] = Field(default=None, description="SQL query generated or referenced in response")
+    sql_file_path: Optional[str] = Field(
+        default=None, description="Relative path to SQL file when SQL exceeds threshold"
+    )
+    sql_preview: Optional[str] = Field(default=None, description="First N lines of SQL for preview when file-stored")
+    sql_diff: Optional[str] = Field(default=None, description="Unified diff of SQL modifications")
+    tokens_used: int = Field(default=0, description="Total tokens used in this interaction")
+    error: Optional[str] = Field(default=None, description="Error message if interaction failed")

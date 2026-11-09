@@ -12,7 +12,7 @@
         "lambda:PutFunctionConcurrency",
         "lambda:InvokeFunction"
       ],
-      "Resource": "arn:aws:lambda:<region>:<account-id>:function:cloudpi-agent-loader"
+      "Resource": "arn:aws:lambda:<region>:<account-id>:function:pico-finops-agent-loader"
     },
     {
       "Sid": "TheLoaderLayer",
@@ -23,15 +23,15 @@
         "lambda:ListLayerVersions"
       ],
       "Resource": [
-        "arn:aws:lambda:<region>:<account-id>:layer:cloudpi-agent-duckdb",
-        "arn:aws:lambda:<region>:<account-id>:layer:cloudpi-agent-duckdb:*"
+        "arn:aws:lambda:<region>:<account-id>:layer:pico-finops-agent-duckdb",
+        "arn:aws:lambda:<region>:<account-id>:layer:pico-finops-agent-duckdb:*"
       ]
     },
     {
       "Sid": "PassOnlyTheLoaderRole",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::<account-id>:role/cloudpi-agent-loader-role",
+      "Resource": "arn:aws:iam::<account-id>:role/pico-finops-agent-loader-role",
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": "lambda.amazonaws.com"

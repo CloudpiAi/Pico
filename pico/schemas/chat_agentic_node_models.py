@@ -1,0 +1,55 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Schema models for Chat Agentic Node.
+
+This module defines the input and output models for the ChatAgenticNode,
+providing structured validation for chat interactions with streaming support.
+"""
+
+from typing import Optional
+
+from pydantic import Field
+
+from pico.schemas.at_context import AtContextInput
+from pico.schemas.base import BaseResult
+
+
+class ChatNodeInput(AtContextInput):
+    """
+    Input model for ChatAgenticNode interactions.
+
+    @-context fields (``schemas`` / ``metrics`` / ``reference_sql`` /
+    ``external_knowledge``) are inherited from :class:`AtContextInput`.
+    """
+
+    user_message: str = Field(..., description="User's chat message input")
+    catalog: Optional[str] = Field(default=None, description="Database catalog for context")
+    database: Optional[str] = Field(default=None, description="Database name for context")
+    db_schema: Optional[str] = Field(default=None, description="Database schema for context")
+    max_turns: int = Field(
+        default=30,
+        description=(
+            "Per-interaction override for the maximum conversation turns. "
+            "Only takes effect when set explicitly by the caller; otherwise "
+            "the chat node's configured max_turns "
+            "(agent.yml ``agentic_nodes.chat.max_turns``) is used."
+        ),
+    )
+    workspace_root: Optional[str] = Field(default=None, description="Root directory path for filesystem MCP server")
+    prompt_version: Optional[str] = Field(default=None, description="Version for prompt template")
+    plan_mode: bool = Field(default=False, description="Whether this is a plan mode interaction")
+    auto_execute_plan: bool = Field(
+        default=False, description="Whether to auto-execute plan without user confirmation (for workflow/benchmark)"
+    )
+
+
+class ChatNodeResult(BaseResult):
+    """
+    Result model for ChatAgenticNode interactions.
+    """
+
+    response: str = Field(..., description="AI assistant's response in markdown format")
+    tokens_used: int = Field(default=0, description="Total tokens used in this interaction")

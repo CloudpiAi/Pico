@@ -1,0 +1,4596 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Agentic Node Architecture for Pico-agent.
+
+This module provides a new agentic node system that supports session-based,
+streaming interactions with tool integration and action history management.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Awaitable, Callable, Dict, List, Literal, Optional, Set, Tuple
+
+from agents import Tool
+from agents.extensions.memory import AdvancedSQLiteSession
+from agents.mcp import MCPServerStdio
+
+from pico.agent.node.compact_archive import ToolArchive, archive_old_tool_outputs, maybe_truncate_item
+from pico.agent.node.compact_prompts import (
+    MID_TURN_SUMMARY_INSTRUCTIONS,
+    build_continuation_message,
+    render_major_compact_prompt,
+)
+from pico.agent.node.context_rewriter import (
+    DEFAULT_OUTPUT_RESERVE_TOKENS,
+    MAX_OUTPUT_RESERVE_TOKENS,
+    MidTurnCompactor,
+    build_assistant_item,
+    build_mid_turn_view,
+    detect_item_format,
+    estimate_items_tokens,
+)
+from pico.agent.node.node import Node
+from pico.cli.execution_state import ExecutionInterrupted, InteractionBroker, InterruptController, PendingInputQueue
+from pico.configuration.agent_config import AgentConfig, CompactConfig
+from pico.models.base import LLMBaseModel
+from pico.prompts.prompt_manager import get_prompt_manager
+from pico.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from pico.schemas.base import BaseInput, BaseResult
+from pico.tools.db_tools.data_file_loader import LOCAL_FILES_DATASOURCE
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.language_utils import build_fallback_directive as _build_fallback_directive
+from pico.utils.language_utils import ensure_native_directive as _ensure_native_directive
+from pico.utils.language_utils import resolve_language_name as _resolve_language_name
+from pico.utils.language_utils import resolve_native_directive as _resolve_native_directive
+from pico.utils.loggings import get_logger
+from pico.utils.message_utils import build_structured_content
+from pico.utils.node_utils import build_database_context
+
+if TYPE_CHECKING:
+    from pico.agent.node.stream_run_context import StreamRunContext
+    from pico.agent.workflow import Workflow
+    from pico.schemas.token_usage import TokenUsage
+    from pico.storage.session_state import ContextState
+    from pico.tools.func_tool.fs_path_policy import PathAllowlist
+    from pico.tools.permission.permission_manager import PermissionManager
+    from pico.tools.skill_tools.skill_manager import SkillManager
+
+logger = get_logger(__name__)
+
+
+class AgenticNode(Node):
+    """
+    Base agentic node that provides session-based, streaming interactions
+    with tool integration and automatic context management.
+    """
+
+    DEFAULT_SUBAGENTS = "explore"
+
+    # Default skill patterns injected into ``<available_skills>`` when the user's
+    # ``agent.yml`` does not override ``skills:`` for this node. Subclasses declare
+    # the skills their workflow expects so every built-in subagent works out of
+    # the box without forcing users to wire each skill manually. Set to an explicit
+    # empty string in yml to opt out of the defaults.
+    DEFAULT_SKILLS: Optional[str] = None
+
+    # Skills whose full content is injected into the system prompt by the host
+    # at render time instead of being advertised in ``<available_skills>`` for
+    # LLM-initiated ``load_skill`` calls. Use for specifications the node needs
+    # on every run (e.g. authoring format specs); optional, conditionally
+    # useful workflows belong in ``DEFAULT_SKILLS``. Subclasses may override
+    # ``_get_required_skills()`` to derive the list from configuration.
+    REQUIRED_SKILLS: Optional[str] = None
+
+    # When True, this node's ``SkillFuncTool`` loads skills in *authoring* mode:
+    # ``allowed_agents`` scoping on ``load_skill`` is bypassed so the agent can
+    # read any skill by name (used by ``gen_skill`` for edit/optimize flows).
+    # Visibility in ``<available_skills>`` is still filtered normally.
+    SKILL_AUTHORING_MODE: bool = False
+
+    def __init__(
+        self,
+        node_id: str,
+        description: str,
+        node_type: str,
+        input_data: BaseInput = None,
+        agent_config: Optional[AgentConfig] = None,
+        tools: Optional[List[Tool]] = None,
+        mcp_servers: Optional[Dict[str, MCPServerStdio]] = None,
+        scope: Optional[str] = None,
+        is_subagent: bool = False,
+        session_id: Optional[str] = None,
+    ):
+        """
+        Initialize the agentic node.
+
+        Args:
+            node_id: Unique identifier for the node
+            description: Human-readable description of the node
+            node_type: Type of the node (e.g., 'chat', 'gen_sql')
+            input_data: Input data for the node
+            agent_config: Agent configuration
+            tools: List of function tools available to this node
+            mcp_servers: Dictionary of MCP servers available to this node
+            scope: Optional session scope for directory isolation
+            is_subagent: When True, skip SubAgentTaskTool setup (2-level depth enforcement)
+            session_id: Optional resume target. When provided, the node opens
+                this session id and persisted plan-mode state on disk is
+                restored automatically. When ``None``, a fresh id is generated
+                eagerly here so ``session_id`` is guaranteed non-empty after
+                construction and never changes for the lifetime of the node.
+        """
+        # Initialize Node base class
+        super().__init__(node_id, description, node_type, input_data, agent_config, tools)
+
+        # AgenticNode-specific attributes
+        self.scope = scope
+        self.mcp_servers = mcp_servers or {}
+        self.actions: List[ActionHistory] = []
+        if not hasattr(self, "degraded_capabilities"):
+            self.degraded_capabilities: Dict[str, str] = {}
+        # Resume target (or freshly generated id when caller passes ``None``).
+        # ``session_id`` is set once below — after ``get_node_name()`` is wired
+        # up — and is treated as immutable for the node's lifetime: resume /
+        # rewind / agent-switch flows allocate a NEW node with the desired id
+        # rather than rewriting this attribute.
+        self.session_id: str = session_id or ""
+        self._session: Optional[AdvancedSQLiteSession] = None
+        # Optional extra path layer between {sessions_dir}/{user_scope}/ and the .db
+        # file. Set by SubAgentTaskTool to the parent's session_id so subagent dbs
+        # nest under their launching main session — enabling later resume.
+        self.session_subdir: Optional[str] = None
+        self._session_manager: Optional["SessionManager"] = None  # noqa: F821 — lazy
+        # Populated lazily via the ``model`` property so ``/model`` switches
+        # take effect on the next access without rebuilding the node.
+        # ``_pinned_model`` exists because the parent :class:`Node` writes
+        # ``self.model = None`` / ``self.model = llm_model`` directly; the
+        # property setter routes those writes here.
+        self._agent_config_ref: Optional[AgentConfig] = None
+        self._node_model_name: Optional[str] = None
+        self._pinned_model: Optional[LLMBaseModel] = None
+
+        # Name of the previous node (set externally by the caller, e.g. the CLI
+        # on agent switch). Nodes that need caller context — like feedback,
+        # which injects the caller's MEMORY.md — read this instead of inferring
+        # it from the session id prefix. ``None`` when no switch occurred.
+        self.caller_node_name: Optional[str] = None
+
+        # Permission and skill management
+        self.permission_manager: Optional["PermissionManager"] = None
+        # PermissionHooks is attached lazily once tools are set up — see
+        # ``_ensure_permission_hooks``. Every subclass that runs the LLM
+        # loop must pass ``self._compose_hooks()`` into
+        # ``generate_with_tools_stream`` so rules actually fire.
+        self.permission_hooks: Optional[Any] = None
+        self.skill_manager: Optional["SkillManager"] = None
+        self.skill_func_tool = None
+        self.ask_user_tool = None
+        self.sub_agent_task_tool = None
+        self.bash_tool = None
+        self.memory_func_tool = None
+        self._is_subagent = is_subagent
+        self._permission_callback: Optional[Callable[[str, str, Dict[str, Any]], Awaitable[bool]]] = None
+
+        # ActionBus - merges tool sub-actions into the main action stream
+        from pico.schemas.action_bus import ActionBus
+
+        self.action_bus = ActionBus()
+
+        # Proxy tool channel - used in print mode with --proxy_tools
+        from pico.tools.proxy.tool_result_channel import ToolResultChannel
+
+        self.tool_channel = ToolResultChannel()
+
+        # Proxy tool patterns - stored when apply_proxy_tools() is called, inherited by sub-agents
+        self.proxy_tool_patterns: Optional[List[str]] = None
+
+        # Names of tools that ``apply_proxy_tools`` actually replaced with proxy
+        # wrappers. ``PermissionHooks`` consults this set to short-circuit the
+        # permission check for proxied tools — the external caller (e.g.
+        # ``print_mode`` stdin protocol) is responsible for any secondary
+        # confirmation, so the agent must not double-prompt. Held as a stable
+        # reference so PermissionHooks can be built before the first proxy call
+        # and still observe later updates without rebuilding.
+        self.proxied_tool_names: Set[str] = set()
+
+        # Shared tool_name -> category registry (used by PermissionHooks & proxy_tool)
+        from pico.tools.registry.tool_registry import ToolRegistry
+
+        self.tool_registry = ToolRegistry()
+
+        # Plugin-declared tool argument transformers are applied lazily on the
+        # first ``_compose_hooks`` call, after ``setup_tools`` and any
+        # ``apply_proxy_tools`` rewrites — see ``_ensure_tool_transformers``.
+        self._tool_transformers_applied = False
+
+        # Parse node configuration from agent.yml (available to all agentic nodes)
+        self.node_config = self._parse_node_config(agent_config, self.get_node_name())
+
+        # Attach the MCP servers named in node_config["mcp"] unless the caller
+        # supplied explicit instances. Done here so every agentic node honors
+        # its configured selection — subclasses must not re-implement this.
+        if not self.mcp_servers:
+            self.mcp_servers = self._setup_mcp_servers()
+
+        # Setup permission manager (after node_config is available)
+        self._setup_permission_manager()
+
+        # Setup skill manager (after permission_manager is available)
+        self._setup_skill_manager()
+
+        # Setup skill func tools for non-chat nodes when explicitly configured
+        self._setup_skill_func_tools()
+
+        # General-purpose BashTool — available to every agentic node. The
+        # actual injection into ``self.tools`` happens lazily via
+        # ``_ensure_bash_tool_in_tools`` because subclass ``setup_tools``
+        # tends to reset ``self.tools`` after base ``__init__``.
+        self._setup_bash_tool()
+
+        # Resolve model lazily so ``/model`` can flip the active target at
+        # runtime without rebuilding every node. The node-specific override
+        # (``agent.agentic_nodes.<name>.model``) — when present — still wins
+        # because ``_resolve_model_name()`` forwards it to
+        # :meth:`LLMBaseModel.create_model`; otherwise the resolver falls
+        # back to ``agent_config.active_model()`` each call.
+        self._agent_config_ref = agent_config
+        self._node_model_name = self.node_config.get("model") if agent_config else None
+
+        self.interaction_broker = InteractionBroker()
+        self.interrupt_controller = InterruptController()
+
+        # Per-chat-session queue of free-text user messages staged during
+        # an agent run. Set to a real ``PendingInputQueue`` by interactive
+        # callers (CLI/TUI and the API ``/insert`` route) before
+        # ``execute_stream``; ``None`` for non-interactive callers so they
+        # keep current behavior. Lifecycle is owned by the caller — the
+        # node treats it as a borrowed reference and never replaces it.
+        self.pending_input_queue: Optional[PendingInputQueue] = None
+
+        # Plan mode state (managed at base class, shared by all subclasses).
+        # Activated manually via REPL/CLI for the current primary agent; sub-agents
+        # spawned during execution do NOT inherit these flags.
+        self.plan_mode_active: bool = False
+        self.workflow_prompt_sent: bool = False
+        self.plan_file_path: Optional[str] = None
+        # One-shot flag: set by ``confirm_plan`` so the next user prompt
+        # carries an "execute the confirmed plan" reminder. Cleared by
+        # ``_build_enhanced_message`` after the reminder is injected.
+        self._plan_just_confirmed: bool = False
+
+        # Finalize session_id: caller-supplied id wins; otherwise generate
+        # eagerly so ``session_id`` is non-empty and stable from here on. We
+        # then re-hydrate any persisted plan-mode state — for fresh sessions
+        # the state file does not exist and ``restore_plan_mode_state`` is a
+        # no-op, preserving the defaults set above.
+        if not self.session_id:
+            self.session_id = self._generate_session_id()
+        # Last persisted context-window occupancy. Defaults to 0 (fresh
+        # session); ``restore_context_state`` below overwrites them when an
+        # on-disk ``context_state`` section exists. These MUST be set before
+        # the restore call so the restored values are not clobbered.
+        self._context_state: Optional["ContextState"] = None
+        self._restored_context_used: int = 0
+        try:
+            self.restore_plan_mode_state()
+        except Exception as exc:  # noqa: BLE001 — restore must never crash construction
+            logger.warning("Failed to restore plan-mode state for %s: %s", self.session_id, exc)
+        try:
+            self.restore_context_state()
+        except Exception as exc:  # noqa: BLE001 — restore must never crash construction
+            logger.warning("Failed to restore context state for %s: %s", self.session_id, exc)
+
+        # ── Compact subsystem state ─────────────────────────────────────
+        # ``_compacted_until`` is a same-process scan-start hint for the
+        # next minor pass; it is not persisted because correctness already
+        # comes from the in-message ``[PICO_ARCHIVED]`` marker, so an API
+        # resume just rescans the archived prefix once and skips items via
+        # marker detection. ``_archive`` and ``_compact_lock`` are lazy
+        # because they depend on path_manager / asyncio.get_running_loop()
+        # — both may not be ready at construction time (e.g. SaaS bootstrap).
+        self._compact_cfg: CompactConfig = (
+            getattr(agent_config, "compact", None) if agent_config else None
+        ) or CompactConfig()
+        self._compacted_until: int = 0
+        self._archive: Optional[ToolArchive] = None
+        self._compact_lock: Optional[asyncio.Lock] = None
+        # SQLite boundary captured right after a mid-turn rewrite. The CLI's
+        # ESC rollback prefers it over the checkpoint taken before the turn:
+        # a rewrite replaces every row, so the pre-turn boundary would delete
+        # the whole session. Reset at the start of every turn.
+        self.mid_turn_rewrite_checkpoint: Optional[Any] = None
+
+        # ── Mid-turn token-usage streaming ─────────────────────────────
+        # Populated by :class:`TokenUsageHook` after every LLM call so the
+        # CLI status bar and ``get_last_turn_usage`` can observe progress
+        # before ``store_run_usage`` persists the final ``turn_usage`` row.
+        # ``None`` between turns and right after a turn commits.
+        self.running_turn_usage: Optional["TokenUsage"] = None  # noqa: F821 — forward-ref
+        # Active ``ActionHistoryManager`` for the running stream. Set by
+        # :meth:`_stream_once` for the duration of one model invocation so
+        # the SDK ``on_llm_end`` hook can enqueue ``token_usage`` actions
+        # against the correct manager. Cleared in ``finally``.
+        self._current_action_history: Optional[ActionHistoryManager] = None
+        # Optional callback wired by the CLI (``DatusApp.invalidate``) so
+        # mid-turn usage updates repaint the bottom toolbar instantly. The
+        # API path leaves it unset; the hook tolerates ``None`` as no-op.
+        self._status_dirty_callback: Optional[Callable[[], None]] = None
+        # Lazy single-instance handle — see ``_get_or_create_token_usage_hook``.
+        self._token_usage_hook_instance: Optional[Any] = None
+
+    def _record_degraded_capability(self, key: str, message: str) -> None:
+        """Record a non-fatal capability degradation for API/CLI surfaces."""
+        self.degraded_capabilities[key] = message
+
+    def _record_context_search_degraded(self, error: BaseException | str) -> str:
+        from pico.storage.embedding_diagnostics import format_context_unavailable
+
+        message = format_context_unavailable(error)
+        self._record_degraded_capability("context_search_tools", message)
+        return message
+
+    @property
+    def model(self) -> Optional[LLMBaseModel]:
+        """Return the currently active :class:`LLMBaseModel` for this node.
+
+        Reads :meth:`AgentConfig.active_model` on every access so a runtime
+        ``/model`` switch is picked up without recreating the node. The
+        heavy lifting is absorbed by :meth:`LLMBaseModel.create_model`'s
+        process-wide LRU cache — calls for the same config are O(1).
+
+        An explicit ``self.model = ...`` assignment (used by the parent
+        :class:`Node` initializer and by tests that inject a mock) pins
+        the instance via the setter below; pinned values win over lazy
+        resolution until explicitly cleared with ``self.model = None``.
+        """
+        if self._pinned_model is not None:
+            return self._pinned_model
+        if self._agent_config_ref is None:
+            return None
+        return LLMBaseModel.create_model(
+            agent_config=self._agent_config_ref,
+            model_name=self._node_model_name,
+            scope=self.scope,
+        )
+
+    @model.setter
+    def model(self, value: Optional[LLMBaseModel]) -> None:
+        """Pin (or clear) the model instance used by this node.
+
+        The parent :class:`Node` class writes ``self.model = None`` during
+        its own ``__init__`` and ``self.model = llm_model`` inside
+        ``_initialize``. Without a setter those assignments would raise
+        because ``model`` is declared as a property here. Storing the
+        value in ``_pinned_model`` preserves the existing contract for
+        legacy callers while still letting ``/model`` switches take effect
+        whenever callers clear the pin.
+        """
+        self._pinned_model = value
+
+    @property
+    def session_manager(self):
+        """Lazy node-owned SessionManager.
+
+        Path layout (each layer optional except the leaf):
+            {agent_config.session_dir}
+              / {self.scope}                  — user/tenant isolation
+              / {self.session_subdir}         — main_session_id when this node is a subagent
+              / {self.session_id}.db
+        """
+        # Use getattr so tests that bypass __init__ still get the lazy default.
+        if getattr(self, "_session_manager", None) is None:
+            import os
+
+            from pico.models.session_manager import SessionManager
+
+            cfg = getattr(self, "agent_config", None)
+            base_dir = getattr(cfg, "session_dir", None) if cfg is not None else None
+            if not base_dir:
+                from pico.utils.path_manager import get_path_manager
+
+                base_dir = str(get_path_manager(agent_config=cfg).sessions_dir)
+            user_scope = getattr(self, "scope", None)
+            session_subdir = getattr(self, "session_subdir", None)
+
+            if session_subdir:
+                scoped_dir = SessionManager(session_dir=base_dir, scope=user_scope).session_dir
+                nested_dir = os.path.join(scoped_dir, session_subdir)
+                self._session_manager = SessionManager(session_dir=nested_dir, scope=None)
+            else:
+                self._session_manager = SessionManager(session_dir=base_dir, scope=user_scope)
+        return self._session_manager
+
+    @property
+    def context_length(self) -> Optional[int]:
+        """Context window of the current model, refreshed per access.
+
+        Used by ``/compact`` / auto-compaction heuristics that divide
+        current token usage by the model's context budget. Falling back
+        to ``None`` (rather than 0) keeps those heuristics inert when the
+        active model doesn't publish a window.
+        """
+        current = self.model
+        if current is None:
+            return None
+        try:
+            return current.context_length()
+        except Exception:
+            return None
+
+    # ── Plan mode lifecycle ─────────────────────────────────────────────
+
+    def activate_plan_mode(self) -> str:
+        """Turn plan mode on.
+
+        Reuses an existing ``plan_file_path`` when present (e.g. left over
+        after ``confirm_plan`` exited plan mode without a full reset) so the
+        next plan session continues on the same markdown file. Allocates a
+        fresh ``./.pico/plans/{short_uuid}.md`` only when no path is set.
+
+        Always resets ``workflow_prompt_sent=False`` so the next user prompt
+        carries the full workflow description.
+
+        Returns:
+            The plan file path (absolute or project-relative).
+        """
+        if self.plan_mode_active and self.plan_file_path:
+            return self.plan_file_path
+
+        self.plan_mode_active = True
+        self.workflow_prompt_sent = False
+
+        # Reuse a previously-allocated path (e.g. confirm_plan exit) when
+        # available — this lets the user re-enter the same plan session.
+        if self.plan_file_path:
+            logger.info(f"Plan mode reactivated: plan_file_path={self.plan_file_path}")
+            self._persist_plan_mode_state()
+            return self.plan_file_path
+
+        plan_dir = os.path.join(self._resolve_workspace_root(), ".pico", "plans")
+        os.makedirs(plan_dir, exist_ok=True)
+        # Short id keeps the path human-friendly; uuid4 has 122 bits of
+        # entropy, so 8 hex chars (32 bits) is still ample for collision
+        # avoidance within a project's plans directory.
+        self.plan_file_path = os.path.join(plan_dir, f"{uuid.uuid4().hex[:8]}.md")
+        # Pre-create an empty plan file so the LLM can read/edit it on the
+        # first turn (it commonly probes with ``read_file`` before writing).
+        try:
+            with open(self.plan_file_path, "w", encoding="utf-8") as _f:
+                pass
+        except OSError as exc:
+            logger.warning(f"Failed to pre-create plan file {self.plan_file_path}: {exc}")
+        logger.info(f"Plan mode activated: plan_file_path={self.plan_file_path}")
+        self._persist_plan_mode_state()
+        return self.plan_file_path
+
+    def deactivate_plan_mode(self) -> None:
+        """Turn plan mode off for this turn while preserving the plan file.
+
+        ``plan_file_path`` is allocated exactly once per session (per node
+        lifetime) and **never** cleared — toggling plan mode off and back on
+        always returns to the same markdown file. This keeps the user's
+        narrative continuous across Shift+Tab toggles and ``confirm_plan``
+        exits within a single session.
+
+        Only ``plan_mode_active`` and ``workflow_prompt_sent`` flip back; the
+        on-disk file and its in-memory path remain.
+        """
+        if self.plan_mode_active:
+            logger.info(f"Plan mode paused: plan_file_path={self.plan_file_path}")
+        self.plan_mode_active = False
+        self.workflow_prompt_sent = False
+        self._persist_plan_mode_state()
+
+    def is_in_plan_mode(self) -> bool:
+        """Return True when plan mode is currently active for this node."""
+        return self.plan_mode_active
+
+    def build_plan_mode_enhanced_prompt(self) -> str:
+        """Render the plan_mode_system template based on current plan-mode state.
+
+        The template branches on ``workflow_prompt_sent``: when False, the full
+        workflow description is rendered; otherwise a short reminder. After the
+        full version is rendered, ``workflow_prompt_sent`` is flipped to True
+        so subsequent prompts only carry the reminder.
+        """
+        if not self.plan_mode_active or not self.plan_file_path:
+            return ""
+
+        auto_execute_plan = bool(getattr(self.input, "auto_execute_plan", False))
+        try:
+            rendered = get_prompt_manager(agent_config=self.agent_config).render_template(
+                template_name="plan_mode_system",
+                version=None,
+                plan_file_path=self.plan_file_path,
+                workflow_prompt_sent=self.workflow_prompt_sent,
+                auto_execute_plan=auto_execute_plan,
+            )
+        except FileNotFoundError:
+            logger.warning("plan_mode_system template not found, using inline fallback")
+            if self.workflow_prompt_sent:
+                rendered = (
+                    f"Plan mode is active. Refer to the workflow already described. "
+                    f"Plan file: {self.plan_file_path}. Continue iterating or call confirm_plan."
+                )
+            else:
+                rendered = (
+                    f"Plan mode is active. Plan file path: {self.plan_file_path}. "
+                    "Use read-only tools and only edit the plan file; call confirm_plan when ready."
+                )
+        # Flip the flag so future prompts only carry the short reminder.
+        self.workflow_prompt_sent = True
+        self._persist_plan_mode_state()
+        return rendered
+
+    def _agent_state_file(self) -> Optional[Path]:
+        """Return the session-bound state file path, or ``None`` when unavailable.
+
+        Returns ``None`` when ``session_id`` has not been allocated yet, or
+        when the path manager fails (e.g. empty ``project_name``). Callers
+        treat ``None`` as "skip persistence this turn".
+        """
+        if not self.session_id:
+            return None
+        try:
+            from pico.utils.path_manager import get_path_manager
+
+            return get_path_manager(agent_config=self.agent_config).agent_state_path(self.session_id)
+        except Exception as exc:  # noqa: BLE001 — persistence must never crash node logic
+            logger.debug("agent_state_path unavailable: %s", exc)
+            return None
+
+    def _persist_plan_mode_state(self, only_if_absent: bool = False) -> None:
+        """Flush current plan-mode fields to the session db. No-op without session_id.
+
+        Plan mode can be toggled before the first message, when the database
+        does not exist yet; ``save_session_meta`` skips that write rather than
+        materialising an empty file that would list as a session, and
+        ``_get_or_create_session`` repeats the call once the session is real.
+        Nothing is lost in that window: a session with no database cannot be
+        resumed, so there is no reader for the state it would have stored.
+
+        ``only_if_absent`` seeds a session that has no plan-mode row yet without
+        overwriting one. Callers that merely materialise the session hold a
+        snapshot taken at construction time, which another process may have
+        moved on from — see :meth:`_get_or_create_session`.
+        """
+        if not self.session_id:
+            return
+        from pico.models.sqlite_session import SESSION_PLAN_MODE_KEY
+        from pico.storage.session_state import PlanModeState
+
+        try:
+            if only_if_absent and self.session_manager.load_session_meta(self.session_id, SESSION_PLAN_MODE_KEY):
+                return
+            payload = PlanModeState(
+                plan_mode_active=self.plan_mode_active,
+                plan_file_path=self.plan_file_path,
+                workflow_prompt_sent=self.workflow_prompt_sent,
+            ).to_json()
+            self.session_manager.save_session_meta(self.session_id, SESSION_PLAN_MODE_KEY, payload)
+        except Exception:  # noqa: BLE001 — session creation must not fail over a flag
+            logger.debug("Failed to persist plan-mode state", exc_info=True)
+
+    def _load_plan_mode_state(self) -> Optional["PlanModeState"]:  # noqa: F821 — forward-ref
+        """Read plan-mode state, preferring the session db over legacy JSON.
+
+        Sessions that predate the move still carry a ``plan_mode`` section in
+        ``{project_data_dir}/state/{session_id}.json``; they keep working and
+        migrate to the database on their next toggle.
+        """
+        from pico.models.sqlite_session import SESSION_PLAN_MODE_KEY
+        from pico.storage.session_state import PlanModeState
+
+        if self.session_id:
+            try:
+                payload = self.session_manager.load_session_meta(self.session_id, SESSION_PLAN_MODE_KEY)
+            except Exception:  # noqa: BLE001
+                payload = None
+                logger.debug("Failed to read plan-mode state from the session db", exc_info=True)
+            state = PlanModeState.from_json(payload)
+            if state is not None:
+                return state
+        state_path = self._agent_state_file()
+        if state_path is None or not state_path.exists():
+            return None
+        return PlanModeState.load(state_path)
+
+    def restore_plan_mode_state(self) -> None:
+        """Re-hydrate plan-mode fields from disk into this node.
+
+        Idempotent; safe to call multiple times. Invoked automatically by:
+          1. ``__init__`` when caller passes ``session_id``
+          2. The ``session_id`` setter when value transitions to non-empty
+
+        When no on-disk state file exists yet (fresh session), this is a
+        no-op — the in-memory defaults / values already on the node are
+        preserved. This matters because ``_get_or_create_session`` may
+        allocate a new ``session_id`` *after* the user already activated
+        plan mode, and we must not wipe their in-flight plan_file_path.
+
+        ``_plan_just_confirmed`` is intentionally NOT restored — it is a
+        turn-local one-shot flag and should always start False on resume.
+        """
+        loaded = self._load_plan_mode_state()
+        if loaded is None:
+            return
+        self.plan_mode_active = loaded.plan_mode_active
+        self.plan_file_path = loaded.plan_file_path
+        self.workflow_prompt_sent = loaded.workflow_prompt_sent
+        self._plan_just_confirmed = False
+        logger.info(
+            "Plan mode state restored for session %s: active=%s path=%s prompt_sent=%s",
+            self.session_id,
+            self.plan_mode_active,
+            self.plan_file_path,
+            self.workflow_prompt_sent,
+        )
+
+    def persist_context_state(self, last_call_input_tokens: int) -> None:
+        """Publish a measured occupancy, then persist it. Zero invalidates.
+
+        Memory is authoritative for the running node even when persistence
+        fails. The session db holds the durable value, zeroed by any history
+        rewrite in the same transaction; the JSON section is only a
+        compatibility mirror for sessions that predate the move, so it is
+        refreshed where it already exists and never created — a new file would
+        be a second storage location ``SessionManager`` has to clean up for no
+        reader's benefit.
+        """
+        from pico.storage.session_state import ContextState
+
+        state = ContextState(max(0, int(last_call_input_tokens or 0)))
+        self._context_state = state
+        self._restored_context_used = state.last_call_input_tokens
+        if self.session_id:
+            try:
+                self.session_manager.save_context_state(self.session_id, state)
+            except Exception:
+                logger.debug("Failed to persist SQLite context state", exc_info=True)
+        try:
+            state_path = self._agent_state_file()
+            if state_path is not None and state_path.exists():
+                state.save(state_path)
+        except Exception:
+            logger.debug("Failed to persist JSON context state", exc_info=True)
+
+    def restore_context_state(self) -> None:
+        """Restore the durable measurement, falling back to legacy JSON."""
+        from pico.storage.session_state import ContextState
+
+        loaded = None
+        if self.session_id:
+            try:
+                loaded = self.session_manager.load_context_state(self.session_id)
+            except Exception:
+                # An unreadable durable zero must not revive an old JSON value.
+                loaded = ContextState()
+                logger.debug("Failed to restore SQLite context state", exc_info=True)
+        if not isinstance(loaded, ContextState):
+            state_path = self._agent_state_file()
+            if state_path is None or not state_path.exists():
+                return
+            loaded = ContextState.load(state_path)
+        self._context_state = loaded
+        self._restored_context_used = loaded.last_call_input_tokens
+
+    def get_context_usage(self) -> "ContextState":
+        """Return the latest measured input occupancy; never substitute spend."""
+        from pico.storage.session_state import read_context_state
+
+        return read_context_state(self)
+
+    def _get_plan_mode_tools(self) -> List[Tool]:
+        """Build the plan-mode func tools (``confirm_plan`` + ``todo_*``).
+
+        - **Sub-agent** (``self._is_subagent is True``): returns ``[]``.
+          Sub-agents are invoked by a parent agent that already owns planning,
+          so they must not expose their own planning surface.
+        - **Main agent**: always returns the tools, regardless of
+          ``plan_mode_active``. The user can pre-activate plan mode to *force*
+          the LLM through the file-backed workflow, but the tools themselves
+          are visible from the start so the LLM can judge whether to use them.
+        """
+        if getattr(self, "_is_subagent", False):
+            return []
+
+        from pico.tools.func_tool.plan_tools import ConfirmPlanTool, PlanTool
+
+        # PlanTool keeps a reference to the agents-SDK session for backward-
+        # compat but does not actually read it, so passing the current value
+        # (which may still be None at setup time) is safe.
+        # Lambda resolves session_id lazily — at setup time it's still None,
+        # ``_get_or_create_session`` allocates it on the first turn. Snapshot
+        # would leave the storage permanently unbound and never persist.
+        # Keep both instances on the node so ``_iter_tool_groups`` registers
+        # their ``permission_category`` — locals would silently fall back to
+        # the ``tools`` catch-all at hook time.
+        self.plan_tool = PlanTool(self._session, session_id=lambda: self.session_id)
+        self.confirm_plan_tool = ConfirmPlanTool(self)
+        tools: List[Tool] = list(self.plan_tool.available_tools())
+        tools.extend(self.confirm_plan_tool.available_tools())
+        return tools
+
+    def _register_plan_mode_tools(self) -> None:
+        """Append plan-mode tools to ``self.tools`` at node setup time.
+
+        Subclasses call this at the end of any code path that (re)builds
+        ``self.tools`` from scratch — e.g. inside ``_rebuild_tools()`` /
+        ``setup_tools()`` and after datasource swaps. The call is a no-op
+        for sub-agents (``_is_subagent=True``).
+        """
+        if getattr(self, "_is_subagent", False):
+            return
+        plan_tools = self._get_plan_mode_tools()
+        if not plan_tools:
+            return
+        if self.tools is None:
+            self.tools = []
+        self.tools.extend(plan_tools)
+
+    def _sync_plan_mode_state(self, user_input: Any) -> None:
+        """Reconcile ``self.plan_mode_active`` with the input's ``plan_mode`` flag.
+
+        - ``user_input.plan_mode == True`` → idempotently activate (reuse the
+          existing plan file across turns).
+        - Flag absent / False but currently active → deactivate (user toggled
+          plan mode off mid-session).
+        - Sub-agent invocations never carry the flag, so this is a no-op.
+        """
+        if getattr(user_input, "plan_mode", False):
+            self.activate_plan_mode()
+        elif self.is_in_plan_mode():
+            self.deactivate_plan_mode()
+
+    def _build_datasource_reminder(self, user_input: Any = None) -> str:
+        """Live per-turn datasource line for the user-message envelope.
+
+        The frozen system-prompt snapshot must never pin the *current*
+        datasource: a mid-session ``/datasource`` switch would silently leave a
+        stale dialect in every later turn. Instead this line rides in the
+        ``<system_reminder>`` envelope of each user message. It merges what
+        used to be a separate "Database Context" block — dialect, catalog,
+        database (resolved via the connector default), adapter-provided SQL
+        semantics, and schema — into one line so the dialect is stated exactly
+        once per turn. Gated on ``db_func_tool`` so non-DB nodes add no noise;
+        returns an empty string when no datasource is selected.
+        """
+        agent_config = getattr(self, "agent_config", None)
+        if not agent_config or getattr(self, "db_func_tool", None) is None:
+            return ""
+        from pico.utils.node_utils import build_datasource_prompt_context, resolve_database_name_for_prompt
+
+        ds_ctx = build_datasource_prompt_context(agent_config)
+        datasource = ds_ctx.get("datasource")
+        if not datasource:
+            return ""
+
+        details: List[str] = []
+        dialect = ds_ctx.get("current_datasource_dialect")
+        if dialect:
+            details.append(f"dialect: {dialect}")
+        catalog = getattr(user_input, "catalog", "") or ""
+        if catalog:
+            details.append(f"catalog: {catalog}")
+        connector = getattr(self.db_func_tool, "connector", None)
+        database = resolve_database_name_for_prompt(connector, getattr(user_input, "database", "") or "")
+        if database:
+            details.append(f"database: {database}")
+        sql_context_getter = getattr(connector, "get_sql_generation_context", None)
+        if callable(sql_context_getter):
+            try:
+                sql_context = sql_context_getter(database_name=database) or {}
+                compatibility_mode = sql_context.get("compatibility_mode") if isinstance(sql_context, dict) else None
+                if compatibility_mode:
+                    compatibility_mode = str(compatibility_mode).strip()
+                    if compatibility_mode:
+                        details.append(f"compatibility mode: {compatibility_mode}")
+            except Exception as e:
+                # SQL-generation hints must never make an otherwise usable
+                # datasource fail. The adapter may be talking to an older or
+                # restricted server that cannot expose the requested trait.
+                logger.debug("Unable to read connector SQL-generation context: %s", e)
+        schema = getattr(user_input, "db_schema", "") or ""
+        if schema:
+            details.append(f"schema: {schema}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        line = (
+            f"Current datasource: {datasource}{suffix}. This is the authoritative "
+            "target for this turn; generate SQL for THIS dialect."
+        )
+
+        # The uploads catalog is a *second* datasource, and nothing else tells the
+        # model it exists: this reminder names only the current one, and no prompt
+        # template renders ``available_datasources``. Without this the model
+        # writes the primary dialect against DuckDB views, or does not look for
+        # uploaded files at all. Config-only check — deliberately no query to
+        # count tables, which would cost a round trip on every single turn.
+        available = ds_ctx.get("available_datasources") or {}
+        if LOCAL_FILES_DATASOURCE in available and datasource != LOCAL_FILES_DATASOURCE:
+            line += (
+                f" Uploaded data files are separately queryable via "
+                f"datasource '{LOCAL_FILES_DATASOURCE}' (dialect: duckdb) after "
+                f"load_file_as_table registers them."
+            )
+        return line
+
+    def _semantic_runtime_db_context(self) -> Dict[str, str]:
+        """Return the current datasource/catalog/database/schema for semantic adapter initialization."""
+        agent_config = getattr(self, "agent_config", None)
+        if not agent_config:
+            return {}
+
+        from pico.utils.node_utils import resolve_database_name_for_prompt
+
+        datasource = getattr(agent_config, "current_datasource", "") or ""
+        runtime_context: Dict[str, str] = {}
+        runtime_context_getter = getattr(agent_config, "runtime_db_context", None)
+        if callable(runtime_context_getter):
+            try:
+                runtime_context = runtime_context_getter() or {}
+            except Exception as e:
+                logger.debug("Unable to read runtime DB context for semantic adapter: %s", e)
+                runtime_context = {}
+        datasource = runtime_context.get("datasource") or datasource
+        context: Dict[str, str] = {}
+        if datasource:
+            context["datasource"] = datasource
+
+        db_config = None
+        try:
+            db_config = agent_config.current_db_config(datasource)
+        except Exception as e:
+            logger.debug("Unable to read current DB config for semantic adapter context: %s", e)
+
+        user_input = getattr(self, "input", None)
+        connector = getattr(getattr(self, "db_func_tool", None), "connector", None)
+
+        catalog = (
+            getattr(user_input, "catalog", "")
+            or runtime_context.get("catalog")
+            or runtime_context.get("catalog_name")
+            or getattr(db_config, "catalog", "")
+            or ""
+        )
+        if catalog:
+            context["catalog"] = str(catalog).strip()
+
+        requested_database = (
+            getattr(user_input, "database", "")
+            or runtime_context.get("database")
+            or runtime_context.get("database_name")
+            or ""
+        )
+        database = resolve_database_name_for_prompt(connector, requested_database)
+        database = (
+            database
+            or runtime_context.get("database")
+            or runtime_context.get("database_name")
+            or getattr(db_config, "database", "")
+            or ""
+        )
+        if database:
+            context["database"] = str(database).strip()
+
+        schema = (
+            getattr(user_input, "db_schema", "")
+            or runtime_context.get("schema")
+            or runtime_context.get("db_schema")
+            or runtime_context.get("schema_name")
+            or getattr(db_config, "schema", "")
+            or ""
+        )
+        if schema:
+            context["schema"] = str(schema).strip()
+            context["db_schema"] = str(schema).strip()
+
+        return {key: value for key, value in context.items() if value}
+
+    def _render_at_context_parts(self, user_input: Any) -> List[str]:
+        """Render resolved @-referenced context as ordered prompt parts.
+
+        Single source of truth for surfacing @Knowledge / @Table / @Metric /
+        @Sql references to the LLM. Shared by :meth:`_build_enhanced_message`
+        and the deliverable / visual-artifact overrides so a new reference kind
+        is rendered everywhere by editing this one method. Reads every field
+        via ``getattr`` — inputs that don't declare a field (or don't inherit
+        :class:`~pico.schemas.at_context.AtContextInput`) simply contribute
+        nothing.
+        """
+        parts: List[str] = []
+
+        ext_know = getattr(user_input, "external_knowledge", "") or ""
+        if ext_know:
+            parts.append(f"## Business knowledge\nMUST apply the following business logic:\n{ext_know}")
+
+        schemas = getattr(user_input, "schemas", None)
+        if schemas:
+            from pico.schemas.node_models import TableSchema
+
+            names = TableSchema.table_names_to_prompt(schemas)
+            bullets = "\n".join(f"- {n.strip()}" for n in names.splitlines() if n.strip())
+            parts.append("## Referenced tables\nMUST use ONLY these tables in FROM/JOIN clauses:\n" + bullets)
+
+        metrics = getattr(user_input, "metrics", None)
+        if metrics:
+            blocks = []
+            for m in metrics:
+                subject_path = getattr(m, "subject_path", []) or []
+                header = f"### {m.name}"
+                if subject_path:
+                    header += f"  (subject_path: {'/'.join(subject_path)})"
+                lines = [header]
+                desc = (getattr(m, "description", "") or "").strip()
+                if desc:
+                    lines.append(desc)
+                meta = []
+                metric_type = (getattr(m, "metric_type", "") or "").strip()
+                measure_expr = (getattr(m, "measure_expr", "") or "").strip()
+                dimensions = getattr(m, "dimensions", []) or []
+                if metric_type:
+                    meta.append(f"type: {metric_type}")
+                if measure_expr:
+                    meta.append(f"measure: {measure_expr}")
+                if dimensions:
+                    meta.append(f"dimensions: {', '.join(dimensions)}")
+                if meta:
+                    lines.append(" · ".join(meta))
+                blocks.append("\n".join(lines))
+            parts.append("## Referenced metrics\n" + "\n\n".join(blocks))
+
+        reference_sql = getattr(user_input, "reference_sql", None)
+        if reference_sql:
+            blocks = []
+            for r in reference_sql:
+                summary = (getattr(r, "summary", "") or "").strip()
+                subject_path = getattr(r, "subject_path", []) or []
+                header = f"### {r.name}" + (f" — {summary}" if summary else "")
+                if subject_path:
+                    header += f"  (subject_path: {'/'.join(subject_path)})"
+                sql = (getattr(r, "sql", "") or "").strip()
+                blocks.append(header + (f"\n```sql\n{sql}\n```" if sql else ""))
+            parts.append("## Referenced SQL\n" + "\n\n".join(blocks))
+
+        hint_part = self._render_context_hint_part(getattr(user_input, "context_hints", None))
+        if hint_part:
+            parts.append(hint_part)
+
+        return parts
+
+    @staticmethod
+    def _render_context_hint_part(hints: Optional[List[Dict[str, Any]]]) -> str:
+        """Render look-up hints for referenced items that couldn't be pre-loaded.
+
+        Names the item and points the model at the exact tool call so it fetches
+        the detail directly instead of searching the subject tree blindly.
+        """
+        if not hints:
+            return ""
+        tool_by_kind = {"metric": "get_metrics", "reference_sql": "get_reference_sql"}
+        label_by_kind = {"metric": "Metric", "reference_sql": "Reference SQL", "knowledge": "Knowledge"}
+        lines = [
+            "## Referenced items to look up",
+            "The user attached these but their details are not loaded here. Fetch each with the "
+            "indicated tool (using the exact subject_path and name) before answering — do not search blindly:",
+        ]
+        for h in hints:
+            kind = h.get("kind", "")
+            name = h.get("name", "")
+            subject_path = h.get("subject_path", []) or []
+            label = label_by_kind.get(kind, kind or "Item")
+            tool = tool_by_kind.get(kind)
+            if tool:
+                lines.append(f'- {label} "{name}" → call {tool}(subject_path={subject_path}, name="{name}")')
+            else:
+                full = "/".join(list(subject_path) + [name])
+                lines.append(f'- {label} "{name}" (subject path: {full}) → locate it via list_subject_tree')
+        return "\n".join(lines)
+
+    def _build_enhanced_message(
+        self,
+        user_input: Any,
+        extra_enhanced_parts: Optional[List[str]] = None,
+    ) -> str:
+        """Assemble the per-turn user prompt for the LLM.
+
+        Composes (in order):
+        1. Plan-mode state transition (activate / deactivate) based on
+           ``user_input.plan_mode``.
+        2. Shared context parts read from *user_input* via ``getattr``
+           (so subclasses with sparser inputs still work):
+           - ``external_knowledge`` → "MUST use these business logic" block
+           - DB-context block (dialect + catalog/database/db_schema)
+           - ``schemas`` (list of :class:`TableSchema`) → "Available tables"
+           - ``metrics`` → "Metrics:" block
+           - ``reference_sql`` → "Reference SQL:" block
+        3. Subclass-supplied ``extra_enhanced_parts`` (already formatted).
+        4. Plan-mode workflow prompt when plan mode is active.
+
+        Args:
+            user_input: The node's input model. Attributes are read via
+                ``getattr`` so unrelated fields are simply skipped. The raw
+                user text comes from ``user_input.user_message``.
+            extra_enhanced_parts: Already-formatted strings to splice into
+                the enhanced section (after the standard parts, before the
+                plan-mode workflow prompt). Use this for subclass-specific
+                context (e.g. compare's pair-of-SQL block) so the user-side
+                of the structured envelope remains the raw user message.
+
+        Returns the final user-facing string. When no enhanced parts apply,
+        returns the raw user message unchanged; otherwise wraps both in a
+        structured JSON ``[enhanced, user]`` envelope.
+        """
+        self._sync_plan_mode_state(user_input)
+
+        enhanced_parts: List[str] = []
+
+        # Live per-turn datasource line (dialect + catalog/database/schema in
+        # one place). Deliberately NOT in the frozen system-prompt snapshot —
+        # injecting it here keeps the system-prompt prefix byte-stable across
+        # a mid-session datasource switch while the model still targets the
+        # right dialect THIS turn. It supersedes the legacy "Database Context"
+        # block, which only renders below when this line is absent.
+        datasource_reminder = self._build_datasource_reminder(user_input)
+        if datasource_reminder:
+            enhanced_parts.append(datasource_reminder)
+
+        db_type = getattr(self.agent_config, "db_type", "") if self.agent_config else ""
+        if db_type and not datasource_reminder:
+            # Always resolve empty database via the connector default — the
+            # helper is a no-op when no connector is wired or value is set.
+            from pico.utils.node_utils import resolve_database_name_for_prompt
+
+            connector = None
+            db_func_tool = getattr(self, "db_func_tool", None)
+            if db_func_tool is not None:
+                connector = getattr(db_func_tool, "connector", None)
+            effective_database = resolve_database_name_for_prompt(
+                connector,
+                getattr(user_input, "database", "") or "",
+            )
+            ctx = build_database_context(
+                db_type,
+                catalog=getattr(user_input, "catalog", "") or "",
+                database=effective_database or "",
+                schema=getattr(user_input, "db_schema", "") or "",
+            )
+            if ctx:
+                enhanced_parts.append(ctx)
+
+        enhanced_parts.extend(self._render_at_context_parts(user_input))
+
+        if extra_enhanced_parts:
+            enhanced_parts.extend(p for p in extra_enhanced_parts if p)
+
+        if self.is_in_plan_mode():
+            plan_prompt = self.build_plan_mode_enhanced_prompt()
+            if plan_prompt:
+                enhanced_parts.append(plan_prompt)
+        elif getattr(self, "_plan_just_confirmed", False) and self.plan_file_path:
+            # One-shot reminder on the turn immediately following a successful
+            # ``confirm_plan``. Tells the LLM the plan is approved and it
+            # should execute the steps instead of asking for further input.
+            enhanced_parts.append(
+                "## Post-Plan Execution\n"
+                f"You just confirmed the plan at {self.plan_file_path}. Plan mode is "
+                "exited. The user's next message is a continuation cue — do NOT ask "
+                "what to do next; instead read the plan file, materialise its actionable "
+                "steps via todo_write (one item per step, each with a `title` ≤ 8 words "
+                "and full `content`), then call todo_update(id, 'in_progress') before "
+                "starting each step and todo_update(id, 'completed') when done. Use "
+                "ask_user only when a step genuinely requires user input that cannot "
+                "be inferred."
+            )
+            self._plan_just_confirmed = False
+
+        user_message = getattr(user_input, "user_message", "") or ""
+        if not enhanced_parts:
+            return user_message
+
+        enhanced_context = "\n\n".join(enhanced_parts)
+        return build_structured_content(enhanced_context, user_message)
+
+    def get_node_name(self) -> str:
+        """
+        Get the template name for this agentic node. Overwrite this method if you need a special name
+
+        Default implementation extracts from class name:
+        - ChatAgenticNode -> "chat"
+        - GenerateAgenticNode -> "generate"
+
+        Returns:
+            Node name that will be used to construct the full template filename and use in agent.yml
+        """
+        class_name = self.__class__.__name__
+        # Remove "AgenticNode" suffix and convert to lowercase
+        if class_name.endswith("AgenticNode"):
+            template_name = class_name[:-11]  # Remove "AgenticNode" (11 characters)
+        else:
+            template_name = class_name
+
+        return template_name.lower()
+
+    def get_node_class_name(self) -> str:
+        """Canonical identifier for this node's underlying class.
+
+        ``get_node_name()`` may return a per-instance alias when a subagent is
+        registered under a custom id (e.g. ``my_dashboard`` backed by
+        ``GenDashboardAgenticNode``). Scoping mechanisms like
+        ``SkillMetadata.allowed_agents`` need a stable class-level identifier so
+        a whitelist written against the canonical class (``gen_dashboard``)
+        still applies to all aliases of that class.
+
+        Resolution order:
+        1. ``type(self).NODE_NAME`` if the subclass declares it — the
+           recommended form, used by ``gen_dashboard``, ``gen_table``,
+           ``scheduler``, ``gen_skill`` etc.
+        2. Otherwise derive from the class name via the *base*
+           ``AgenticNode.get_node_name`` (e.g. ``ExploreAgenticNode`` →
+           ``explore``). This is the safety net for alias-capable subclasses
+           that haven't added ``NODE_NAME``: we must NOT fall back to
+           ``self.get_node_name()``, since overrides there return the alias.
+
+        Returns:
+            A stable class-level identifier independent of any alias.
+        """
+        node_class = getattr(type(self), "NODE_NAME", None)
+        if node_class:
+            return node_class
+        return AgenticNode.get_node_name(self)
+
+    def _system_prompt_snapshot_meta(self, prompt_version: Optional[str]) -> Dict[str, str]:
+        """Identity keys that invalidate the cached system-prompt snapshot.
+
+        The snapshot is replayed verbatim while these stay equal. They cover
+        the inputs that change the prompt's identity within a session: the
+        node template, its version, and the active model (a model switch also
+        resets the provider-side prefix cache, so rebuilding is free). The
+        live per-turn datasource/dialect is injected in the user message
+        instead, so it deliberately does **not** appear here. ``language`` DOES
+        appear: it is a per-request field on the Chat API, so a user switching
+        the UI language mid-session must not keep replaying a snapshot that
+        pins the old one. Date, memory, and skills stay frozen until the
+        snapshot is rebuilt.
+        """
+        agent_config = getattr(self, "agent_config", None)
+        version = prompt_version
+        if version is None and agent_config is not None and hasattr(agent_config, "prompt_version"):
+            version = agent_config.prompt_version
+        # A node-level model override (``node_config.model``) pins the
+        # effective model regardless of the agent-level target, so it must be
+        # the identity when set — otherwise a /model switch that doesn't
+        # affect this node would spuriously rebuild (and vice versa).
+        node_model = getattr(self, "_node_model_name", None)
+        if node_model:
+            model_id = f"node:{node_model}"
+        else:
+            model_id = ""
+            try:
+                mc = agent_config.active_model() if agent_config is not None else None
+                if mc is not None:
+                    model_id = f"{getattr(mc, 'type', '') or ''}:{getattr(mc, 'model', '') or ''}"
+            except Exception:
+                model_id = ""
+        language = getattr(agent_config, "language", None) if agent_config is not None else None
+        return {
+            "node_name": self.get_node_name(),
+            "prompt_version": str(version or ""),
+            "model_name": model_id,
+            "language": str(language or "").strip(),
+        }
+
+    def _get_session_system_prompt(
+        self,
+        prompt_version: Optional[str] = None,
+        template_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Return the system prompt for this turn, served from a session snapshot.
+
+        On the first LLM call of a session the finalized prompt is built via
+        :meth:`_get_system_prompt` (subclass overrides honored) and persisted
+        under ``{session_dir}/{session_id}.sysprompt.json``. Later turns —
+        including new node instances, API per-request nodes, ``/resume``, and
+        subagent sessions — replay the exact bytes, keeping the provider
+        prefix cache warm and skipping the per-turn template render and
+        AGENTS.md/MEMORY.md file reads. A major compact or ``/clear`` drops
+        the snapshot so it rebuilds (session-rebuild semantics); a model
+        switch invalidates it via the meta comparison.
+        """
+        session_id = getattr(self, "session_id", "") or ""
+        meta = self._system_prompt_snapshot_meta(prompt_version)
+        sm = None
+        if session_id:
+            try:
+                sm = self.session_manager
+            except Exception as exc:  # session manager wiring is optional in some unit paths
+                logger.debug("System-prompt snapshot disabled (no session manager): %s", exc)
+                sm = None
+
+        if sm is not None:
+            snapshot = sm.load_system_prompt_snapshot(session_id)
+            if snapshot is not None and all(snapshot.get(k) == v for k, v in meta.items()):
+                # The replayed prompt advertises skill/bash/memory tools whose
+                # mounting is normally a side effect of the (skipped) build.
+                self._ensure_lazy_tools_mounted()
+                return snapshot["prompt"]
+
+        # Cache miss / stale meta: rebuild. Preserve the call shape — several
+        # subclass overrides accept only ``prompt_version``.
+        if template_context:
+            prompt = self._get_system_prompt(prompt_version=prompt_version, template_context=template_context)
+        else:
+            prompt = self._get_system_prompt(prompt_version=prompt_version)
+
+        if sm is not None:
+            sm.save_system_prompt_snapshot(session_id, prompt, meta)
+        return prompt
+
+    def _get_system_prompt(
+        self,
+        prompt_version: Optional[str] = None,
+        template_context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Get the system prompt for this agentic node using PromptManager.
+
+        The template name follows the pattern: {get_node_name()}_system_{version}
+
+        Args:
+            prompt_version: Optional prompt version to use, overrides agent config version
+            template_context: Optional extra keyword arguments forwarded into the
+                template render call. Subclasses populate this via
+                ``_prepare_template_context`` when their templates need extra
+                variables beyond the common ones.
+
+        Returns:
+            System prompt string loaded from the template
+        """
+        # Get prompt version from parameter, fallback to agent config, then use default
+        version = prompt_version
+        if version is None and self.agent_config and hasattr(self.agent_config, "prompt_version"):
+            version = self.agent_config.prompt_version
+
+        root_path = self._resolve_workspace_root()
+
+        # Construct template name: {template_name}_system_{version}
+        template_name = f"{self.get_node_name()}_system"
+
+        render_kwargs: Dict[str, Any] = {
+            "agent_config": self.agent_config,
+            "datasource": getattr(self.agent_config, "current_datasource", None) if self.agent_config else None,
+            "workspace_root": root_path,  # DEPRECATED: Use semantic_model_dir or sql_summary_dir instead
+        }
+        if template_context:
+            render_kwargs.update(template_context)
+
+        try:
+            # Use prompt manager to render the template
+            base_prompt = get_prompt_manager(agent_config=self.agent_config).render_template(
+                template_name=template_name,
+                version=version,
+                **render_kwargs,
+            )
+
+        except FileNotFoundError as e:
+            # Template not found - throw DatusException
+            raise DatusException(
+                code=ErrorCode.COMMON_TEMPLATE_NOT_FOUND,
+                message_args={"template_name": template_name, "version": version or "latest"},
+            ) from e
+        except Exception as e:
+            # Other template errors - wrap in DatusException
+            logger.error(f"Template loading error for '{template_name}': {e}")
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Template loading failed for '{template_name}': {str(e)}"},
+            ) from e
+
+        return self._finalize_system_prompt(base_prompt)
+
+    def _finalize_system_prompt(self, base_prompt: str, memory_node_name_override: Optional[str] = None) -> str:
+        """
+        Finalize system prompt by injecting skill context, memory context, and ensuring skill tools.
+
+        All subclasses should call this at the end of their _get_system_prompt() override
+        to ensure skills and memory are properly injected regardless of how the template is rendered.
+
+        Args:
+            base_prompt: The rendered template prompt
+            memory_node_name_override: When provided, inject memory for this node name instead of
+                ``self.get_node_name()``. Used by FeedbackAgenticNode to inject the caller's memory
+                (the feedback node has no memory of its own).
+
+        Returns:
+            Prompt with skills XML and memory context appended
+        """
+        # Inject session-stable runtime context. The current datasource
+        # selection lives in the per-turn user message instead.
+        base_prompt = self._inject_runtime_context(base_prompt)
+        base_prompt = self._inject_datasource_runtime_context(base_prompt)
+
+        # Inject installed-plugin context (available scheduling/plugin
+        # environments and what they do), grouped with the other "what's
+        # available" context above.
+        base_prompt = self._inject_plugin_context(base_prompt)
+
+        # Inject AGENTS.md project context if present in cwd
+        agents_md = self._load_agents_md()
+        if agents_md:
+            base_prompt = base_prompt + "\n\n" + agents_md
+
+        # Mount the lazily injected skill/bash/memory tools.
+        self._ensure_lazy_tools_mounted()
+
+        # Inject required-skill specifications deterministically. These are
+        # host-mandated (e.g. authoring format specs) and must not depend on
+        # the LLM choosing to call ``load_skill``.
+        base_prompt = self._inject_required_skills(base_prompt)
+
+        # Inject available skills XML into system prompt when skill_func_tool is active.
+        if self.skill_func_tool:
+            skills_xml = self._get_available_skills_context()
+            if skills_xml:
+                base_prompt = base_prompt + "\n\n" + skills_xml
+
+        # Inject memory context for eligible nodes.
+        base_prompt = self._inject_memory_context(base_prompt, override_node_name=memory_node_name_override)
+
+        # Inject response language policy so every agentic node — including
+        # sub-agents invoked via ``task`` — honors the configured output language.
+        base_prompt = self._inject_response_language(base_prompt)
+
+        return base_prompt
+
+    def _ensure_lazy_tools_mounted(self) -> None:
+        """Mount the lazily injected skill/bash/memory tools into ``self.tools``.
+
+        Normally a side effect of :meth:`_finalize_system_prompt` during the
+        prompt build. A snapshot cache hit skips that build entirely, so the
+        hit path calls this directly — the replayed prompt advertises these
+        capabilities and a fresh node instance (API per-request, ``/resume``)
+        must actually have them mounted. All three are idempotent; subclass
+        gating overrides (e.g. artifact-ask nodes) are honored via virtual
+        dispatch.
+        """
+        self._ensure_skill_tools_in_tools()
+        self._ensure_bash_tool_in_tools()
+        self._ensure_memory_tool_in_tools()
+        self._ensure_web_tools_in_tools()
+
+    def _runtime_context_current_date(self) -> str:
+        """Current-date reference rendered into the shared runtime-context block.
+
+        Defaults to today. Subclasses with a reference-date concept (e.g.
+        GenSQL/AskMetrics, which honor a benchmark/replay ``reference_date``)
+        override this so the frozen prompt reflects the intended evaluation
+        date.
+        """
+        from pico.utils.time_utils import get_default_current_date
+
+        return get_default_current_date(None)
+
+    def _inject_runtime_context(self, base_prompt: str) -> str:
+        """Append the shared runtime-context block.
+
+        Renders ``runtime_context_1.0.j2`` with date-only session-stable
+        context. Date context is runtime input, not DB-tool capability.
+        """
+        agent_config = getattr(self, "agent_config", None)
+        try:
+            section = get_prompt_manager(agent_config=agent_config).render_template(
+                template_name="runtime_context",
+                version=None,
+                current_date=self._runtime_context_current_date(),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to inject runtime context: {e}")
+            return base_prompt
+        if section and section.strip():
+            base_prompt = base_prompt + "\n\n" + section.strip()
+        return base_prompt
+
+    def _inject_datasource_runtime_context(self, base_prompt: str) -> str:
+        """Append datasource/sql-root context for DB-tool-capable nodes.
+
+        This preserves the old scope for datasource catalog and sql-root hints
+        while allowing date context to be injected independently.
+        """
+        if getattr(self, "db_func_tool", None) is None:
+            return base_prompt
+        agent_config = getattr(self, "agent_config", None)
+        try:
+            from pico.utils.node_utils import build_datasource_prompt_context
+
+            ds_ctx = build_datasource_prompt_context(agent_config) if agent_config else {}
+            section = get_prompt_manager(agent_config=agent_config).render_template(
+                template_name="datasource_runtime_context",
+                version=None,
+                available_datasources=ds_ctx.get("available_datasources") or {},
+                workspace_root=self._resolve_workspace_root(),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to inject datasource runtime context: {e}")
+            return base_prompt
+        if section and section.strip():
+            base_prompt = base_prompt + "\n\n" + section.strip()
+        return base_prompt
+
+    def _inject_plugin_context(self, base_prompt: str) -> str:
+        """Append self-describing context contributed by installed plugins.
+
+        Each ``pico.plugins`` package may expose a class-level
+        ``system_prompt(profiles)`` returning a markdown block (e.g. the
+        available scheduler environments). pico collects those sections and
+        appends them verbatim — the plugin owns formatting and is responsible
+        for surfacing only non-secret fields. Skipped entirely when the
+        plugin system is disabled (``agent.plugins_enabled: false``).
+        """
+        agent_config = getattr(self, "agent_config", None)
+        if agent_config is None or not getattr(agent_config, "plugins_enabled", True):
+            return base_prompt
+        try:
+            from pico.plugins.registry import plugin_system_prompt_sections
+
+            sections = plugin_system_prompt_sections(agent_config)
+        except Exception as e:
+            logger.warning(f"Failed to inject plugin context: {e}")
+            return base_prompt
+        for section in sections:
+            if section and section.strip():
+                base_prompt = base_prompt + "\n\n" + section.strip()
+        return base_prompt
+
+    def _inject_response_language(self, base_prompt: str) -> str:
+        """Append a language directive driven by ``agent_config.language``.
+
+        When ``language`` is unset (``None`` or empty), this is a no-op so the
+        model decides the response language on its own. Setting a code (e.g.
+        ``"en"``/``"zh"``) in yaml or via the Chat API pins every AgenticNode
+        to that output language through a single append hook.
+        """
+        language_raw = getattr(self.agent_config, "language", None)
+        if not language_raw or not str(language_raw).strip():
+            return base_prompt
+        language_code = str(language_raw).strip()
+        try:
+            language_section = get_prompt_manager(agent_config=self.agent_config).render_template(
+                template_name="response_language",
+                version=None,
+                language_code=language_code,
+                language_name=_resolve_language_name(language_code),
+                native_directive=_resolve_native_directive(language_code),
+            )
+        except Exception as e:
+            # Returning the prompt untouched would read as "no language pinned"
+            # and hand the turn back to the model's own choice — the very drift
+            # this directive exists to stop. Fall back like the other two call
+            # sites do.
+            logger.warning(f"Failed to render response_language template: {e}")
+            return base_prompt + "\n\n" + _build_fallback_directive(language_code)
+        language_section = _ensure_native_directive(language_section, language_code)
+        if language_section and language_section.strip():
+            base_prompt = base_prompt + "\n\n" + language_section
+        return base_prompt
+
+    def _inject_memory_context(self, base_prompt: str, override_node_name: Optional[str] = None) -> str:
+        """Inject memory context into the system prompt.
+
+        Injection rules (resolved in order):
+        1. ``override_node_name`` provided (feedback path) → writable injection of
+           that node's memory (the feedback node injects its caller's memory).
+        2. ``inherited_memory`` contextvar set by ``SubAgentTaskTool`` → this node
+           is running as a **sub-agent**; render the parent's memory **read-only**
+           (content only, no write manual). It has no memory write tools.
+        3. Otherwise this is a **main** agent → render its own memory writable.
+           The owner is ``resolve_memory_node(get_node_name())`` (built-in main
+           agents share ``chat``; custom agents use their own name).
+
+        Args:
+            base_prompt: The prompt to append memory context to.
+            override_node_name: When provided, look up memory for this node name instead of
+                ``self.get_node_name()``. Enables injecting another node's memory (e.g. the
+                feedback node injects its caller's memory).
+        """
+        from pico.configuration.inherited_memory_overrides import get_inherited_memory
+        from pico.utils.memory_loader import get_memory_dir, load_memory_context, resolve_memory_node
+
+        read_only = False
+        if override_node_name:
+            node_name = override_node_name
+        else:
+            inherited = get_inherited_memory(self.get_node_name())
+            if inherited:
+                # Sub-agent: inline the parent's memory read-only.
+                node_name = inherited
+                read_only = True
+            elif self._is_subagent:
+                # Sub-agent whose parent has no memory: nothing to show, and a
+                # sub-agent must never get the writable manual (it has no tools).
+                return base_prompt
+            else:
+                # Main agent: own writable memory (built-in → shared 'chat').
+                node_name = resolve_memory_node(self.get_node_name())
+
+        try:
+            workspace_root = self._resolve_workspace_root()
+
+            memory_content = load_memory_context(workspace_root, node_name)
+            if read_only and not memory_content.strip():
+                # Parent has no memory worth inheriting; skip the read-only block
+                # entirely so we do not waste prompt budget on an empty notice.
+                return base_prompt
+            memory_dir = get_memory_dir(workspace_root, node_name)
+
+            memory_section = get_prompt_manager(agent_config=self.agent_config).render_template(
+                template_name="memory_context",
+                version=None,
+                has_memory=True,
+                memory_content=memory_content,
+                memory_dir=memory_dir,
+                read_only=read_only,
+                originating_agent=node_name,
+            )
+
+            if memory_section.strip():
+                base_prompt = base_prompt + "\n\n" + memory_section
+        except Exception as e:
+            logger.warning(f"Failed to inject memory context for node '{node_name}': {e}")
+        return base_prompt
+
+    def _load_agents_md(self) -> str:
+        """Load AGENTS.md from current working directory as project context.
+
+        Returns first 200 lines wrapped in <project_context> tags.
+        Returns empty string if file doesn't exist — all features work without it.
+        """
+        import os
+
+        agents_md_path = os.path.join(os.getcwd(), "AGENTS.md")
+        if not os.path.exists(agents_md_path):
+            return ""
+
+        try:
+            with open(agents_md_path, encoding="utf-8") as f:
+                lines = f.readlines()
+            if not lines:
+                return ""
+            # Keep first 200 lines to stay within reasonable context budget
+            max_lines = 200
+            content = "".join(lines[:max_lines])
+            if len(lines) > max_lines:
+                content += f"\n... ({len(lines) - max_lines} more lines, see AGENTS.md for full content)"
+            return f"<project_context>\n{content}\n</project_context>"
+        except Exception as e:
+            logger.debug(f"Failed to load AGENTS.md: {e}")
+            return ""
+
+    def _generate_session_id(self) -> str:
+        """Generate a unique session ID."""
+        return f"{self.get_node_name()}_session_{str(uuid.uuid4())[:8]}"
+
+    def _get_or_create_session(self) -> AdvancedSQLiteSession:
+        """
+        Get or create the session for this node.
+
+        Returns:
+            The active session. Compaction persists its summary directly into
+            the session history as an assistant message, so this method no
+            longer carries a separate ``conversation_summary`` slot.
+        """
+        if self._session is None:
+            self._session = self.session_manager.create_session(self.session_id)
+            logger.debug(f"Created session: {self.session_id}")
+            # Plan mode may have been toggled before the database existed, in
+            # which case that write was skipped. There is somewhere to put it
+            # now, and a resumable session must carry its plan-mode flags.
+            #
+            # Seed only, never overwrite: this method also runs from paths that
+            # only need a session object — turn counting, the API's throwaway
+            # compaction node — whose in-memory flags were restored when the
+            # node was built and may already be stale. Blindly writing them
+            # back would drop a live process out of plan mode.
+            self._persist_plan_mode_state(only_if_absent=True)
+
+        return self._session
+
+    async def _count_session_tokens(self) -> int:
+        """Return measured input occupancy, or zero when it is unknown."""
+        state = self.get_context_usage()
+        return state.last_call_input_tokens
+
+    # ── Compact subsystem ──────────────────────────────────────────────
+    # Public entry: ``compact(mode, reason)``. CLI, RunHooks, and model-layer
+    # overflow fallbacks all go through this so the orchestration stays in
+    # the node. Private helpers below cover (a) the LLM-driven major pass
+    # that summarizes the entire history into a structured 10-section
+    # recap, and (b) the rule-based minor pass that walks the
+    # ``[_compacted_until, user-turn-cutoff)`` slice (everything older than
+    # the most recent ``keep_recent_user_turns`` user turns) and offloads
+    # any arguments/output over ``archive_threshold`` to disk.
+
+    async def compact(
+        self,
+        mode: Literal["major", "minor", "auto"] = "auto",
+        reason: str = "manual",
+    ) -> Dict[str, Any]:
+        """Run a compact pass on the current session.
+
+        Args:
+            mode: ``"major"`` summarizes the entire session via the LLM;
+                ``"minor"`` runs the rule-based archive of long tool I/O;
+                ``"auto"`` picks one based on token usage and minor triggers,
+                or returns a no-op when neither threshold is met.
+            reason: Free-text label recorded on the result for observability
+                (e.g. ``"cli_manual"``, ``"hook_major"``, ``"overflow"``).
+
+        Returns:
+            Dict with at least ``mode`` (the mode actually run, ``"noop"`` if
+            nothing was triggered), ``reason``, ``success`` (bool), and
+            mode-specific fields. Major also returns ``summary`` and
+            ``history_jsonl``; minor returns ``window`` (the [lo, hi) range
+            it processed) and ``archived_count``.
+        """
+        self._ensure_compact_state()
+        lock = self._get_compact_lock()
+        async with lock:
+            resolved_mode = mode if mode != "auto" else await self._decide_compact_mode()
+            if resolved_mode == "noop":
+                return {"mode": "noop", "reason": reason, "success": True}
+            if resolved_mode == "major":
+                # Every major path — ``hook_major`` (mid-turn), ``pre_user_turn``
+                # (turn start, via ``_auto_compact``) and ``cli_manual`` — flows
+                # through here, so the CLI display is driven from one place. A
+                # pinned in-progress hint goes out before the blocking summary
+                # call; a terminal summary action follows. Injection is a no-op
+                # when no action_bus consumer is live (the manual ``/compact``
+                # path renders to the console directly instead).
+                compact_action_id = f"compact_{uuid.uuid4().hex[:8]}"
+                self._emit_compact_display_action(compact_action_id, "progress")
+                result = await self._major_compact(reason=reason)
+                # Always emit the terminal action — even on failure — so the
+                # pinned hint is cleared; the renderer only draws the panel when
+                # a summary is actually present.
+                self._emit_compact_display_action(
+                    compact_action_id, "summary", result if result.get("success") else None
+                )
+                return result
+            return await self._minor_compact(reason=reason)
+
+    def _emit_compact_display_action(
+        self, action_id: str, status: str, result: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Inject a ``compact_progress`` / ``compact_summary`` display action.
+
+        Pushed to ``action_bus`` ONLY — deliberately not ``add_action()``-ed to
+        the history manager: a major compact clears the session, so a persisted
+        summary action would duplicate on resume/reprint and contradict the
+        cleared-history semantics. The CLI renderer draws a pinned progress hint
+        and a cleared-screen summary panel; the print/API content builders
+        forward a markdown bubble. No-op when no ``action_bus`` is wired or no
+        consumer is live (e.g. manual ``/compact``, which renders directly).
+        """
+        bus = getattr(self, "action_bus", None)
+        put = getattr(bus, "put", None) if bus is not None else None
+        if not callable(put):
+            return
+        if status == "progress":
+            action = ActionHistory(
+                action_id=action_id,
+                role=ActionRole.ASSISTANT,
+                messages="Compacting context…",
+                action_type="compact_progress",
+                input={},
+                output={},
+                status=ActionStatus.PROCESSING,
+            )
+        else:
+            res = result if isinstance(result, dict) else {}
+            action = ActionHistory(
+                action_id=action_id,
+                role=ActionRole.ASSISTANT,
+                messages="Context compacted",
+                action_type="compact_summary",
+                input={},
+                output={
+                    "summary": res.get("summary", ""),
+                    "summary_token": res.get("summary_token", 0),
+                    "history_jsonl": res.get("history_jsonl", ""),
+                },
+                status=ActionStatus.SUCCESS,
+            )
+        try:
+            put(action)
+        except Exception as exc:  # noqa: BLE001 — display must never crash the run loop
+            logger.debug("compact display action injection failed: %s", exc)
+
+    def _ensure_compact_state(self) -> None:
+        """Lazy-init the compact subsystem attributes.
+
+        Test harnesses that bypass ``AgenticNode.__init__`` (a common pattern
+        in the existing unit test suite) don't have these fields populated.
+        Production constructions set them eagerly, so this is a no-op there.
+        Each attribute keeps the same default it would get from ``__init__``.
+        """
+        if not hasattr(self, "_compact_cfg") or self._compact_cfg is None:
+            self._compact_cfg = (
+                getattr(self.agent_config, "compact", None) if getattr(self, "agent_config", None) else None
+            ) or CompactConfig()
+        if not hasattr(self, "_compacted_until"):
+            self._compacted_until = 0
+        if not hasattr(self, "_archive"):
+            self._archive = None
+        if not hasattr(self, "_compact_lock"):
+            self._compact_lock = None
+        if not hasattr(self, "mid_turn_rewrite_checkpoint"):
+            self.mid_turn_rewrite_checkpoint = None
+
+    async def _decide_compact_mode(self) -> Literal["major", "minor", "noop"]:
+        """Choose a mode for an explicit ``compact(mode="auto")`` call.
+
+        Priority order:
+        1. Token usage above ``major.token_threshold`` → major. The session
+           is in danger of overflowing context, so a full LLM summary is
+           the only safe response.
+        2. User-turn count above ``minor.keep_recent_user_turns`` → minor.
+           There is at least one user turn old enough to fall out of the
+           preserved window, so the rule-based archive has something to do.
+           The user-turn boundary alone gates both throttling (sessions
+           under the threshold short-circuit to noop) and cache freshness
+           (the preserved window covers all recent history that would
+           still be in the model's cache).
+        3. Otherwise → noop.
+
+        The streaming loop does not use this compatibility dispatcher.
+        Its unified per-model-call decision is
+        :meth:`_decide_mid_turn_compact_mode`, driven by the
+        :class:`~pico.agent.node.context_rewriter.MidTurnCompactor`.
+
+        The user-turn count is read from session items (the same source
+        ``_resolve_user_turn_cutoff`` uses) rather than ``self.actions``, so a
+        rebuilt node on resume — whose ``self.actions`` is empty but whose
+        session already holds many turns — still triggers minor compact.
+        """
+        cfg = self._compact_cfg
+        if not (cfg.major.enabled or cfg.minor.enabled):
+            return "noop"
+        try:
+            ratio = self._history_token_ratio_sync()
+        except Exception:
+            ratio = 0.0
+        if cfg.major.enabled and ratio >= cfg.major.token_threshold:
+            return "major"
+        if cfg.minor.enabled:
+            count = await self._user_turn_count_from_session()
+            if count > cfg.minor.keep_recent_user_turns:
+                return "minor"
+        return "noop"
+
+    def _decide_mid_turn_compact_mode(
+        self, ratio: float, *, first_call: bool = False
+    ) -> Literal["major", "minor", "noop"]:
+        """Choose the automatic pass before any model request.
+
+        ``ratio`` already includes the tool outputs appended since the last
+        model call and the output headroom (see :meth:`compact_mid_turn`).
+        Major wins when it is enabled for mid-turn and the ratio reaches
+        ``major.token_threshold``; otherwise the cheaper archive stage runs at
+        ``minor.mid_turn_token_threshold``. Either stage can be switched off
+        independently with its ``mid_turn_enabled`` flag.
+        """
+        cfg = self._compact_cfg
+        if cfg.major.enabled and (first_call or cfg.major.mid_turn_enabled) and ratio >= cfg.major.token_threshold:
+            return "major"
+        if (
+            cfg.minor.enabled
+            and (first_call or cfg.minor.mid_turn_enabled)
+            and ratio >= cfg.minor.mid_turn_token_threshold
+        ):
+            return "minor"
+        return "noop"
+
+    async def _user_turn_count_from_session(self) -> int:
+        """Count ``role == "user"`` items in the active session.
+
+        Authoritative source for the minor-compact gate: ``self.actions`` is
+        wiped on rebuild (resume / new process) while the session items
+        survive, so reading from the session is the only way the dispatcher
+        agrees with ``_resolve_user_turn_cutoff``'s view of the world.
+
+        Returns 0 when the session is unavailable or ``get_items`` fails — a
+        conservative default that lets the dispatcher fall through to noop
+        rather than firing spuriously on a half-initialized node.
+        """
+        if self._session is None and self.session_id:
+            try:
+                self._get_or_create_session()
+            except Exception as exc:
+                logger.debug("session materialize failed in dispatcher: %s", exc)
+                return 0
+        if self._session is None:
+            return 0
+        try:
+            items = await self._session.get_items()
+        except Exception as exc:
+            logger.debug("session.get_items() failed in dispatcher: %s", exc)
+            return 0
+        return sum(1 for it in items if isinstance(it, dict) and it.get("role") == "user")
+
+    def _history_token_ratio_sync(self) -> float:
+        """Return measured occupancy for explicit compact(auto) callers."""
+        state = self.get_context_usage()
+        length = self.context_length
+        return state.last_call_input_tokens / length if length else 0.0
+
+    def _get_compact_lock(self) -> asyncio.Lock:
+        """Lazily allocate the per-node compact lock.
+
+        Initialized on first use so the lock binds to the active event loop —
+        constructing it in ``__init__`` would attach it to whatever loop ran
+        the construction (often none), and asyncio.Lock would then refuse to
+        cross loops on TUI/CLI hand-off.
+        """
+        if self._compact_lock is None:
+            self._compact_lock = asyncio.Lock()
+        return self._compact_lock
+
+    def _get_archive(self) -> Optional[ToolArchive]:
+        """Lazily build the on-disk tool I/O archive for this session.
+
+        Path resolution is fully delegated to :class:`DatusPathManager` —
+        archives always land under ``session_data_dir(session_id)``.
+        """
+        if self._archive is not None:
+            return self._archive
+        if not self.session_id:
+            return None
+        cfg = self._compact_cfg.minor
+        path_manager = None
+        if self.agent_config is not None:
+            path_manager = getattr(self.agent_config, "path_manager", None)
+        try:
+            project_name = path_manager.project_name if path_manager else ""
+            self._archive = ToolArchive(
+                project_name=project_name,
+                session_id=self.session_id,
+                preview_chars=cfg.archive_preview_chars,
+                path_manager=path_manager,
+            )
+        except Exception as exc:
+            logger.warning("Failed to construct ToolArchive for session %s: %s", self.session_id, exc)
+            return None
+        return self._archive
+
+    def _resolve_user_turn_cutoff(self, items: List[Dict[str, Any]]) -> int:
+        """Return the items index that bounds the eligible compact region.
+
+        ``items[0:cutoff)`` is eligible for archiving; ``items[cutoff:]`` is
+        the most recent ``keep_recent_user_turns`` user turns plus everything
+        that follows them, all kept intact so the model never loses fine
+        detail from the active conversation window.
+
+        The cutoff is the position of the ``keep_recent_user_turns``-th
+        most-recent user message (``role == "user"``). When the session has
+        ``<= keep_recent_user_turns`` user messages there is nothing older
+        than the kept window and we return ``-1`` to signal no-op.
+        """
+        n = self._compact_cfg.minor.keep_recent_user_turns
+        if n <= 0:
+            return -1
+        user_indices = [i for i, it in enumerate(items) if isinstance(it, dict) and it.get("role") == "user"]
+        if len(user_indices) <= n:
+            return -1
+        return user_indices[-n]
+
+    async def _dump_session_history_jsonl(self, items: Optional[List[Dict[str, Any]]] = None) -> Optional[Path]:
+        """Write the full conversation history to a JSONL file before major compact.
+
+        One item per line, written verbatim. Lets the LLM ``read_file`` any
+        original item by offset after the summary is in place — the structured
+        summary covers the common case, the JSONL covers the long tail.
+        ``items`` is the transcript to dump; when omitted the session is read
+        (turn-start / manual compact). Mid-turn callers pass the in-memory
+        view the model is being sent. Returns ``None`` when the archive
+        directory is unavailable; the compact still runs but without a
+        recovery pointer.
+        """
+        archive = self._get_archive()
+        if archive is None:
+            return None
+        if items is None:
+            if self._session is None:
+                return None
+            try:
+                items = await self._session.get_items()
+            except Exception as exc:
+                logger.warning("session.get_items() failed during history dump: %s", exc)
+                return None
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = archive.dir / f"history_{ts}.jsonl"
+        try:
+            with path.open("w", encoding="utf-8") as f:
+                for it in items:
+                    f.write(json.dumps(it, ensure_ascii=False, default=str) + "\n")
+        except OSError as exc:
+            logger.warning("history JSONL dump failed: %s", exc)
+            return None
+        return path
+
+    async def _major_compact(self, *, reason: str) -> Dict[str, Any]:
+        """LLM-driven full-history compact pass.
+
+        Pipeline: (1) dump the full session as JSONL so any detail dropped by
+        the summary stays recoverable, (2) render the structured prompt with
+        the j2 template, (3) run a single-turn generation with the node's
+        own system instruction so the summary stays grounded in this node's
+        identity, (4) clear the session and persist the summary as a single
+        assistant ``output_text`` message with the JSONL recovery pointer
+        appended by host code (the LLM never authors the pointer line).
+        """
+        self._ensure_compact_state()
+        try:
+            model = self.model
+        except Exception as exc:
+            logger.warning("Cannot major-compact: model resolution failed: %s", exc)
+            return {"mode": "major", "reason": reason, "success": False, "summary": "", "summary_token": 0}
+        if not model:
+            logger.warning("Cannot major-compact: no model available")
+            return {"mode": "major", "reason": reason, "success": False, "summary": "", "summary_token": 0}
+
+        if self._session is None and self.session_id:
+            self._get_or_create_session()
+        if not self._session:
+            logger.warning("Cannot major-compact: no session available")
+            return {"mode": "major", "reason": reason, "success": False, "summary": "", "summary_token": 0}
+
+        logger.info("Starting major compact for session %s (reason=%s)", self.session_id, reason)
+        try:
+            items = list(await self._session.get_items())
+        except Exception as exc:
+            # Never summarize (and then clear) a history we could not read.
+            logger.warning("session.get_items() failed during major compact: %s", exc)
+            return {"mode": "major", "reason": reason, "success": False, "summary": "", "summary_token": 0}
+        history_jsonl_path = await self._dump_session_history_jsonl(items) if items else None
+        # A Claude-native session stores Anthropic-format messages; the
+        # continuation must be written in the same dialect or the next native
+        # replay sends an ``output_text`` block Anthropic does not accept.
+        item_format = detect_item_format(items)
+
+        try:
+            summary, summary_token = await self._summarize_items(items, item_format=item_format)
+        except Exception as exc:
+            logger.error("Failed to generate major-compact summary: %s", exc)
+            return {"mode": "major", "reason": reason, "success": False, "summary": "", "summary_token": 0}
+
+        continuation = build_continuation_message(
+            summary or "(empty summary)",
+            str(history_jsonl_path) if history_jsonl_path else "",
+        )
+        try:
+            await self._replace_session_items([build_assistant_item(continuation, item_format)], mode="major")
+        except Exception as persist_err:
+            logger.error("Failed to persist major-compact continuation: %s", persist_err)
+            return {
+                "mode": "major",
+                "reason": reason,
+                "success": False,
+                "summary": summary,
+                "summary_token": summary_token,
+            }
+
+        # Reset the high-water mark — the prior history is now collapsed into
+        # a single assistant continuation message, so the next minor pass
+        # starts scanning from the top of the rewritten session.
+        self._compacted_until = 0
+
+        logger.info(
+            "Major compact complete: %d chars summary, %d output tokens, history=%s",
+            len(summary),
+            summary_token,
+            history_jsonl_path,
+        )
+        return {
+            "mode": "major",
+            "reason": reason,
+            "success": True,
+            "summary": summary,
+            "summary_token": summary_token,
+            "history_jsonl": str(history_jsonl_path) if history_jsonl_path else "",
+        }
+
+    def _archive_history_view(
+        self, items: List[Dict[str, Any]], *, history_end: Optional[int] = None
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        history = items if history_end is None else items[:history_end]
+        cutoff = self._resolve_user_turn_cutoff(history)
+        archive = self._get_archive()
+        if cutoff <= 0 or archive is None:
+            return items, 0, cutoff
+        rewritten = list(items)
+        count = 0
+        for idx in range(cutoff):
+            item = maybe_truncate_item(items[idx], archive, self._compact_cfg.minor.archive_threshold, idx)
+            if item is not items[idx]:
+                count += 1
+                rewritten[idx] = item
+        return (rewritten if count else items), count, cutoff
+
+    async def _minor_compact(self, *, reason: str) -> Dict[str, Any]:
+        """Rule-based user-turn-bounded compact pass.
+
+        Walks ``items[lo:cutoff)`` (everything older than the most recent
+        ``keep_recent_user_turns`` user turns) and replaces any
+        ``function_call_output.output`` that exceeds ``archive_threshold`` with
+        a single-line text marker pointing to a disk-backed archive file.
+        ``function_call.arguments`` is left untouched so the tool-call payload
+        stays valid for the LLM service. The kept window
+        (``items[cutoff:]``) and the already-compacted prefix
+        (``items[:lo]``) are untouched, preserving cache for stable sections
+        of the prompt.
+
+        Idempotency: items whose text field already begins with the
+        ``[PICO_ARCHIVED]`` marker are skipped by ``maybe_truncate_item`` —
+        the high-water mark ``_compacted_until`` is therefore a pure
+        same-process performance hint, not persisted across rebuilds. After
+        an API resume the next minor pass rescans the archived prefix once,
+        skipping each item via marker detection, and recomputes the cutoff
+        with no duplicate archives written.
+        """
+        self._ensure_compact_state()
+        cfg = self._compact_cfg.minor
+        if not cfg.enabled:
+            return {"mode": "minor", "reason": reason, "success": True, "archived_count": 0, "window": None}
+        if self._session is None and self.session_id:
+            self._get_or_create_session()
+        if not self._session:
+            return {"mode": "minor", "reason": reason, "success": False, "archived_count": 0, "window": None}
+        archive = self._get_archive()
+        if archive is None:
+            logger.warning("Minor compact skipped: archive unavailable for session %s", self.session_id)
+            return {"mode": "minor", "reason": reason, "success": False, "archived_count": 0, "window": None}
+
+        try:
+            items = await self._session.get_items()
+        except Exception as exc:
+            logger.warning("session.get_items() failed during minor compact: %s", exc)
+            return {"mode": "minor", "reason": reason, "success": False, "archived_count": 0, "window": None}
+
+        cutoff = self._resolve_user_turn_cutoff(items)
+        if cutoff < 0:
+            return {"mode": "minor", "reason": reason, "success": True, "archived_count": 0, "window": None}
+
+        lo = max(self._compacted_until, 0)
+        if cutoff <= lo:
+            return {
+                "mode": "minor",
+                "reason": reason,
+                "success": True,
+                "archived_count": 0,
+                "window": [lo, cutoff],
+            }
+
+        rewritten, archived_count, cutoff = self._archive_history_view(items)
+        if archived_count == 0:
+            # Nothing crossed the threshold or everything was already archived
+            # — advance the high-water mark anyway so we don't keep re-scanning
+            # the same region every turn within this process.
+            self._compacted_until = cutoff
+            return {
+                "mode": "minor",
+                "reason": reason,
+                "success": True,
+                "archived_count": 0,
+                "window": [lo, cutoff],
+            }
+
+        try:
+            await self._replace_session_items(rewritten)
+        except Exception as exc:
+            logger.error("Failed to persist minor-compact rewrite: %s", exc)
+            return {
+                "mode": "minor",
+                "reason": reason,
+                "success": False,
+                "archived_count": archived_count,
+                "window": [lo, cutoff],
+            }
+
+        self._compacted_until = cutoff
+        logger.info(
+            "Minor compact done: window=[%d,%d) archived=%d reason=%s",
+            lo,
+            cutoff,
+            archived_count,
+            reason,
+        )
+        return {
+            "mode": "minor",
+            "reason": reason,
+            "success": True,
+            "archived_count": archived_count,
+            "window": [lo, cutoff],
+        }
+
+    # ── Mid-turn compaction (driven by MidTurnCompactor before each model call) ──
+
+    async def _summarize_items(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        item_format: str,
+        instruction: Optional[str] = None,
+        custom_instructions: Optional[str] = None,
+    ) -> Tuple[str, int]:
+        """One summarization call over an explicit transcript.
+
+        Shared by manual major compact (``items`` read from the session)
+        and automatic compact (``items`` is the in-memory view
+        the model is being sent). Never touches the live session: the model's
+        ``summarize_items`` runs with ``session=None`` and no hooks. Raises on
+        model failure so callers decide how to degrade.
+
+        Returns ``(summary_text, summary_output_tokens)``.
+        """
+        sys_prompt = instruction if instruction is not None else self._get_system_prompt()
+        prompt = render_major_compact_prompt(node_role=self.get_node_name(), custom_instructions=custom_instructions)
+        result = await self.model.summarize_items(
+            items,
+            instruction=sys_prompt,
+            prompt=prompt,
+            item_format=item_format,
+            max_tokens=4000,
+            temperature=0.3,
+            agent_name=self.get_node_name(),
+        )
+        if isinstance(result, dict):
+            summary = result.get("content", "") or ""
+            usage = result.get("usage", {})
+        else:
+            summary = getattr(result, "content", "") or ""
+            usage = {}
+        summary_token = int(usage.get("output_tokens", 0) or 0) if isinstance(usage, dict) else 0
+        return str(summary), summary_token
+
+    async def _replace_session_items(
+        self, items: List[Dict[str, Any]], *, mode: str = "minor", pending_user_turns: int = 0
+    ) -> None:
+        """Atomically replace history and complete rewrite bookkeeping before cancellation."""
+        if self._session is None:
+            raise DatusException(ErrorCode.COMMON_FIELD_REQUIRED, message_args={"field_name": "session"})
+
+        async def replace() -> None:
+            if pending_user_turns:
+                await self._session.replace_items(items, pending_user_turns=pending_user_turns)
+            else:
+                await self._session.replace_items(items)
+            self._invalidate_context_usage()
+            self._refresh_turn_checkpoint_after_rewrite()
+            if mode == "major":
+                self._compacted_until = 0
+                if self.session_id:
+                    try:
+                        self.session_manager.delete_system_prompt_snapshot(self.session_id)
+                    except Exception:
+                        logger.debug("Failed to invalidate system prompt after rewrite", exc_info=True)
+
+        task = asyncio.create_task(replace())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    def _mid_turn_output_reserve(self) -> int:
+        """Output-token headroom reserved when checking request capacity.
+
+        A context that still "fits" but leaves no room for the model's reply
+        overflows on the very next call, so the trigger counts the reply
+        budget as already used.
+        """
+        max_tokens = 0
+        try:
+            model = self.model
+            getter = getattr(model, "max_tokens", None) if model is not None else None
+            if callable(getter):
+                max_tokens = int(getter() or 0)
+        except Exception:  # noqa: BLE001 — headroom is a heuristic
+            max_tokens = 0
+        return min(max_tokens or DEFAULT_OUTPUT_RESERVE_TOKENS, MAX_OUTPUT_RESERVE_TOKENS)
+
+    def _invalidate_context_usage(self) -> None:
+        """Discard the old measurement without changing cumulative consumption."""
+        running = getattr(self, "running_turn_usage", None)
+        if running is not None:
+            self.running_turn_usage = running.model_copy(
+                update={
+                    "session_total_tokens": 0,
+                    "context_usage_ratio": 0.0,
+                    "context_usage_valid": False,
+                }
+            )
+        self.persist_context_state(0)
+        self._notify_status_dirty()
+
+    def _refresh_turn_checkpoint_after_rewrite(self) -> None:
+        """Publish a rollback boundary that sits *after* the rewritten history.
+
+        The CLI captures a SQLite checkpoint before each turn and, on ESC,
+        deletes everything newer. A mid-turn rewrite replaces every row, so
+        that pre-turn boundary would wipe the session; the checkpoint taken
+        here keeps the compacted view and removes only what follows it.
+        """
+        self._session_rewritten_this_turn = True
+        self.mid_turn_rewrite_checkpoint = None
+        if not self.session_id:
+            return
+        try:
+            self.mid_turn_rewrite_checkpoint = self.session_manager.checkpoint_turn(self.session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to refresh the turn checkpoint after mid-turn compact", exc_info=True)
+
+    async def compact_mid_turn(
+        self,
+        items: List[Dict[str, Any]],
+        *,
+        item_format: str,
+        base_tokens: int,
+        tail_start: int,
+        instruction: str = "",
+        turn_request: Optional[Dict[str, Any]] = None,
+        reason: str = "before_model_call",
+        first_call: bool = False,
+        archive_history: bool = False,
+        pending_user_turns: int = 0,
+    ) -> Dict[str, Any]:
+        """Two-stage compaction of the transcript a running turn is about to send.
+
+        Called by :class:`~pico.agent.node.context_rewriter.MidTurnCompactor`
+        before every model call, including the first, with the exact item list the model would
+        receive. Occupancy is estimated as ``base_tokens`` (the last call's
+        real input tokens) plus a chars/4 estimate of ``items[tail_start:]``
+        (everything appended since) plus the output headroom.
+
+        On the first request, archive eligible historical user turns once.
+        On subsequent requests:
+
+        1. **minor** — archive the turn's tool outputs older than the newest
+           ``keep_recent_tool_results`` (lossless, no LLM call); re-estimate.
+        2. **major** — if still at or above ``major.token_threshold``, summarize
+           the (archived) view and rebuild it as
+           ``[this turn's user request(s)] + [assistant summary] + [user resume]``.
+
+        Whatever survives is persisted with an atomic history replacement so
+        SQLite mirrors the new view; a persistence failure leaves the original
+        ``items`` in force. Returns a dict with ``mode`` (``noop`` / ``minor``
+        / ``major``), ``success``, ``items`` (the list to send), and the major
+        fields (``summary``, ``summary_token``, ``history_jsonl``,
+        ``major_error`` when the summary failed after a successful archive).
+        Never raises.
+        """
+        self._ensure_compact_state()
+        noop: Dict[str, Any] = {"mode": "noop", "reason": reason, "success": True, "items": items}
+        try:
+            lock = self._get_compact_lock()
+            async with lock:
+                context_length = int(self.context_length or 0)
+                if context_length <= 0 and not archive_history:
+                    return noop
+                if self._session is None and self.session_id:
+                    self._get_or_create_session()
+                if self._session is None:
+                    return noop
+                cfg = self._compact_cfg
+                output_reserve = self._mid_turn_output_reserve()
+                tail_start = max(0, min(int(tail_start), len(items)))
+                effective = int(base_tokens or 0) + estimate_items_tokens(items[tail_start:]) + output_reserve
+                ratio = effective / float(context_length) if context_length > 0 else 0.0
+                mode = self._decide_mid_turn_compact_mode(ratio, first_call=first_call)
+                if mode == "noop" and not archive_history:
+                    return noop
+                logger.debug(
+                    "Mid-turn compact (%s): ratio=%.2f mode=%s items=%d session=%s",
+                    reason,
+                    ratio,
+                    mode,
+                    len(items),
+                    self.session_id,
+                )
+                entry_ratio = ratio
+
+                view: List[Dict[str, Any]] = items
+                archived_count = 0
+                result: Dict[str, Any] = {"mode": "noop", "reason": reason, "success": True, "archived_count": 0}
+
+                # Stage 1: cheap, lossless archive of this turn's older tool outputs.
+                if cfg.minor.enabled and (first_call or cfg.minor.mid_turn_enabled):
+                    archive = self._get_archive()
+                    if archive is not None:
+                        if archive_history:
+                            history_end = next((i for i, item in enumerate(items) if item is turn_request), len(items))
+                            view, archived_count, _ = self._archive_history_view(items, history_end=history_end)
+                        elif not first_call:
+                            view, archived_count = archive_old_tool_outputs(
+                                items,
+                                item_format=item_format,
+                                archive=archive,
+                                threshold=cfg.minor.archive_threshold,
+                                keep_recent=cfg.minor.keep_recent_tool_results,
+                            )
+                        if archived_count:
+                            result.update(mode="minor", archived_count=archived_count)
+                            # Subtract what the archive saved from the measured
+                            # occupancy instead of re-estimating the items alone:
+                            # the system prompt and tool schemas still count.
+                            saved = estimate_items_tokens(items) - estimate_items_tokens(view)
+                            ratio = max(0.0, (effective - saved) / float(context_length)) if context_length > 0 else 0.0
+                        else:
+                            view = items
+
+                # Stage 2: LLM summary when the archive stage was not enough.
+                if (
+                    cfg.major.enabled
+                    and (first_call or cfg.major.mid_turn_enabled)
+                    and ratio >= cfg.major.token_threshold
+                ):
+                    compact_action_id = f"compact_{uuid.uuid4().hex[:8]}"
+                    self._emit_compact_display_action(compact_action_id, "progress")
+                    major_ok = False
+                    try:
+                        history_jsonl_path = await self._dump_session_history_jsonl(items)
+                        summary, summary_token = await self._summarize_items(
+                            view,
+                            item_format=item_format,
+                            instruction=instruction or None,
+                            custom_instructions=MID_TURN_SUMMARY_INSTRUCTIONS,
+                        )
+                        continuation = build_continuation_message(
+                            summary or "(empty summary)",
+                            str(history_jsonl_path) if history_jsonl_path else "",
+                        )
+                        view = build_mid_turn_view(
+                            view,
+                            continuation,
+                            item_format=item_format,
+                            turn_request=turn_request,
+                        )
+                        result.update(
+                            mode="major",
+                            summary=summary,
+                            summary_token=summary_token,
+                            history_jsonl=str(history_jsonl_path) if history_jsonl_path else "",
+                        )
+                        major_ok = True
+                    except Exception as exc:  # noqa: BLE001 — degrade to the archive result
+                        logger.error("Mid-turn major compact failed to summarize: %s", exc)
+                        result["major_error"] = str(exc)
+                    finally:
+                        self._emit_compact_display_action(compact_action_id, "summary", result if major_ok else None)
+
+                if view is items:
+                    result["items"] = items
+                    return result
+
+                try:
+                    await self._replace_session_items(view, mode=result["mode"], pending_user_turns=pending_user_turns)
+                except Exception as exc:  # noqa: BLE001
+                    logger.error("Failed to persist mid-turn compact rewrite: %s", exc)
+                    return {**result, "success": False, "items": items}
+
+                result["items"] = view
+                logger.info(
+                    "Mid-turn compact done (%s): mode=%s ratio=%.2f archived=%d items %d -> %d session=%s",
+                    reason,
+                    result["mode"],
+                    entry_ratio,
+                    archived_count,
+                    len(items),
+                    len(view),
+                    self.session_id,
+                )
+                return result
+        except Exception:  # noqa: BLE001 — the rewriter must never see an exception from here
+            logger.exception("Mid-turn compact failed unexpectedly")
+            return {"mode": "major", "reason": reason, "success": False, "items": items}
+
+    def _build_context_rewriter(self, ctx: "StreamRunContext") -> Optional[MidTurnCompactor]:
+        """Create the unified per-request compactor, or ``None`` when disabled.
+
+        One instance per ``_stream_once`` call; it also resets itself on the
+        SDK ``on_start`` hook so a retried run never inherits a stale overlay.
+        """
+        self._ensure_compact_state()
+        cfg = self._compact_cfg
+        if not (cfg.major.enabled or cfg.minor.enabled):
+            return None
+
+        def refresh_instruction() -> str:
+            ctx.system_instruction = self._get_session_system_prompt(
+                prompt_version=getattr(ctx.user_input, "prompt_version", None),
+                template_context=self._build_template_context(ctx),
+            )
+            return ctx.system_instruction
+
+        return MidTurnCompactor(
+            self,
+            interrupt_controller=getattr(self, "interrupt_controller", None),
+            system_instruction=ctx.system_instruction or "",
+            refresh_instruction=refresh_instruction,
+            turn_state=ctx.extras,
+        )
+
+    async def _auto_compact(self) -> bool:
+        """Backward-compatible wrapper kept for callers outside this class.
+
+        Delegates to :meth:`compact` with ``mode="auto"`` and translates the
+        dict return to the legacy ``bool`` (True iff a non-noop pass ran
+        successfully). New code should call :meth:`compact` directly.
+        """
+        result = await self.compact(mode="auto", reason="pre_user_turn")
+        return result.get("mode") != "noop" and result.get("success", False)
+
+    def _parse_node_config(self, agent_config: Optional[AgentConfig], node_name: str) -> dict:
+        """
+        Parse node configuration from agent.yml.
+
+        Args:
+            agent_config: Agent configuration
+            node_name: Name of the node configuration
+
+        Returns:
+            Dictionary containing node configuration
+        """
+        if not agent_config or not hasattr(agent_config, "agentic_nodes"):
+            return {}
+
+        nodes_config = agent_config.agentic_nodes
+        from pico.configuration.scoped_context_overrides import get_override
+
+        override = get_override(node_name)
+        if node_name not in nodes_config and override is None:
+            logger.debug(f"Node configuration '{node_name}' not found in agent.yml, using default configuration")
+            return {}
+
+        if override is not None:
+            # Layer the runtime override (with parent-merged scoped_context) on top
+            # of any yaml entry, so child node __init__ sees the effective context.
+            base = nodes_config.get(node_name) if node_name in nodes_config else {}
+            base_dict = (
+                dict(base) if isinstance(base, dict) else (base.model_dump() if hasattr(base, "model_dump") else {})
+            )
+            node_config = {**base_dict, **override.model_dump(exclude_unset=True)}
+        else:
+            node_config = nodes_config[node_name]
+
+        # Extract configuration attributes
+        config = {}
+
+        # Basic node config attributes
+        if isinstance(node_config, dict):
+            config["model"] = node_config.get("model")
+        elif hasattr(node_config, "model"):
+            config["model"] = node_config.model
+
+        # Check direct attributes on node_config
+        direct_attributes = [
+            "system_prompt",
+            "agent_description",
+            "prompt_version",
+            "prompt_language",
+            "tools",
+            "mcp",
+            "skills",  # AgentSkills pattern filter (e.g., "sql-*, data-*")
+            "permissions",  # Node-specific permission overrides
+            "hooks",
+            "rules",
+            "max_turns",
+            "workspace_root",
+            "scoped_context",
+            "scoped_kb_path",
+            "adapter_type",
+            "subject_tree_prompt_limit",
+            "require_final_result_selection",
+            "sql_file_threshold",
+            "sql_preview_lines",
+            "bi_platform",
+            "scheduler_service",
+            "subagents",
+            # Read by ask_report / ask_dashboard nodes to resolve the
+            # bound artifact directory at startup.
+            "artifact_slug",
+        ]
+        for attr in direct_attributes:
+            # Handle both dict and object access patterns
+            if attr not in config:
+                value = None
+                if isinstance(node_config, dict):
+                    value = node_config.get(attr)
+                elif hasattr(node_config, attr):
+                    value = getattr(node_config, attr)
+
+                if value is not None:
+                    config[attr] = value
+
+        # Normalize rules: convert dict items to strings (YAML parsing issue workaround)
+        if "rules" in config and isinstance(config["rules"], list):
+            normalized_rules = []
+            for rule in config["rules"]:
+                if isinstance(rule, dict):
+                    # Convert dict to string format "key: value"
+                    rule_str = ", ".join(f"{k}: {v}" for k, v in rule.items())
+                    normalized_rules.append(rule_str)
+                else:
+                    normalized_rules.append(str(rule))
+            config["rules"] = normalized_rules
+
+        logger.info(f"Parsed node configuration for '{node_name}': {config}")
+        return config
+
+    def _setup_mcp_servers(self) -> Dict[str, Any]:
+        """Build MCP server instances from the comma-separated ``node_config["mcp"]``."""
+        mcp_servers = {}
+
+        config_value = self.node_config.get("mcp", "")
+        if not config_value:
+            return mcp_servers
+
+        mcp_server_names = [p.strip() for p in config_value.split(",") if p.strip()]
+
+        for server_name in mcp_server_names:
+            try:
+                server = self._setup_mcp_server_from_config(server_name)
+                if server:
+                    mcp_servers[server_name] = server
+
+            except Exception as e:
+                logger.error(f"Failed to setup MCP server '{server_name}': {e}")
+
+        logger.debug(f"Setup {len(mcp_servers)} MCP servers: {list(mcp_servers.keys())}")
+        return mcp_servers
+
+    def _setup_mcp_server_from_config(self, server_name: str) -> Optional[Any]:
+        """Build one MCP server instance via MCPManager.
+
+        MCPManager resolves definitions from the in-memory
+        ``agent_config.services["mcp_servers"]`` first (SaaS host) and falls
+        back to ``{agent.home}/conf/.mcp.json`` (CLI/standalone).
+        """
+        try:
+            from pico.tools.mcp_tools.mcp_manager import MCPManager
+
+            mcp_manager = MCPManager(agent_config=self.agent_config)
+            server_config = mcp_manager.get_server_config(server_name)
+
+            if not server_config:
+                logger.warning(f"MCP server '{server_name}' not found in configuration")
+                return None
+
+            server_instance, details = mcp_manager._create_server_instance(server_config)
+
+            if server_instance:
+                logger.debug(f"Added MCP server '{server_name}' from configuration: {details}")
+                return server_instance
+            else:
+                error_msg = details.get("error", "Unknown error")
+                logger.warning(f"Failed to create MCP server '{server_name}': {error_msg}")
+                return None
+
+        except Exception as e:
+            logger.error(f"Failed to setup MCP server '{server_name}' from config: {e}")
+            return None
+
+    def _setup_permission_manager(self) -> None:
+        """
+        Initialize unified permission manager for tools, MCP, and skills.
+
+        The permission manager uses global config from agent.yml and node-specific
+        overrides to control access to tools/MCP/skills with allow/deny/ask levels.
+
+        ``execution_mode="workflow"`` nodes (``/bootstrap``, scheduler subagents,
+        ``auto_create``, etc.) ignore the user's profile and run under a fresh
+        ``dangerous`` profile. Combined with the non-interactive ``PermissionHooks``
+        gate (see :meth:`_ensure_permission_hooks`), this means workflow flows
+        execute exactly the operations ``dangerous`` allows and fail loudly on
+        anything else — no broker prompts, no auto-approval, no drift when the
+        user happens to be on ``normal`` or ``auto``.
+        """
+        if not self.agent_config or not hasattr(self.agent_config, "permissions_config"):
+            return
+
+        try:
+            from pico.tools.permission.permission_manager import PermissionManager
+
+            is_workflow = getattr(self, "execution_mode", None) == "workflow"
+            # Print mode opts out of the forced-``dangerous`` posture by
+            # setting ``agent_config.workflow_permission_profile`` (the
+            # configured or ``--permission-mode`` profile), so ``pico -p``
+            # only auto-runs what the profile's allow rules cover. Unattended
+            # flows (bootstrap, scheduler, benchmarks) leave it ``None`` and
+            # keep the historical dangerous baseline. isinstance guards
+            # against mocked agent_configs in tests.
+            workflow_profile = getattr(self.agent_config, "workflow_permission_profile", None)
+            if is_workflow and isinstance(workflow_profile, str) and workflow_profile:
+                permissions_config = self.agent_config.permissions_config
+                active_profile = workflow_profile
+            elif is_workflow:
+                from pico.tools.permission.profiles import get_profile
+
+                permissions_config = get_profile("dangerous")
+                active_profile = "dangerous"
+            else:
+                permissions_config = self.agent_config.permissions_config
+                active_profile = getattr(self.agent_config, "active_profile_name", None) or "normal"
+
+            if not permissions_config:
+                return
+
+            # Get node-specific permission overrides from node_config
+            node_permissions = self.node_config.get("permissions", {})
+
+            self.permission_manager = PermissionManager(
+                global_config=permissions_config,
+                node_overrides={self.get_node_name(): node_permissions} if node_permissions else {},
+                active_profile=active_profile,
+                plugin_bash_rules=getattr(self.agent_config, "plugin_bash_rules", None),
+                project_bash_allows=getattr(self.agent_config, "project_bash_allow", None),
+                project_sql_allows=getattr(self.agent_config, "project_sql_allow", None),
+            )
+            # Forward existing callback to permission manager
+            if self._permission_callback:
+                self.permission_manager.set_permission_callback(self._permission_callback)
+            logger.debug(
+                f"Permission manager initialized for node '{self.get_node_name()}' "
+                f"(profile={active_profile}, workflow={is_workflow})"
+            )
+
+        except Exception as e:
+            logger.exception("Failed to setup permission manager")
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Permission manager init failed: {e}"},
+            ) from e
+
+    def _setup_skill_manager(self) -> None:
+        """
+        Initialize skill manager from agent config.
+
+        The skill manager coordinates skill discovery, permission checking,
+        and content loading for the AgentSkills integration.
+        """
+        if not self.agent_config or not hasattr(self.agent_config, "skills_config"):
+            return
+
+        skills_config = self.agent_config.skills_config
+        if not skills_config:
+            return
+
+        try:
+            from pico.tools.skill_tools.skill_manager import SkillManager
+
+            self.skill_manager = SkillManager(
+                config=skills_config,
+                permission_manager=self.permission_manager,
+                config_mutable=self._resolve_config_mutable(),
+                agent_config=self.agent_config,
+            )
+            logger.debug(
+                f"Skill manager initialized for node '{self.get_node_name()}' "
+                f"with {self.skill_manager.get_skill_count()} skills"
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to setup skill manager: {e}")
+
+    def _setup_skill_func_tools(self) -> None:
+        """
+        Setup skill function tools when explicitly configured in agentic_nodes.
+
+        Only activates if 'skills' is explicitly set in node_config.
+        ChatAgenticNode overrides skill setup in its own setup_tools(), so this primarily
+        serves other AgenticNode subclasses (GenReport, GenMetrics, etc.).
+
+        If skill_manager was not created (e.g. no global 'skills:' section in agent.yml),
+        creates one with default SkillConfig (same behavior as ChatAgenticNode).
+
+        NOTE: This only creates the SkillFuncTool instance (self.skill_func_tool).
+        The actual tools are injected into self.tools lazily via _ensure_skill_tools_in_tools(),
+        which is called from _get_system_prompt(). This avoids a timing issue where subclass
+        setup_tools() resets self.tools = [] after __init__ completes.
+        """
+        skill_patterns_str = self.node_config.get("skills")
+        if skill_patterns_str is None:
+            # Fall back to the subclass-declared defaults so built-in subagents
+            # work out of the box. An explicit empty string in yml opts out.
+            skill_patterns_str = type(self).DEFAULT_SKILLS
+            if skill_patterns_str:
+                # Persist the resolved pattern so <available_skills> filtering
+                # and any downstream reader sees the same value.
+                self.node_config["skills"] = skill_patterns_str
+        if not skill_patterns_str:
+            return
+
+        try:
+            # Create skill_manager with defaults if not already initialized
+            # (e.g. when agent.yml has no global 'skills:' section)
+            if not self.skill_manager:
+                from pico.tools.skill_tools.skill_manager import SkillManager
+
+                self.skill_manager = SkillManager(
+                    permission_manager=self.permission_manager,
+                    config_mutable=self._resolve_config_mutable(),
+                    agent_config=self.agent_config,
+                )
+                logger.info(
+                    f"Created default SkillManager for node '{self.get_node_name()}' "
+                    f"with {self.skill_manager.get_skill_count()} skills"
+                )
+
+            from pico.tools.skill_tools.skill_func_tool import SkillFuncTool
+
+            self.skill_func_tool = SkillFuncTool(
+                manager=self.skill_manager,
+                node_name=self.get_node_name(),
+                node_class=self.get_node_class_name(),
+                authoring_mode=self.SKILL_AUTHORING_MODE,
+            )
+            logger.info(
+                f"Skill func tools activated for node '{self.get_node_name()}' with pattern '{skill_patterns_str}'"
+            )
+        except Exception as e:
+            logger.error(f"Failed to setup skill func tools: {e}")
+
+    def _get_required_skills(self) -> List[str]:
+        """Return skill names whose content is host-injected into the prompt.
+
+        Defaults to parsing the class-level ``REQUIRED_SKILLS`` string.
+        Subclasses may override to derive the list from configuration (e.g.
+        the active semantic authoring format).
+        """
+        patterns = type(self).REQUIRED_SKILLS
+        if not patterns:
+            return []
+        return [pattern.strip() for pattern in patterns.split(",") if pattern.strip()]
+
+    def _get_database_skill_candidates(self) -> List[str]:
+        """Return conventional skill names for the configured database types."""
+        if not self.agent_config:
+            return []
+        getter = getattr(self.agent_config, "current_db_configs", None)
+        try:
+            configs = getter() if callable(getter) else getattr(self.agent_config, "datasource_configs", {})
+        except Exception as exc:
+            logger.debug("Failed to read database configs for skill candidates: %s", exc)
+            return []
+        if not isinstance(configs, dict):
+            return []
+
+        candidates = []
+        for config in configs.values():
+            db_type = config.get("type", "") if isinstance(config, dict) else getattr(config, "type", "")
+            db_type = getattr(db_type, "value", db_type)
+            normalized = str(db_type or "").strip().lower().replace("_", "-")
+            if normalized:
+                candidates.append(f"db-{normalized}-sql")
+        return list(dict.fromkeys(candidates))
+
+    def _render_required_skill_content(self, skill_name: str, content: str) -> str:
+        """Render node-specific runtime values into a required skill."""
+        del skill_name
+        return content
+
+    def _inject_required_skills(self, base_prompt: str) -> str:
+        """Append required-skill content to the system prompt deterministically.
+
+        Required skills carry specifications the node needs on every run, so
+        the host injects them at prompt-build time instead of advertising them
+        in ``<available_skills>`` and hoping the LLM calls ``load_skill``.
+        Permission checks are skipped — the node itself mandates these skills —
+        but ``allowed_agents`` scoping still applies.
+
+        Raises:
+            DatusException: When a required skill cannot be loaded. A missing
+                authoring spec would silently degrade every generation, so this
+                fails fast instead.
+        """
+        required_skills = self._get_required_skills()
+        database_candidates = self._get_database_skill_candidates()
+        if not required_skills and not database_candidates:
+            return base_prompt
+
+        if not self.skill_manager:
+            from pico.tools.skill_tools.skill_manager import SkillManager
+
+            self.skill_manager = SkillManager(
+                permission_manager=self.permission_manager,
+                config_mutable=self._resolve_config_mutable(),
+                agent_config=self.agent_config,
+            )
+
+        from xml.sax.saxutils import quoteattr as xml_quoteattr
+
+        # Database skills follow a convention but remain adapter-optional. Only
+        # inject candidates actually contributed by an installed adapter; class-
+        # declared required skills retain their fail-fast contract.
+        database_skills = [name for name in database_candidates if self.skill_manager.get_skill(name) is not None]
+        skills_to_inject = list(dict.fromkeys([*required_skills, *database_skills]))
+        if not skills_to_inject:
+            return base_prompt
+
+        required_skill_names = set(required_skills)
+        sections = []
+        for skill_name in skills_to_inject:
+            success, message, content = self.skill_manager.load_skill(
+                skill_name,
+                self.get_node_name(),
+                check_permission=False,
+                node_class=self.get_node_class_name(),
+            )
+            if not success or not content:
+                if skill_name not in required_skill_names:
+                    logger.debug("Skipping optional database skill '%s': %s", skill_name, message)
+                    continue
+                from pico.utils.exceptions import DatusException, ErrorCode
+
+                raise DatusException(
+                    code=ErrorCode.COMMON_CONFIG_ERROR,
+                    message_args={
+                        "config_error": (
+                            f"Required skill '{skill_name}' could not be loaded for node "
+                            f"'{self.get_node_name()}': {message}"
+                        )
+                    },
+                )
+            content = self._render_required_skill_content(skill_name, content)
+            sections.append(f"<required_skill name={xml_quoteattr(skill_name)}>\n{content}\n</required_skill>")
+            logger.info(f"Injected required skill '{skill_name}' into system prompt for '{self.get_node_name()}'")
+
+        if not sections:
+            return base_prompt
+        return base_prompt + "\n\n" + "\n\n".join(sections)
+
+    @staticmethod
+    def _merge_skill_patterns(existing_skills: Any, injected_skills: List[str]) -> str:
+        """Merge runtime-injected skill patterns into the user's configured list.
+
+        Platform-aware subagents (``scheduler``, ``gen_dashboard``, etc.) need to
+        append a ``{platform}-*`` skill based on config without overriding the
+        user's ``skills:`` yml entry. This helper merges the two sources,
+        deduplicates, and returns the canonical comma-separated string that
+        ``_setup_skill_func_tools`` expects.
+
+        Args:
+            existing_skills: Value of ``node_config["skills"]`` — either a
+                comma-separated string, a list of patterns, or ``None``.
+            injected_skills: Skill names the subclass wants to guarantee.
+
+        Returns:
+            Comma-separated pattern string with injected skills appended after
+            the user's patterns and duplicates removed (first occurrence wins).
+        """
+        merged_patterns: List[str] = []
+
+        if isinstance(existing_skills, str):
+            merged_patterns.extend([pattern.strip() for pattern in existing_skills.split(",") if pattern.strip()])
+        elif isinstance(existing_skills, list):
+            merged_patterns.extend(
+                [pattern.strip() for pattern in existing_skills if isinstance(pattern, str) and pattern.strip()]
+            )
+
+        for skill in injected_skills:
+            if skill not in merged_patterns:
+                merged_patterns.append(skill)
+
+        return ", ".join(merged_patterns)
+
+    def _setup_ask_user_tool(self):
+        """Setup ask-user tool so the agent can ask clarifying questions.
+
+        Creates an AskUserTool backed by this node's InteractionBroker.
+        Subclasses call this from their ``setup_tools()``; tools are
+        automatically appended to ``self.tools``.
+        """
+        try:
+            from pico.tools.func_tool.ask_user_tools import AskUserTool
+
+            broker = self._get_or_create_broker()
+            self.ask_user_tool = AskUserTool(broker=broker)
+            if self.tools is not None:
+                self.tools.extend(self.ask_user_tool.available_tools())
+            logger.debug("Setup ask_user tool")
+        except Exception as e:
+            logger.error(f"Failed to setup ask_user tool: {e}")
+            self.ask_user_tool = None
+
+    def _setup_task_result_tool(self):
+        """Setup the structured task-outcome tool, for orchestrator-driven runs.
+
+        Only wired up when the request declared an orchestrator origin: an
+        ordinary IDE chat has a human reading the answer and no need to declare
+        an outcome. The caller reads the resulting tool call off the stream and
+        stops the run, so this is effectively how such a run ends.
+        """
+        if getattr(self.agent_config, "_request_origin", None) != "orchestrator":
+            self.task_result_tool = None
+            return
+
+        try:
+            from pico.tools.func_tool.task_result_tools import TaskResultTool
+
+            self.task_result_tool = TaskResultTool()
+            if self.tools is not None:
+                self.tools.extend(self.task_result_tool.available_tools())
+            self._allow_task_result_tool()
+            logger.debug("Setup submit_task_result tool")
+        except Exception as e:
+            logger.error(f"Failed to setup task result tool: {e}")
+            self.task_result_tool = None
+
+    def _allow_task_result_tool(self) -> None:
+        """Exempt ``submit_task_result`` from the permission prompt.
+
+        Same reasoning as ``ask_user``: this is the channel the run reports
+        through, not a resource it touches. Under ``normal`` / ``auto`` it
+        matches no ALLOW rule and lands on ``default=ASK``, so a finished
+        dispatch stopped to ask permission to say it had finished — and the
+        card sat in the thread waiting for a human.
+
+        Declared here rather than in ``profiles.py`` because the tool itself is
+        injected here, only for orchestrator origins. A rule in the shared
+        profiles would outlive the tool and name it for every other caller.
+        ``add_persistent_rule`` so a later ``/profile`` switch, which rebuilds
+        ``global_config``, does not drop it.
+        """
+        if self.permission_manager is None:
+            return
+
+        from pico.tools.permission.permission_config import PermissionLevel, PermissionRule
+
+        category = getattr(self.task_result_tool, "permission_category", "tools")
+        self.permission_manager.add_persistent_rule(
+            PermissionRule(tool=category, pattern="submit_task_result", permission=PermissionLevel.ALLOW)
+        )
+
+    def _setup_sub_agent_task_tool(self):
+        """Setup SubAgentTaskTool based on subagents config or node default.
+
+        Skipped when ``is_subagent`` is True (nodes created by SubAgentTaskTool)
+        to enforce strict 2-level depth — subagent nodes never get their own task tool.
+        """
+        if self._is_subagent:
+            return
+
+        from pico.schemas.agent_models import SubAgentConfig
+
+        subagents_str = self.node_config.get("subagents")
+        if subagents_str is None:
+            subagents_str = self.DEFAULT_SUBAGENTS
+
+        parsed = SubAgentConfig(subagents=subagents_str).subagent_list
+        if not parsed:
+            return  # Empty = no task tool
+
+        if parsed == ["*"]:
+            allowed = None  # None = SubAgentTaskTool discovers all types
+        else:
+            allowed = parsed
+
+        try:
+            from pico.tools.func_tool.sub_agent_task_tool import SubAgentTaskTool
+
+            self.sub_agent_task_tool = SubAgentTaskTool(
+                agent_config=self.agent_config,
+                allowed_subagents=allowed,
+                parent_node_name=self.get_node_name(),
+            )
+            self.sub_agent_task_tool.set_action_bus(self.action_bus)
+            self.sub_agent_task_tool.set_interaction_broker(self.interaction_broker)
+            self.sub_agent_task_tool.set_parent_node(self)
+        except Exception as e:
+            logger.error(f"Failed to setup SubAgent task tool: {e}")
+            self.sub_agent_task_tool = None
+
+    def _ensure_skill_tools_in_tools(self) -> None:
+        """
+        Ensure skill function tools are present in self.tools.
+
+        Called lazily (from _get_system_prompt) to avoid the timing issue where
+        subclass setup_tools() resets self.tools = [] after base __init__ runs.
+        Idempotent — safe to call multiple times.
+        """
+        if not self.skill_func_tool:
+            return
+
+        skill_tool_names = {t.name for t in self.skill_func_tool.available_tools()}
+        existing_names = {t.name for t in (self.tools or [])}
+
+        if skill_tool_names.issubset(existing_names):
+            return  # Already added
+
+        if self.tools is None:
+            self.tools = []
+        self.tools.extend(self.skill_func_tool.available_tools())
+        logger.info(
+            f"Skill tools injected into node '{self.get_node_name()}': "
+            f"{[t.name for t in self.skill_func_tool.available_tools()]}"
+        )
+
+    def _setup_bash_tool(self) -> None:
+        """Create the node's general-purpose :class:`BashTool` instance.
+
+        Available to every agentic node when ``agent.bash.enabled`` is
+        ``True`` (the default). ``allowed_patterns`` comes from
+        ``agent_config.bash_allowed_patterns``: the default ``["*"]`` exposes
+        ``bash`` for any shell command with per-call gating left to the
+        ``bash_tools`` ASK rule in the permission profile; a restrictive list
+        (e.g. the web front-end's ``["pico*"]``) is enforced as a hard
+        whitelist inside the tool itself.
+
+        Only creates the instance — the tool enters ``self.tools`` via
+        :meth:`_ensure_bash_tool_in_tools` so subclass ``setup_tools()``
+        resets don't drop it.
+        """
+        if not getattr(self.agent_config, "bash_tool_enabled", True):
+            logger.debug("Bash tool disabled via agent.bash.enabled=false")
+            self.bash_tool = None
+            return
+        # Fail closed: ``allowed_patterns=["*"]`` relies on the ``bash_tools``
+        # ASK/DENY rule wired by ``_ensure_permission_hooks``. When no
+        # ``permission_manager`` exists those hooks are a no-op, so creating
+        # the tool would expose unrestricted shell execution to the model.
+        if self.permission_manager is None:
+            logger.warning("Skipping bash tool because permission enforcement is unavailable")
+            self.bash_tool = None
+            return
+        # Non-list values (configs mocked without the attribute, legacy
+        # bootstraps) fall back to the unrestricted default — the AgentConfig
+        # setter already normalizes real config input.
+        allowed_patterns = getattr(self.agent_config, "bash_allowed_patterns", None)
+        if not isinstance(allowed_patterns, list) or not allowed_patterns:
+            allowed_patterns = ["*"]
+        try:
+            from pico.tools.func_tool.bash_tool import BashExecutionContext, BashTool
+
+            # Pico home stays readable inside the sandbox: skills, templates
+            # and plugins live there and are read/executed via bash.
+            sandbox_read_dirs = []
+            try:
+                from pico.utils.path_manager import get_path_manager
+
+                sandbox_read_dirs.append(str(get_path_manager(agent_config=self.agent_config).datus_home))
+            except Exception as exc:
+                logger.debug("Failed to resolve pico home for sandbox read dirs: %s", exc)
+
+            execution_context_provider = None
+            if not getattr(self.agent_config, "config_mutable", True):
+                from pico.plugins.runtime_context import prepare_plugin_invocation
+
+                def _managed_plugin_context(command: str):
+                    prepared = prepare_plugin_invocation(command, self.agent_config)
+                    if prepared is None:
+                        return None
+                    return BashExecutionContext(
+                        command=prepared.command,
+                        env=prepared.env,
+                        sandbox_read_dirs=prepared.sandbox_read_dirs,
+                    )
+
+                execution_context_provider = _managed_plugin_context
+
+            self.bash_tool = BashTool(
+                workspace_root=self._resolve_workspace_root(),
+                allowed_patterns=allowed_patterns,
+                # Offload oversized command output to the session data dir (the
+                # same location minor compact uses). Resolved lazily: this method
+                # runs before ``session_id`` is finalized, so the closure reads it
+                # at execute time. Returns None until a session id exists → the
+                # tool falls back to in-memory truncation.
+                output_dir_provider=self._bash_output_dir,
+                # Shared mutable settings: /sandbox on|off flips ``enabled`` on
+                # the AgentConfig object and this tool sees it next call.
+                sandbox_settings=getattr(self.agent_config, "bash_sandbox", None),
+                sandbox_read_dirs=sandbox_read_dirs,
+                execution_context_provider=execution_context_provider,
+            )
+            logger.debug(f"Setup bash tool with workspace: {self.bash_tool.workspace_root}")
+        except Exception as e:
+            logger.error(f"Failed to setup bash tool: {e}")
+            self.bash_tool = None
+
+    def _bash_output_dir(self) -> Optional[Path]:
+        """Session data dir for bash output offload, or None if unavailable.
+
+        Reused directory convention as the compact archive
+        (``path_manager.session_data_dir(session_id)``). Returns None before a
+        session id is allocated, when there is no ``agent_config`` (mirrors
+        ``_resolve_session_data_dir`` — otherwise ``get_path_manager`` would fall
+        back to a process-wide default rooted at ``~/.pico``), or when the path
+        manager can't be built, so the bash tool degrades to in-memory truncation.
+        """
+        if not self.agent_config or not self.session_id:
+            return None
+        try:
+            from pico.utils.path_manager import get_path_manager
+
+            return get_path_manager(agent_config=self.agent_config).session_data_dir(self.session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Failed to resolve bash output dir: %s", exc)
+            return None
+
+    def _ensure_bash_tool_in_tools(self) -> None:
+        """Ensure the BashTool's ``bash`` is in ``self.tools``.
+
+        Mirrors :meth:`_ensure_skill_tools_in_tools` — called lazily so the
+        late ``setup_tools()`` reset in subclasses doesn't strip the tool.
+        Idempotent.
+        """
+        if not self.bash_tool:
+            return
+
+        bash_tool_names = {t.name for t in self.bash_tool.available_tools()}
+        if not bash_tool_names:
+            return
+
+        existing_names = {t.name for t in (self.tools or [])}
+        if bash_tool_names.issubset(existing_names):
+            return
+
+        if self.tools is None:
+            self.tools = []
+        self.tools.extend(self.bash_tool.available_tools())
+        logger.info(
+            f"Bash tool injected into node '{self.get_node_name()}': "
+            f"{[t.name for t in self.bash_tool.available_tools()]}"
+        )
+
+    def _ensure_web_tools_in_tools(self) -> None:
+        """Mount the unified ``web_tool`` group per the active provider.
+
+        Mirrors :meth:`_ensure_skill_tools_in_tools`. The active model decides
+        whether each capability is served by a vendor-native tool (then the local
+        function tool is suppressed and the model layer injects the hosted tool)
+        or by the local backend. Re-runs per request so a runtime ``/model``
+        switch re-resolves the backends; stale local web tools are dropped first.
+        """
+        from pico.tools.func_tool.web_tool import WebTool
+
+        try:
+            model = self.model
+        except Exception:
+            model = None
+        search_builtin = bool(getattr(model, "supports_builtin_web_search", lambda: False)()) if model else False
+        fetch_builtin = bool(getattr(model, "supports_builtin_web_fetch", lambda: False)()) if model else False
+        self._builtin_web_tools = {"web_search": search_builtin, "web_fetch": fetch_builtin}
+
+        self._web_tool = WebTool(
+            self.agent_config,
+            sub_agent_name=getattr(self, "sub_agent_name", None),
+            expose_local_search=not search_builtin,
+            expose_local_fetch=not fetch_builtin,
+        )
+        desired = self._web_tool.available_tools()
+        web_names = set(WebTool.all_tools_name())
+
+        # Drop previously-mounted web tools so a provider switch can't leave a
+        # stale local backend behind, then mount the current desired set.
+        existing = [t for t in (getattr(self, "tools", None) or []) if getattr(t, "name", None) not in web_names]
+        existing.extend(desired)
+        self.tools = existing
+        # The tool list was rebuilt: freshly mounted web tools are unwrapped, so
+        # clear the "transformers applied" flag to force a re-wrap on the next
+        # ``_ensure_tool_transformers`` pass. Without this, a runtime ``/model``
+        # switch that remounts web tools would leave them unwrapped and matching
+        # plugin transformers (policy enforcement) would silently fail open.
+        # ``apply_tool_transformers`` skips already-wrapped tools, so the re-wrap
+        # never double-transforms the tools carried over above.
+        self._tool_transformers_applied = False
+        if desired:
+            logger.info(
+                f"Web tools injected into node '{self.get_node_name()}': "
+                f"{[t.name for t in desired]} (builtin={self._builtin_web_tools})"
+            )
+
+    def _ensure_memory_tool_in_tools(self) -> None:
+        """Ensure ``add_memory`` / ``edit_memory`` are in ``self.tools`` for a main agent.
+
+        Mirrors :meth:`_ensure_skill_tools_in_tools`: a single lazy chokepoint so
+        every main-agent node gets the memory tools without each ``setup_tools``
+        having to wire them. Sub-agents are skipped entirely — they never write
+        memory, only see the parent's memory inlined read-only. Idempotent; the
+        memory owner defaults to ``resolve_memory_node(get_node_name())`` (built-in
+        main agents share ``chat``; custom agents use their own name), but a node
+        that already built its own ``memory_func_tool`` (e.g. feedback, bound to
+        its caller) keeps it.
+        """
+        if self._is_subagent:
+            return
+
+        if self.memory_func_tool is None:
+            from pico.utils.memory_loader import resolve_memory_node
+
+            try:
+                self.memory_func_tool = self._make_memory_tool(memory_node=resolve_memory_node(self.get_node_name()))
+            except Exception as e:
+                logger.error(f"Failed to build memory tool for node '{self.get_node_name()}': {e}")
+                return
+
+        memory_tool_names = {t.name for t in self.memory_func_tool.available_tools()}
+        existing_names = {t.name for t in (self.tools or [])}
+        if memory_tool_names.issubset(existing_names):
+            return
+
+        if self.tools is None:
+            self.tools = []
+        self.tools.extend(self.memory_func_tool.available_tools())
+        logger.debug(f"Memory tools injected into node '{self.get_node_name()}': {sorted(memory_tool_names)}")
+
+    def set_permission_callback(self, callback: Callable[[str, str, Dict[str, Any]], Awaitable[bool]]) -> None:
+        """
+        Set callback for ASK permission prompts.
+
+        This callback is invoked when a tool/skill requires user confirmation
+        before execution (ASK permission level).
+
+        Args:
+            callback: Async function(tool_category, tool_name, context) -> bool
+                      Returns True if user approves, False otherwise
+        """
+        self._permission_callback = callback
+        # Forward to permission manager if it exists
+        if self.permission_manager:
+            self.permission_manager.set_permission_callback(callback)
+        logger.debug(f"Permission callback set for node '{self.get_node_name()}'")
+
+    def _get_available_skills_context(self) -> str:
+        """
+        Generate <available_skills> XML context for system prompt injection.
+
+        Returns the XML block listing skills the LLM can use via load_skill tool.
+        Skills with DENY permission are filtered out.
+
+        Returns:
+            XML string for system prompt injection, empty string if no skills
+        """
+        if not self.skill_manager:
+            return ""
+
+        # Get skill patterns from node config (e.g., "sql-*, data-*")
+        skill_patterns_str = self.node_config.get("skills", "")
+        skill_patterns = None
+        if skill_patterns_str:
+            skill_patterns = self.skill_manager.parse_skill_patterns(skill_patterns_str)
+
+        return self.skill_manager.generate_available_skills_xml(
+            node_name=self.get_node_name(),
+            patterns=skill_patterns,
+            node_class=self.get_node_class_name(),
+        )
+
+    def setup_input(self, workflow: "Workflow") -> Dict:
+        """
+        Setup input for agentic node from workflow context.
+
+        Default implementation extracts common fields from workflow context
+        and populates the input object. Subclasses can override for custom behavior.
+
+        Args:
+            workflow: Workflow instance containing context and task
+
+        Returns:
+            Dictionary with success status and message
+        """
+        if self.input is None:
+            self.input = BaseInput()
+
+        # Populate common fields from workflow context if input has these attributes
+        if hasattr(self.input, "catalog"):
+            self.input.catalog = workflow.task.catalog_name
+        if hasattr(self.input, "database"):
+            self.input.database = workflow.task.database_name
+        if hasattr(self.input, "db_schema"):
+            self.input.db_schema = workflow.task.schema_name
+        if hasattr(self.input, "schemas"):
+            self.input.schemas = workflow.context.table_schemas
+        if hasattr(self.input, "metrics"):
+            self.input.metrics = workflow.context.metrics
+
+        return {"success": True, "message": f"Agentic node {self.type} input prepared"}
+
+    def update_context(self, workflow: "Workflow") -> Dict:
+        """
+        Update workflow context with agentic node results.
+
+        Default implementation stores SQL results if present.
+        Subclasses can override for custom context updates.
+
+        Args:
+            workflow: Workflow instance to update
+
+        Returns:
+            Dictionary with success status and message
+        """
+        if not self.result:
+            return {"success": False, "message": "No result to update context"}
+
+        result = self.result
+
+        # Store SQL generation results if present
+        if hasattr(result, "sql") and result.sql:
+            from pico.schemas.node_models import SQLContext
+
+            new_record = SQLContext(
+                sql_query=result.sql,
+                explanation=getattr(result, "response", "") or getattr(result, "explanation", ""),
+            )
+            workflow.context.sql_contexts.append(new_record)
+
+        return {"success": True, "message": "Agentic node context updated"}
+
+    def execute(self) -> BaseResult:
+        """
+        Synchronous execution wrapper for agentic nodes.
+
+        Agentic nodes are async by nature, so this wraps the async method
+        to provide synchronous execution interface required by Node base class.
+
+        Returns:
+            BaseResult object with execution results
+        """
+        action_history_manager = ActionHistoryManager()
+
+        async def _run_async():
+            final_action = None
+            async for action in self.execute_stream(action_history_manager):
+                final_action = action
+            return final_action
+
+        try:
+            # Get the final action from streaming execution
+            final_action = asyncio.run(_run_async())
+
+            # Extract result from final action output
+            if final_action and final_action.output:
+                output_data = final_action.output
+                terminal_succeeded = final_action.status == ActionStatus.SUCCESS
+                if isinstance(output_data, dict):
+                    result_class = getattr(self, "result_class", None)
+                    if result_class:
+                        try:
+                            result_payload = dict(output_data)
+                            if not terminal_succeeded:
+                                result_payload["success"] = False
+                            self.result = result_class.model_validate(result_payload)
+                        except Exception as e:
+                            logger.warning(f"Failed to validate result as {result_class.__name__}: {e}")
+                            self.result = BaseResult(
+                                success=terminal_succeeded and output_data.get("success", True),
+                                error=output_data.get("error"),
+                            )
+                    else:
+                        self.result = BaseResult(
+                            success=terminal_succeeded and output_data.get("success", True),
+                            error=output_data.get("error"),
+                        )
+                else:
+                    self.result = output_data
+
+            if not self.result:
+                self.result = BaseResult(success=False, error="No result from execution")
+
+            return self.result
+
+        except Exception as e:
+            logger.error(f"Agentic node execution error: {e}")
+            self.result = BaseResult(success=False, error=str(e))
+            return self.result
+
+    # ── execute_stream template method ──────────────────────────────────
+    #
+    # The base class owns the streaming skeleton (input validation, session
+    # setup, prompt assembly, retry loop, error handling). Subclasses customise
+    # behaviour through the optional hooks declared below this method:
+    #
+    #   - ``_before_stream``               (async, side-effect init)
+    #   - ``_build_template_context``      (extra render kwargs)
+    #   - ``_compose_run_hooks``           (extra model hooks)
+    #   - ``_maybe_rewrite_stream_action`` (live action rewrite, e.g. JSON→md)
+    #   - ``_get_retry_policy``            (validate/retry strategy)
+    #   - ``_build_success_result``        (REQUIRED — construct NodeResult)
+    #
+    # Subclasses also MUST declare ``result_class`` (a ``ClassVar[type[BaseResult]]``)
+    # so the unified ``_build_error_result`` can construct the right NodeResult
+    # subtype on the failure path.
+    #
+    # Subclasses MUST NOT override ``execute_stream`` itself — the template
+    # contract is final. Add a new hook to ``AgenticNode`` if you encounter a
+    # variation point that none of the existing hooks captures.
+
+    # Declared as ``Optional`` so abstract intermediates (DeliverableAgenticNode,
+    # BaseVisualArtifactAgenticNode) can leave it unset; concrete subclasses
+    # must assign a real ``BaseResult`` subclass. Runtime check lives in
+    # ``_build_error_result``.
+    result_class: Any = None
+
+    async def execute_stream(
+        self, action_history_manager: Optional[ActionHistoryManager] = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Execute the agentic node with streaming support — template method.
+
+        Drives the full lifecycle: input validation → initial USER action →
+        session setup → prompt assembly → optional retry loop around
+        ``_stream_once`` → success/error result construction → closing
+        ASSISTANT action. Subclasses customise via the hooks below, never by
+        overriding this method.
+
+        Args:
+            action_history_manager: Optional action history manager. A fresh
+                one is created when omitted.
+
+        Yields:
+            ActionHistory: Progress updates during execution.
+        """
+        from pico.agent.node.retry_policy import NoRetryPolicy
+        from pico.agent.node.stream_run_context import StreamRunContext
+
+        ahm = action_history_manager or ActionHistoryManager()
+        if self.input is None:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_REQUIRED,
+                message_args={"field_name": "input"},
+            )
+
+        ctx = StreamRunContext(
+            user_input=self.input,
+            action_history_manager=ahm,
+            # Tolerate test doubles that bypass ``AgenticNode.__init__``
+            # and therefore don't have ``pending_input_queue`` set.
+            pending_input_queue=getattr(self, "pending_input_queue", None),
+        )
+
+        # A fresh turn: any rollback boundary published by a previous turn's
+        # mid-turn rewrite is stale now.
+        self.mid_turn_rewrite_checkpoint = None
+        self._session_rewritten_this_turn = False
+
+        node_name = self.get_node_name()
+        logger.info(
+            "%s execute_stream start: session=%s msg=%r",
+            node_name,
+            getattr(self, "session_id", None),
+            (getattr(self.input, "user_message", "") or "")[:120],
+        )
+        initial_action = ActionHistory.create_action(
+            role=ActionRole.USER,
+            action_type=f"{node_name}_request",
+            messages=f"User: {getattr(self.input, 'user_message', '')}",
+            input_data=self.input.model_dump(),
+            status=ActionStatus.PROCESSING,
+        )
+        ahm.add_action(initial_action)
+        yield initial_action
+
+        try:
+            await self._before_stream(ctx)
+
+            # Session injection is independent of ``execution_mode``: workflow
+            # callers (print mode ``--resume``, API chat with ``interactive=False``,
+            # sub-agents continuing a parent session) all want SDK to see prior
+            # items. ``execution_mode`` controls human-in-the-loop, not history.
+            ctx.session = self._get_or_create_session()
+
+            template_context = self._build_template_context(ctx)
+            prompt_version = getattr(self.input, "prompt_version", None)
+            # Served from a per-session snapshot when available; rebuilt and
+            # re-persisted on a cache miss or when the snapshot meta is stale.
+            ctx.system_instruction = self._get_session_system_prompt(
+                prompt_version=prompt_version,
+                template_context=template_context,
+            )
+
+            # Compose the user prompt, optionally with a per-run override of
+            # ``user_input.user_message`` set during ``_before_stream`` (used
+            # by Compare to inject node-specific text without mutating the
+            # caller's input object).
+            if ctx.user_message_override is not None:
+                original = self.input.user_message
+                self.input.user_message = ctx.user_message_override
+                try:
+                    ctx.user_prompt = self._build_enhanced_message(self.input)
+                finally:
+                    self.input.user_message = original
+            else:
+                ctx.user_prompt = self._build_enhanced_message(self.input)
+
+            policy = self._get_retry_policy() or NoRetryPolicy()
+            max_attempts = max(1, getattr(policy, "max_attempts", 1))
+
+            for attempt in range(1, max_attempts + 1):
+                ctx.attempt = attempt
+                policy.reset(ctx)
+
+                async for stream_action in self._stream_once(ctx):
+                    yield stream_action
+
+                # Always probe ``should_retry`` so the policy can stash
+                # per-attempt state (validation reports, verification flags)
+                # for ``finalise`` to surface — even on the final attempt
+                # when no further retry will actually fire.
+                wants_retry = policy.should_retry(ctx)
+                if not wants_retry or attempt >= max_attempts:
+                    break
+                for retry_action in policy.on_retry_actions(ctx):
+                    ahm.add_action(retry_action)
+                    yield retry_action
+                next_prompt = policy.next_prompt(ctx)
+                if next_prompt is not None:
+                    ctx.user_prompt = next_prompt
+
+            policy.finalise(ctx)
+
+            result = self._build_success_result(ctx)
+            self.result = result
+            self.actions.extend(ahm.get_actions())
+
+            # Optional post-build streaming hook. Visual-artifact subagents
+            # override this to interleave finalize-progress messages around
+            # their 10-15 s of post-validate LLM work; default is a no-op.
+            # The hook may mutate ``result`` in place (e.g. populate
+            # ``finalize_warnings``) and those mutations land in the
+            # ``final_action`` dump below because ``model_dump()`` runs
+            # after the hook is fully consumed.
+            async for progress_action in self._stream_post_build(ctx, result):
+                ahm.add_action(progress_action)
+                yield progress_action
+
+            final_action = ActionHistory.create_action(
+                role=ActionRole.ASSISTANT,
+                action_type=f"{node_name}_response",
+                messages=(
+                    f"{node_name} interaction completed successfully"
+                    if getattr(result, "success", True)
+                    else f"{node_name} interaction completed with failures"
+                ),
+                input_data=self.input.model_dump(),
+                output_data=result.model_dump(),
+                status=ActionStatus.SUCCESS if getattr(result, "success", True) else ActionStatus.FAILED,
+            )
+            ahm.add_action(final_action)
+            yield final_action
+
+        except ExecutionInterrupted:
+            # Skip the running-snapshot drop below so resume after Ctrl+C
+            # still shows the partial usage the interrupted turn accrued.
+            self._drop_running_turn_usage_on_exit = False
+            raise
+        except Exception as exc:
+            error_msg = self._format_execution_error(exc)
+            logger.error("%s execution error: %s", node_name, error_msg)
+
+            error_result = self._build_error_result(exc, ctx)
+            self.result = error_result
+            ahm.update_current_action(
+                status=ActionStatus.FAILED,
+                output=error_result.model_dump(),
+                messages=f"Error: {error_msg}",
+            )
+            error_action = ActionHistory.create_action(
+                role=ActionRole.ASSISTANT,
+                action_type="error",
+                messages=f"{node_name} interaction failed: {error_msg}",
+                input_data=self.input.model_dump(),
+                output_data=error_result.model_dump(),
+                status=ActionStatus.FAILED,
+            )
+            ahm.add_action(error_action)
+            # Mirror the success path: persist this turn's actions onto the
+            # node so cross-turn helpers (``_count_session_tokens``,
+            # ``get_last_turn_usage``) don't keep reading stale state after
+            # a failed attempt.
+            self.actions.extend(ahm.get_actions())
+            yield error_action
+        finally:
+            # Drop the in-flight running snapshot once the turn ends so the
+            # next status-bar refresh does not double-count it on top of the
+            # committed ``turn_usage`` row. ``ExecutionInterrupted`` above
+            # opts out so Ctrl+C survivors keep the partial data for resume.
+            drop = getattr(self, "_drop_running_turn_usage_on_exit", True)
+            self._drop_running_turn_usage_on_exit = True
+            if drop:
+                try:
+                    self.running_turn_usage = None
+                    session_id = getattr(self, "session_id", None)
+                    if session_id:
+                        try:
+                            sm = self.session_manager
+                        except Exception:  # noqa: BLE001
+                            sm = None
+                        if sm is not None and hasattr(sm, "clear_running_turn_usage"):
+                            sm.clear_running_turn_usage(session_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("Failed to drop running_turn_usage on turn end", exc_info=True)
+
+    async def _stream_once(self, ctx: "StreamRunContext") -> AsyncGenerator[ActionHistory, None]:
+        """Run the model once and yield every action while collecting state.
+
+        The template invokes this method ``max_attempts`` times (once for
+        every retry-policy iteration). Each call:
+
+        - Calls ``model.generate_with_tools_stream`` with the current
+          ``ctx.user_prompt`` and per-node-configured tools / hooks.
+        - Routes every emitted action through ``_maybe_rewrite_stream_action``
+          so subclasses can re-shape items mid-flight (used by GenReport).
+        - Updates ``ctx.response_content`` / ``ctx.last_successful_output``
+          from assistant chunks (skipping ``is_thinking`` items so the
+          model's internal monologue never lands in the final response) and
+          ``ctx.last_tool_summary`` from successful tool actions.
+
+        Briefly exposes ``ctx.action_history_manager`` as
+        ``self._current_action_history`` so the SDK ``on_llm_end`` hook
+        (see :class:`TokenUsageHook`) can enqueue mid-turn ``token_usage``
+        actions against the active manager. Always cleared in ``finally``
+        so a follow-up turn / a node reused across requests never sees a
+        stale reference.
+        """
+        # ``max_turns`` precedence: a per-call value on the input wins, but only
+        # when the caller set it explicitly (tracked via Pydantic
+        # ``model_fields_set``); otherwise fall back to the node's configured
+        # limit (agent.yml ``agentic_nodes.<name>.max_turns``). The input field's
+        # own default must never shadow the node config -- otherwise a config
+        # value can never take effect.
+        explicit_turns = (
+            getattr(ctx.user_input, "max_turns", None)
+            if "max_turns" in getattr(ctx.user_input, "model_fields_set", ())
+            else None
+        )
+        effective_max_turns = explicit_turns if explicit_turns is not None else self.max_turns
+        # Wrap tools with plugin transformers BEFORE the stream call below
+        # captures ``self.tools``: call arguments evaluate left to right, so
+        # deferring to ``hooks=self._compose_run_hooks(ctx)`` would be one
+        # argument too late and the first run would execute unwrapped tools.
+        self._ensure_tool_transformers()
+        self._current_action_history = ctx.action_history_manager
+        # Per-run mid-turn compactor. Created before ``_compose_run_hooks`` so
+        # the same instance is both composed into the hooks (its ``on_start``
+        # resets the view per SDK run) and handed to the model layer as the
+        # per-model-call context rewriter.
+        ctx.context_rewriter = self._build_context_rewriter(ctx)
+        self._active_context_rewriter = ctx.context_rewriter
+        try:
+            async for stream_action in self.model.generate_with_tools_stream(
+                prompt=ctx.user_prompt,
+                tools=self.tools or [],
+                builtin_web_tools=getattr(self, "_builtin_web_tools", None),
+                mcp_servers=self.mcp_servers,
+                instruction=ctx.system_instruction,
+                max_turns=effective_max_turns,
+                session=ctx.session,
+                action_history_manager=ctx.action_history_manager,
+                hooks=self._compose_run_hooks(ctx),
+                agent_name=self.get_node_name(),
+                interrupt_controller=self.interrupt_controller,
+                pending_input_queue=ctx.pending_input_queue,
+                # Defensive: test doubles that bypass ``AgenticNode.__init__``
+                # may not have a broker; the model layer skips emit when None.
+                interaction_broker=getattr(self, "interaction_broker", None),
+                context_rewriter=ctx.context_rewriter,
+            ):
+                rewritten = self._maybe_rewrite_stream_action(stream_action, ctx)
+                action_to_yield = rewritten or stream_action
+
+                if (
+                    action_to_yield.role == ActionRole.ASSISTANT
+                    and action_to_yield.status == ActionStatus.SUCCESS
+                    and action_to_yield.output
+                ):
+                    output = action_to_yield.output
+                    if isinstance(output, dict) and output.get("is_thinking") is not True:
+                        ctx.last_successful_output = output
+                        candidate = (
+                            output.get("content", "") or output.get("response", "") or output.get("raw_output", "")
+                        )
+                        # Preserve dict candidates (used by Deliverable for structured
+                        # outputs); coerce only when the candidate is a non-empty
+                        # non-string scalar.
+                        if isinstance(candidate, str):
+                            if candidate:
+                                ctx.response_content = candidate
+                        elif candidate:
+                            ctx.response_content = candidate
+                elif action_to_yield.role == ActionRole.TOOL and action_to_yield.status == ActionStatus.SUCCESS:
+                    tool_output = action_to_yield.output if isinstance(action_to_yield.output, dict) else {}
+                    summary = tool_output.get("summary") or tool_output.get("status_message") or ""
+                    if isinstance(summary, str) and summary.strip():
+                        ctx.last_tool_summary = summary.strip()
+
+                yield action_to_yield
+        finally:
+            self._current_action_history = None
+            self._active_context_rewriter = None
+
+    # ── optional hooks (subclasses override as needed) ──────────────────
+
+    async def _before_stream(self, ctx: "StreamRunContext") -> None:
+        """Hook: side-effect initialisation before the stream loop begins.
+
+        Runs after input validation / initial action emission but BEFORE
+        session setup and prompt assembly. Use this for async setup whose
+        outcome affects tool selection, prompt building, or template context
+        (e.g. parse ``user_input`` to derive ``ctx.user_message_override`` /
+        ``ctx.extras``, enable/disable tools on ``self.tools``).
+        """
+        return None
+
+    def _build_template_context(self, ctx: "StreamRunContext") -> Optional[Dict[str, Any]]:
+        """Hook: extra keyword arguments forwarded to the system-prompt template.
+
+        Return a dict to enable template-context rendering; return ``None``
+        (default) when the node's template needs only the common variables
+        injected by :meth:`_get_system_prompt`.
+
+        Distinct from the per-subclass helper ``_prepare_template_context``
+        (which various subclasses already define with ``(user_input, …)``
+        signatures); subclasses that need template context override this hook
+        and typically delegate: ``return self._prepare_template_context(ctx.user_input)``.
+
+        Contract: the returned values are rendered into the system prompt,
+        which is frozen into the per-session snapshot and replayed on later
+        turns — so they must be **session-stable** (tool wiring, execution
+        mode), never per-turn (current datasource, user input). Per-turn
+        values belong in :meth:`_build_enhanced_message`.
+        """
+        return None
+
+    def _compose_run_hooks(self, ctx: "StreamRunContext") -> Any:
+        """Hook: compose the final ``hooks`` argument passed to the model.
+
+        Default: include ``self.hooks`` only in interactive mode;
+        otherwise return permission hooks alone.
+
+        Subclasses with non-``self.hooks`` extras (Deliverable's
+        ``_validation_hook``) override to call ``self._compose_hooks(extra)``
+        directly.
+        """
+        extra_hook = getattr(self, "hooks", None)
+        if extra_hook is None or self.execution_mode != "interactive":
+            return self._compose_hooks()
+        return self._compose_hooks(extra_hook)
+
+    def _maybe_rewrite_stream_action(self, action: ActionHistory, ctx: "StreamRunContext") -> Optional[ActionHistory]:
+        """Hook: optionally replace a streamed action before it is yielded.
+
+        Return a replacement :class:`ActionHistory` to substitute it (used by
+        GenReport to swap JSON payloads for rendered markdown in real time)
+        or ``None`` (default) to keep the original action unchanged.
+        """
+        return None
+
+    def _get_retry_policy(self):
+        """Hook: return a :class:`RetryPolicy` to drive validate/retry.
+
+        Default returns :class:`NoRetryPolicy` (single execution). Override
+        to return :class:`ValidationHookRetryPolicy` when the node needs
+        re-prompting on validation failure. Concrete policies
+        live in their owning node's module — there is no shared ``policies/``
+        package since each policy is bound to a specific node's internals.
+        """
+        from pico.agent.node.retry_policy import NoRetryPolicy
+
+        return NoRetryPolicy()
+
+    def _build_success_result(self, ctx: "StreamRunContext") -> BaseResult:
+        """Hook (REQUIRED): construct the NodeResult on the success path.
+
+        Subclasses parse ``ctx.response_content`` / ``ctx.last_successful_output``
+        / ``ctx.last_tool_summary`` / ``ctx.extras`` and return an instance
+        of ``self.result_class``.
+        """
+        raise NotImplementedError(f"{type(self).__name__} must override _build_success_result(ctx)")
+
+    async def _stream_post_build(
+        self, ctx: "StreamRunContext", result: BaseResult
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Optional async-generator hook invoked after :meth:`_build_success_result`
+        and before the final wrapper action is yielded.
+
+        Visual-artifact subagents override this to interleave finalize-
+        progress messages around their post-validate LLM work, so the
+        chat panel doesn't sit silent through the 10-15 s finalize. The
+        hook may mutate ``result`` in place (e.g. populate
+        ``finalize_warnings`` / ``finalize_error``); those mutations
+        flow into the final wrapper action's ``output_data``.
+
+        Default: yield nothing.
+        """
+        # ``if False: yield`` keeps this an async-generator function (so
+        # callers can ``async for``) while emitting zero items by default.
+        if False:  # pragma: no cover - documented sentinel
+            yield  # type: ignore[unreachable]
+
+    def _build_error_result(self, exc: BaseException, ctx: "StreamRunContext") -> BaseResult:
+        """Construct a uniform error NodeResult — base implementation final.
+
+        Builds an instance of ``self.result_class`` populated with
+        ``success=False``, ``error=<formatted>``, ``response=""``,
+        ``tokens_used=0``. Automatically fills ``action_history`` for
+        NodeResult subtypes that declare that field.
+
+        Subclasses MUST declare ``result_class`` for this to work; the
+        runtime guard below produces a clear error otherwise.
+        """
+        if self.result_class is None:
+            raise NotImplementedError(
+                f"{type(self).__name__} must declare a class-level "
+                f"`result_class` attribute pointing to its BaseResult subtype"
+            )
+
+        kwargs: Dict[str, Any] = {
+            "success": False,
+            "error": self._format_execution_error(exc),
+            "response": "",
+            "tokens_used": 0,
+        }
+        if "action_history" in getattr(self.result_class, "model_fields", {}):
+            kwargs["action_history"] = [a.model_dump() for a in ctx.action_history_manager.get_actions()]
+        return self.result_class(**kwargs)
+
+    def _get_or_create_broker(self) -> "InteractionBroker":
+        """
+        Get or create the interaction broker for this node.
+
+        Resets the broker's asyncio.Queue so it binds to the current event loop.
+        This is necessary because each asyncio.run() creates a new event loop,
+        and asyncio.Queue is bound at creation time. Without this reset, reusing
+        a node across multiple asyncio.run() calls would fail with
+        'Queue is bound to a different event loop'.
+
+        Returns:
+            InteractionBroker instance for this node
+        """
+        self.interaction_broker.reset_queue()
+        return self.interaction_broker
+
+    async def execute_stream_with_interactions(
+        self, action_history_manager: Optional[ActionHistoryManager] = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """
+        Execute with interaction support, merging execute_stream with broker
+        and any tool action channels (e.g. sub-agent task actions).
+
+        This is the method that UI components should call instead of execute_stream()
+        when they want to handle interactions from hooks.
+
+        Supports graceful interruption via self.interrupt_controller. When interrupted,
+        yields an "interrupted" action and stops execution cleanly.
+
+        Args:
+            action_history_manager: Optional action history manager for tracking
+
+        Yields:
+            ActionHistory: Progress updates during execution, including
+            INTERACTION actions and tool sub-actions.
+        """
+        self.interrupt_controller.reset()
+        self.action_bus.reset()
+        broker = self._get_or_create_broker()
+
+        action_stream = self.execute_stream(action_history_manager)
+        try:
+            async for action in self.action_bus.merge(
+                action_stream,
+                broker.fetch(),
+                on_primary_done=broker.close,
+            ):
+                self.interrupt_controller.check()
+                yield action
+        except ExecutionInterrupted:
+            logger.info("Execution interrupted by user")
+            yield ActionHistory.create_action(
+                role=ActionRole.ASSISTANT,
+                action_type="interrupted",
+                messages="Execution interrupted. You can continue with additional information.",
+                input_data={},
+                status=ActionStatus.SUCCESS,
+            )
+
+    def _reset_usage_caches(self) -> None:
+        """Drop the session-scoped token/context usage caches on reset.
+
+        ``running_turn_usage`` and the restored context mirrors survive
+        independently of the session DB, so a ``/clear`` or ``/delete`` must
+        zero the in-memory fields and remove the persisted running-turn
+        snapshot / ``ContextState`` — otherwise the status bar keeps showing
+        the previous turn's token and context-window usage until the next LLM
+        call overwrites it.
+        """
+        self.running_turn_usage = None
+        self._context_state = None
+        self._restored_context_used = 0
+        if not self.session_id:
+            return
+        try:
+            sm = getattr(self, "session_manager", None)
+            if sm is not None and hasattr(sm, "clear_running_turn_usage"):
+                sm.clear_running_turn_usage(self.session_id)
+                from pico.storage.session_state import ContextState
+
+                sm.save_context_state(self.session_id, ContextState())
+        except Exception:  # noqa: BLE001 — cleanup must never crash node logic
+            logger.debug("Failed to clear running_turn_usage for %s", self.session_id, exc_info=True)
+        try:
+            state_path = self._agent_state_file()
+            if state_path is not None:
+                from pico.storage.session_state import ContextState
+
+                ContextState.clear(state_path)
+        except Exception:  # noqa: BLE001
+            logger.debug("Failed to clear persisted context state for %s", self.session_id, exc_info=True)
+
+    def clear_session(self) -> None:
+        """Clear the current session."""
+        if self.session_id:
+            self.session_manager.clear_session(self.session_id)
+            self._reset_usage_caches()
+            self._session = None
+            logger.info(f"Cleared session: {self.session_id}")
+
+    def delete_session(self) -> None:
+        """Delete the current session completely.
+
+        The node becomes unusable after this call — callers (REPL ``/delete``,
+        API ``DELETE /sessions/{id}``) discard it and either build a fresh node
+        or end the conversation. ``session_id`` stays set (it is immutable) so
+        log lines and tracebacks can still reference which session was deleted.
+        """
+        if self.session_id:
+            self._reset_usage_caches()
+            self.session_manager.delete_session(self.session_id)
+            self._session = None
+            logger.info("Deleted session: %s", self.session_id)
+
+    async def get_session_info(self) -> Dict[str, Any]:
+        """
+        Get information about the current session.
+
+        Returns:
+            Dictionary with session information
+        """
+        if not self.session_id:
+            return {"session_id": None, "active": False}
+
+        current_tokens = await self._count_session_tokens()
+
+        return {
+            "session_id": self.session_id,
+            "active": self._session is not None,
+            "token_count": current_tokens,
+            "action_count": len(self.actions),
+            "context_usage_ratio": current_tokens / self.context_length if self.context_length else 0,
+            "context_remaining": (
+                max(0, self.context_length - current_tokens)
+                if self.context_length and self.get_context_usage().last_call_input_tokens
+                else 0
+            ),
+            "context_length": self.context_length,
+        }
+
+    async def get_last_turn_usage(self) -> Optional[TokenUsage]:
+        """Get token usage from the last assistant action that contains usage data.
+
+        Mid-turn callers (e.g. status bar refresh, ``execute_stream`` early
+        exit) prefer the in-memory ``running_turn_usage`` snapshot updated
+        by :class:`TokenUsageHook` so they observe the latest cumulative
+        usage before the SDK's ``store_run_usage`` persists it.
+        """
+        from pico.schemas.token_usage import TokenUsage as _TokenUsage
+
+        running = getattr(self, "running_turn_usage", None)
+        if running is not None:
+            return running
+
+        for action in reversed(self.actions):
+            # Stop at the last root-level user message to scope to the current turn
+            if action.role == ActionRole.USER and action.depth == 0:
+                break
+            if (
+                action.role == ActionRole.ASSISTANT
+                and action.depth == 0
+                and isinstance(action.output, dict)
+                and isinstance(action.output.get("usage"), dict)
+            ):
+                usage_dict = action.output["usage"]
+                return _TokenUsage.from_usage_dict(
+                    usage_dict,
+                    session_total_tokens=self.get_context_usage().last_call_input_tokens,
+                    context_usage_valid=self.get_context_usage().last_call_input_tokens > 0,
+                    context_length=self.context_length or 0,
+                )
+        return None
+
+    def _resolve_workspace_root(self) -> str:
+        """
+        Resolve workspace_root with priority: node-specific ``workspace_root`` >
+        ``agent_config.project_root`` (which itself defaults to the launch CWD).
+
+        Expands ``~`` to the user home directory if present.
+
+        vscode short-circuit: the vscode front-end drives the daemon from a
+        remote IDE that owns its own filesystem, so any concrete server-side
+        path would just leak the daemon CWD. Return the literal ``"."``
+        unexpanded for that source — callers that surface this value to the
+        LLM (e.g. system prompt) stay neutral, and the proxied
+        ``filesystem_tools.*`` route every real path through the client
+        anyway. Web keeps its real root because web sessions still operate
+        against a server-side workspace.
+        """
+        import os
+
+        if getattr(self.agent_config, "_client_source", None) == "vscode":
+            return "."
+
+        node_workspace_root = self.node_config.get("workspace_root")
+        if node_workspace_root:
+            workspace_root = node_workspace_root
+            logger.debug(f"Using node-specific workspace_root: {workspace_root}")
+        elif self.agent_config and hasattr(self.agent_config, "project_root"):
+            workspace_root = self.agent_config.project_root
+            logger.debug(f"Using project_root as workspace_root: {workspace_root}")
+        else:
+            workspace_root = os.getcwd()
+            logger.debug(f"Using current directory as workspace_root: {workspace_root}")
+
+        expanded_path = os.path.expanduser(workspace_root)
+        if expanded_path != workspace_root:
+            logger.debug(f"Expanded workspace_root from '{workspace_root}' to '{expanded_path}'")
+        return expanded_path
+
+    def _resolve_filesystem_strict(self) -> bool:
+        """Resolve the ``strict`` flag for this node's filesystem tool.
+
+        Reads ``self.agent_config.filesystem_strict`` (process-wide default set
+        by API / gateway bootstraps, or by ``agent.filesystem.strict`` / the
+        ``--filesystem-strict`` CLI flag). CLI leaves it unset so EXTERNAL
+        access falls back to broker-prompt behavior.
+        """
+        if self.agent_config is None:
+            return False
+        return bool(self.agent_config.filesystem_strict)
+
+    def _resolve_filesystem_allowlist(self) -> Optional["PathAllowlist"]:
+        """Resolve the configured extra fs roots for this node's tools.
+
+        Reads ``agent_config.filesystem_allowlist`` (``agent.filesystem
+        .allow_read`` / ``allow_write``). Returns ``None`` when unset or empty
+        so the tool / policy layers keep their default project-only view.
+        """
+        allowlist = getattr(self.agent_config, "filesystem_allowlist", None) if self.agent_config else None
+        return allowlist or None
+
+    def _resolve_config_mutable(self) -> bool:
+        """Whether the agent may edit the agent config file (agent.yml).
+
+        Reads ``self.agent_config.config_mutable`` (default ``True``). The
+        chat API / gateway set it to ``False`` on their per-request config
+        clone so config-editing setup skills are hidden and refused.
+        """
+        if not self.agent_config:
+            return True
+        return bool(getattr(self.agent_config, "config_mutable", True))
+
+    def _make_filesystem_tool(self, **kwargs):
+        """Construct a ``FilesystemFuncTool`` with this node's identity baked in.
+
+        All production call sites go through this helper so ``root_path`` is
+        uniformly ``_resolve_workspace_root()`` and ``current_node`` matches
+        ``get_node_name()``. The ``strict`` flag is resolved from
+        ``agent_config.filesystem_strict`` so API / gateway can opt out of
+        interactive EXTERNAL prompts. Persistent memory is no longer reachable
+        through this tool — the whole ``.pico/memory/**`` subtree is HIDDEN and
+        owned exclusively by the dedicated ``add_memory`` / ``edit_memory``
+        tools (see ``_make_memory_tool``).
+        """
+        from pico.tools.func_tool import FilesystemFuncTool
+
+        root_path = kwargs.pop("root_path", None) or self._resolve_workspace_root()
+        datus_home = kwargs.pop("datus_home", None)
+        if datus_home is None and self.agent_config is not None:
+            path_manager = getattr(self.agent_config, "path_manager", None)
+            if path_manager is not None:
+                try:
+                    datus_home = str(path_manager.datus_home)
+                except Exception:
+                    datus_home = None
+        strict = kwargs.pop("strict", None)
+        if strict is None:
+            strict = self._resolve_filesystem_strict()
+        current_node = kwargs.pop("current_node", None) or self.get_node_name()
+        session_data_dir = kwargs.pop("session_data_dir", None) or self._resolve_session_data_dir()
+        path_allowlist = kwargs.pop("path_allowlist", None) or self._resolve_filesystem_allowlist()
+        return FilesystemFuncTool(
+            root_path=root_path,
+            current_node=current_node,
+            datus_home=datus_home,
+            strict=strict,
+            session_data_dir=session_data_dir,
+            path_allowlist=path_allowlist,
+            **kwargs,
+        )
+
+    def _make_memory_tool(self, **kwargs):
+        """Construct a ``MemoryFuncTool`` bound to a single memory owner node.
+
+        ``memory_node`` defaults to ``get_node_name()`` (chat / custom subagents
+        own their memory) but the feedback node passes its caller's name so it
+        writes the caller's memory instead of its own.
+        """
+        from pico.tools.func_tool import MemoryFuncTool
+
+        root_path = kwargs.pop("root_path", None) or self._resolve_workspace_root()
+        memory_node = kwargs.pop("memory_node", None) or self.get_node_name()
+        return MemoryFuncTool(root_path=root_path, memory_node=memory_node, **kwargs)
+
+    def _setup_memory_tools(self, memory_node: Optional[str] = None) -> None:
+        """Mount the dedicated memory tools (``add_memory`` / ``edit_memory``).
+
+        Only *main* agents write memory. A node running as a sub-agent (launched
+        via ``task``) never mounts the tools — it only sees the parent's memory
+        inlined read-only (see ``_inject_memory_context``). The memory owner
+        defaults to ``resolve_memory_node(get_node_name())`` (built-in main
+        agents share ``chat``; custom agents use their own name); the feedback
+        node passes an explicit ``memory_node`` (its caller's resolved memory).
+        """
+        from pico.utils.memory_loader import resolve_memory_node
+
+        if self._is_subagent:
+            return
+        node = memory_node or resolve_memory_node(self.get_node_name())
+        try:
+            self.memory_func_tool = self._make_memory_tool(memory_node=node)
+            self.tools.extend(self.memory_func_tool.available_tools())
+            logger.debug(f"Setup memory tools for node: {self.memory_func_tool.memory_node}")
+        except Exception as e:
+            logger.error(f"Failed to setup memory tools: {e}")
+
+    def _resolve_session_data_dir(self) -> Optional[str]:
+        """Resolve the compact-archive data dir for this node's current session.
+
+        Returns ``None`` when the node has no agent_config / path_manager (used
+        by lightweight bootstrap tests), no session_id yet, or when the
+        path manager rejects the segment (e.g. missing project_name). The
+        caller falls back to leaving the FS policy without a session anchor,
+        which keeps archived paths EXTERNAL — safe but the LLM will be
+        prompted before it can ``read_file`` them.
+        """
+        if not self.agent_config:
+            return None
+        path_manager = getattr(self.agent_config, "path_manager", None)
+        if path_manager is None or not getattr(self, "session_id", ""):
+            return None
+        try:
+            return str(path_manager.session_data_dir(self.session_id))
+        except Exception as exc:
+            logger.debug("Failed to resolve session_data_dir for fs policy: %s", exc)
+            return None
+
+    def _make_filesystem_policy(self):
+        """Build a :class:`FilesystemPolicy` for ``PermissionHooks`` construction.
+
+        Returns ``None`` when this node has no ``agent_config`` or the path
+        manager cannot be resolved, so callers can treat the policy as opt-in
+        and fall back to the pre-refactor category-level behavior.
+        """
+        if not self.agent_config:
+            return None
+        path_manager = getattr(self.agent_config, "path_manager", None)
+        if path_manager is None:
+            return None
+        try:
+            from pathlib import Path as _Path
+
+            from pico.tools.permission.permission_hooks import FilesystemPolicy
+
+            session_data_dir_str = self._resolve_session_data_dir()
+            session_data_dir = _Path(session_data_dir_str) if session_data_dir_str else None
+            return FilesystemPolicy(
+                root_path=_Path(self._resolve_workspace_root()).resolve(strict=False),
+                current_node=self.get_node_name(),
+                datus_home=_Path(path_manager.datus_home),
+                strict=self._resolve_filesystem_strict(),
+                session_data_dir=session_data_dir,
+                allowlist=self._resolve_filesystem_allowlist(),
+            )
+        except Exception as e:
+            logger.debug(f"Failed to build FilesystemPolicy: {e}")
+            return None
+
+    # ── Permission hook wiring ──────────────────────────────────────────
+    # Subagent nodes historically passed ``hooks=None`` into
+    # ``generate_with_tools_stream`` — meaning profile rules (DENY, ASK)
+    # never fired for anything other than ``chat``. These helpers let
+    # every subclass participate in the permission system with one call.
+
+    def _iter_tool_groups(self) -> List[Any]:
+        """Collect tool-group instances mounted as attributes on this node.
+
+        A tool group is any object that declares both ``permission_category``
+        (the class-level category from ``BaseTool`` or a plain class attribute)
+        and ``available_tools()``. Category declaration lives at the tool's
+        definition site, so nodes no longer maintain hand-written
+        category maps that silently drift when a tool is added or renamed.
+        """
+        groups: List[Any] = []
+        seen: set = set()
+        for attr_name in sorted(vars(self)):
+            value = getattr(self, attr_name, None)
+            if value is None or id(value) in seen:
+                continue
+            if isinstance(value, type):
+                continue
+            # ``permission_category`` must be a plain string — this also keeps
+            # ``Mock()`` stand-ins in tests out of the registry unless they
+            # explicitly declare a category.
+            category = getattr(value, "permission_category", None)
+            if isinstance(category, str) and callable(getattr(value, "available_tools", None)):
+                seen.add(id(value))
+                groups.append(value)
+        return groups
+
+    @staticmethod
+    def _tool_group_names(group: Any) -> List[str]:
+        """Return every permission-relevant tool name a group can expose.
+
+        Prefers ``all_tools_name()`` (the full surface, independent of
+        runtime availability) over ``available_tools()`` so the registry
+        also covers method-level wrappers some nodes mount directly (e.g.
+        ``DBFuncTool.transfer_query_result`` on gen_job) and conditional tools that
+        appear only with certain configs. Registering a superset is safe:
+        the registry is a name → category lookup consulted per call, so
+        names that are never mounted are never queried.
+        """
+        all_names = getattr(group, "all_tools_name", None)
+        if callable(all_names):
+            try:
+                return [str(name) for name in all_names()]
+            except Exception:
+                logger.debug("all_tools_name() failed for %s", type(group).__name__, exc_info=True)
+        try:
+            return [getattr(tool, "name", str(tool)) for tool in group.available_tools()]
+        except Exception:
+            logger.debug("available_tools() failed for %s", type(group).__name__, exc_info=True)
+            return []
+
+    def _populate_tool_registry(self) -> None:
+        """Register every mounted tool group's names into :attr:`tool_registry`.
+
+        Categories come from each tool class's ``permission_category``
+        declaration (see :meth:`_iter_tool_groups`), so the mapping is
+        deterministic across nodes — the same tool name always lands in the
+        same category no matter which node mounts it.
+
+        Decoupled from :meth:`_ensure_permission_hooks` so callers that
+        need the registry filled *before* the first LLM turn — most
+        importantly :func:`apply_proxy_tools`, which inspects the
+        registry to honour the ``_FS_DEPENDENT_NODES`` exclusion — can
+        trigger it eagerly. Safe to call multiple times because
+        :meth:`ToolRegistry.register_tools` is overwrite-write.
+
+        Permission gating remains opt-in through
+        :meth:`_ensure_permission_hooks`; this helper does **not** require
+        a ``permission_manager`` and never builds ``PermissionHooks``.
+        """
+        try:
+            for group in self._iter_tool_groups():
+                names = self._tool_group_names(group)
+                if names:
+                    self.tool_registry.register_tools(group.permission_category, names)
+        except Exception:
+            logger.debug(
+                "Failed to populate tool_registry for %s; falling back to lazy registration.",
+                self.get_node_name(),
+                exc_info=True,
+            )
+
+    def _ensure_permission_hooks(self) -> None:
+        """Build ``self.permission_hooks`` once tools are in place.
+
+        Invoked lazily from :meth:`_compose_hooks` so subclasses don't have
+        to remember the ordering (``setup_tools`` must happen first). Safe
+        to call many times — short-circuits after the first successful
+        build. Silently no-ops when no ``permission_manager`` exists
+        (agent with permissions disabled).
+        """
+        if self.permission_hooks is not None:
+            return
+        if not self.permission_manager:
+            return
+        try:
+            self._populate_tool_registry()
+            from pico.tools.permission.permission_hooks import PermissionHooks
+
+            # ``execution_mode="workflow"`` flows have no human in the loop, so
+            # ASK / EXTERNAL fs hits short-circuit to ``PermissionDeniedException``
+            # inside the hook rather than awaiting the broker indefinitely.
+            non_interactive = getattr(self, "execution_mode", None) == "workflow"
+
+            # Never call ``_get_or_create_broker`` here — it resets the queue
+            # and orphans any parent CLI listener when running as a sub-agent.
+            from pico.tools.permission.auto_reviewer import create_auto_reviewer
+
+            self.permission_hooks = PermissionHooks(
+                broker=self.interaction_broker,
+                permission_manager=self.permission_manager,
+                node_name=self.get_node_name(),
+                tool_registry=self.tool_registry,
+                fs_policy=self._make_filesystem_policy(),
+                non_interactive=non_interactive,
+                proxied_tool_names=self.proxied_tool_names,
+                project_root=getattr(self.agent_config, "project_root", None),
+                config_mutable=self._resolve_config_mutable(),
+                auto_reviewer=create_auto_reviewer(self.agent_config),
+                review_context_provider=self._build_permission_review_context,
+            )
+            logger.debug(
+                f"PermissionHooks attached to node '{self.get_node_name()}' "
+                f"with {len(self.tool_registry)} tool mappings"
+            )
+        except Exception as e:
+            # Fail closed: leaving ``permission_hooks=None`` with a
+            # ``permission_manager`` present would silently bypass profile
+            # DENY/ASK checks on every tool call. Raise so the node refuses
+            # to run rather than executing with degraded enforcement.
+            from pico.utils.exceptions import DatusException, ErrorCode
+
+            logger.exception("Failed to build PermissionHooks for %s", self.get_node_name())
+            self.permission_hooks = None
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Permission hook setup failed for {self.get_node_name()}: {e}"},
+            ) from e
+
+    def _build_permission_review_context(self) -> Dict[str, Any]:
+        """Return minimal permission-review evidence without tool outputs.
+
+        User actions are trusted authorization evidence. Bash/SQL call
+        arguments are retained only as explicitly-labelled untrusted history;
+        assistant prose and every tool result are omitted.
+        """
+        combined: List[ActionHistory] = list(self.actions)
+        current = getattr(self, "_current_action_history", None)
+        if current is not None:
+            combined.extend(current.get_actions())
+
+        seen: Set[str] = set()
+        user_messages: List[str] = []
+        prior_actions: List[Dict[str, Any]] = []
+        for action in combined:
+            if action.action_id in seen:
+                continue
+            seen.add(action.action_id)
+            role = ActionRole(action.role)
+            if role == ActionRole.USER:
+                payload = action.input if isinstance(action.input, dict) else {}
+                message = payload.get("user_message") or action.messages
+                if isinstance(message, str) and message.strip():
+                    user_messages.append(message.removeprefix("User: ").strip())
+                continue
+            if role != ActionRole.TOOL:
+                continue
+            tool_name = action.action_type or action.function_name()
+            if tool_name not in {"bash", "execute_sql"}:
+                continue
+            payload = action.input if isinstance(action.input, dict) else {}
+            arguments: Any = payload.get("arguments", payload)
+            if isinstance(arguments, str):
+                try:
+                    arguments = json.loads(arguments)
+                except (json.JSONDecodeError, TypeError):
+                    arguments = {"raw": arguments}
+            prior_actions.append({"tool": tool_name, "arguments": arguments})
+
+        sandbox = getattr(self.agent_config, "bash_sandbox", None)
+        return {
+            "trusted_user_messages": user_messages,
+            "prior_actions": prior_actions,
+            "environment": {
+                "session_id": self.session_id,
+                "sandbox_enabled": bool(getattr(sandbox, "enabled", False)),
+                "sandbox_mode": getattr(sandbox, "mode", None),
+            },
+        }
+
+    def _ensure_tool_transformers(self) -> None:
+        """Wrap ``self.tools`` with plugin-declared argument transformers, once.
+
+        Invoked lazily from :meth:`_compose_hooks` so wrapping happens after
+        ``setup_tools`` and any ``apply_proxy_tools`` rewrite (proxied tools
+        are skipped — they execute client-side). Idempotent via a flag so a
+        node reused across turns never double-wraps.
+
+        Gated by ``agent.plugins_enabled`` like every other plugin surface.
+        Collection failures are swallowed inside the registry (a broken plugin
+        must not break the agent), but once a plugin *has* declared
+        transformers, a failure to apply them raises: transformers are policy
+        code, and running without them would silently drop enforcement.
+        """
+        # Defensive getattr: test doubles that bypass ``AgenticNode.__init__``
+        # may carry neither the flag nor an agent_config (same rationale as the
+        # ``interaction_broker`` getattr in ``_stream_once``).
+        if getattr(self, "_tool_transformers_applied", False):
+            return
+        if not getattr(getattr(self, "agent_config", None), "plugins_enabled", True):
+            self._tool_transformers_applied = True
+            return
+        from pico.plugins.registry import collect_plugin_tool_transformers
+
+        agent_config = getattr(self, "agent_config", None)
+        active_names = agent_config.active_plugin_names() if hasattr(agent_config, "active_plugin_names") else None
+        transformers_by_pattern = collect_plugin_tool_transformers(active_names)
+        if not transformers_by_pattern:
+            self._tool_transformers_applied = True
+            return
+        try:
+            from pico.tools.middleware import apply_tool_transformers
+
+            wrapped = apply_tool_transformers(self, transformers_by_pattern)
+            logger.debug(
+                "Applied plugin tool transformers on node '%s': %d tool(s) wrapped",
+                self.get_node_name(),
+                wrapped,
+            )
+            # Only mark applied on success: setting the flag before the
+            # attempt would turn the fail-closed raise below into fail-open
+            # on the next turn (the early return above would skip wrapping
+            # entirely and matched tools would run unenforced).
+            self._tool_transformers_applied = True
+        except Exception as e:
+            # Fail closed: a declared transformer that cannot be applied means
+            # policy enforcement would silently vanish for matched tools.
+            from pico.utils.exceptions import DatusException, ErrorCode
+
+            logger.exception("Failed to apply plugin tool transformers for %s", self.get_node_name())
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Tool transformer setup failed for {self.get_node_name()}: {e}"},
+            ) from e
+
+    @staticmethod
+    def _extract_total_tokens(actions: List[ActionHistory]) -> int:
+        """Walk the current root turn and return its assistant token count.
+
+        Iterates in reverse from the most recent action, stopping at the
+        last root-level user message so child/tool usage from sub-agents
+        does not leak into the parent's per-turn total — same scoping as
+        ``_count_session_tokens`` / ``get_last_turn_usage``. Tolerates
+        ``total_tokens`` being a numeric string (some providers emit
+        ``"1234"`` rather than ``1234``) — anything that fails an ``int``
+        cast contributes ``0`` and the loop continues looking further back.
+        Returns ``0`` when no assistant action carries a usable usage block.
+        """
+        for action in reversed(actions):
+            if action.role == ActionRole.USER and action.depth == 0:
+                break
+            if action.role != ActionRole.ASSISTANT or action.depth != 0:
+                continue
+            output = action.output
+            if not isinstance(output, dict):
+                continue
+            usage_info = output.get("usage")
+            if not isinstance(usage_info, dict):
+                continue
+            total = usage_info.get("total_tokens")
+            if not total:
+                continue
+            try:
+                tokens = int(total)
+            except (TypeError, ValueError):
+                continue
+            if tokens > 0:
+                return tokens
+        return 0
+
+    @staticmethod
+    def _format_execution_error(exc: BaseException) -> str:
+        """Render an exception for error_result / error_action display.
+
+        ``DatusException`` carries a structured error code that is normally
+        lost when callers fall back to ``str(exc)``. Surface it as
+        ``[CODE] <message>`` so logs and SSE error cards remain greppable.
+        """
+        from pico.utils.exceptions import DatusException
+
+        if isinstance(exc, DatusException):
+            return f"[{exc.code}] {exc}"
+        return str(exc)
+
+    def _compose_hooks(self, extra: Any = None) -> Any:
+        """Combine permission hooks with an optional per-node hook.
+
+        ``extra`` is typically ``self.hooks`` for workflow nodes
+        (``feedback``, ``sql_summary``, …) that have their own todo/plan
+        hooks. Returns a :class:`CompositeHooks` when multiple hooks are
+        active, a single hook when only one is present, or ``None`` when
+        none exist. Callers pass the result directly into
+        ``generate_with_tools_stream(hooks=...)``.
+
+        The per-run ``MidTurnCompactor`` (``_stream_once`` stores it on
+        ``_active_context_rewriter`` for the duration of the call) is wired
+        in too, so its ``on_start`` resets the compaction view whenever the
+        model layer starts a new SDK run. Compaction itself is not hook
+        driven: the compactor is consulted by the model layer before every
+        model call (``call_model_input_filter`` / the native loop).
+
+        ``TokenUsageHook`` is also wired in so each LLM call's ``on_llm_end``
+        publishes a ``token_usage`` action mid-turn (see
+        ``pico/agent/node/token_usage_hook.py``).
+        """
+        self._ensure_permission_hooks()
+        self._ensure_tool_transformers()
+        context_rewriter = getattr(self, "_active_context_rewriter", None)
+        token_usage_hook = self._get_or_create_token_usage_hook()
+
+        active = [h for h in (extra, self.permission_hooks, context_rewriter, token_usage_hook) if h is not None]
+        if not active:
+            return None
+        if len(active) == 1:
+            return active[0]
+        from pico.tools.permission.permission_hooks import CompositeHooks
+
+        return CompositeHooks(active)
+
+    def _get_or_create_token_usage_hook(self) -> Any:
+        """Lazily build the per-node ``TokenUsageHook``.
+
+        The hook is cheap (just a closure over ``self``) and idempotent so
+        we build it once and reuse it across turns. Returns ``None`` when
+        the feature is explicitly disabled via
+        ``agent.token_usage_streaming.enabled = false`` so callers can fall
+        back to the legacy turn-end-only emission path.
+        """
+        if not self._token_usage_streaming_enabled():
+            return None
+        existing = getattr(self, "_token_usage_hook_instance", None)
+        if existing is not None:
+            return existing
+        from pico.agent.node.token_usage_hook import TokenUsageHook
+
+        hook = TokenUsageHook(self)
+        self._token_usage_hook_instance = hook
+        return hook
+
+    def _token_usage_streaming_enabled(self) -> bool:
+        """Resolve the per-call token usage streaming toggle.
+
+        Defaults to ``True``; only an explicit ``False`` (under
+        ``agent.token_usage_streaming.enabled`` in ``agent.yml``) opts out.
+        Tolerates test doubles that bypass ``__init__`` and therefore have
+        no ``agent_config``.
+        """
+        cfg = getattr(self, "agent_config", None)
+        if cfg is None:
+            return True
+        streaming_cfg = getattr(cfg, "token_usage_streaming", None)
+        if streaming_cfg is None:
+            return True
+        enabled = getattr(streaming_cfg, "enabled", True)
+        return bool(enabled)
+
+    def _notify_status_dirty(self) -> None:
+        """Invoke the optional status-dirty callback (set by the CLI).
+
+        The CLI wires this to ``DatusApp.invalidate`` so a mid-turn token
+        usage update repaints the bottom toolbar immediately rather than
+        waiting for the next periodic redraw. No-op in API / headless
+        contexts where no callback is registered.
+        """
+        callback = getattr(self, "_status_dirty_callback", None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # noqa: BLE001 — never crash the run loop
+            logger.debug("Status dirty callback raised", exc_info=True)

@@ -1,0 +1,88 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+from enum import StrEnum
+
+
+class DBType(StrEnum):
+    """Built-in database dialect types (zero or minimal dependencies).
+
+    External dialects (mysql, postgresql, snowflake, etc.) are registered
+    dynamically via adapter packages and the ConnectorRegistry.
+    """
+
+    SQLITE = "sqlite"
+    DUCKDB = "duckdb"
+
+
+class LLMProvider(StrEnum):
+    """Large Language Model provider types supported by Pico."""
+
+    OPENAI = "openai"
+    CLAUDE = "claude"
+    DEEPSEEK = "deepseek"
+    QWEN = "qwen"
+    KIMI = "kimi"  # Moonshot Kimi models
+    ANTHROPIC = "anthropic"  # Alternative name for Claude
+    GEMINI = "gemini"
+    MINIMAX = "minimax"
+    GLM = "glm"
+    LLAMA = "llama"
+    GPT = "gpt"  # Alternative name for OpenAI
+    CODEX = "codex"  # OpenAI Codex (ChatGPT subscription, OAuth authentication)
+    OPENROUTER = "openrouter"  # OpenRouter unified AI gateway
+
+
+class EmbeddingProvider(StrEnum):
+    """Embedding model provider types supported by Pico."""
+
+    OPENAI = "openai"
+    SENTENCE_TRANSFORMERS = "sentence-transformers"
+    FASTEMBED = "fastembed"
+    HUGGINGFACE = "huggingface"
+
+
+# System sub-agents that are built-in and not user-configurable
+SYS_SUB_AGENTS = {
+    "semantic_modeling",
+    "gen_semantic_model",
+    "gen_metrics",
+    "gen_sql_summary",
+    "gen_sql",
+    "ask_metrics",
+    "gen_report",
+    "gen_visual_report",
+    "gen_visual_dashboard",
+    "gen_table",
+    "gen_job",
+    "gen_skill",
+    "feedback",
+}
+
+# Legacy semantic authoring names remain reserved so saved configurations keep
+# loading, but they are no longer discoverable or executable.
+RETIRED_SYS_SUB_AGENTS = frozenset({"gen_semantic_model", "gen_metrics"})
+
+# Subset of SYS_SUB_AGENTS hidden from user-facing listings (autocomplete and
+# the ".agent" selector). Internal agents may still be invoked by their owning
+# workflow; retired agents are rejected by the shared node factory.
+HIDDEN_SYS_SUB_AGENTS = {
+    "feedback",
+    *RETIRED_SYS_SUB_AGENTS,
+}
+
+
+class SQLType(StrEnum):
+    """SQL statement types."""
+
+    SELECT = "select"
+    INSERT = "insert"
+    UPDATE = "update"
+    DELETE = "delete"
+    MERGE = "merge"
+    DDL = "ddl"
+    METADATA_SHOW = "metadata"
+    EXPLAIN = "explain"
+    CONTENT_SET = "context_set"
+    UNKNOWN = "unknown"

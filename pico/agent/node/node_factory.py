@@ -1,0 +1,514 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Shared factory functions for creating interactive agentic nodes and their inputs.
+
+Used by CLI print mode and interactive REPL to avoid duplicating node creation logic.
+"""
+
+from typing import TYPE_CHECKING, Literal, Optional
+
+from pico.schemas.at_context import apply_at_context
+
+if TYPE_CHECKING:
+    from pico.configuration.agent_config import AgentConfig
+
+
+def create_interactive_node(
+    subagent_name: Optional[str],
+    agent_config: "AgentConfig",
+    node_id_suffix: str = "",
+    scope: Optional[str] = None,
+    *,
+    execution_mode: Literal["interactive", "workflow"] = "interactive",
+    node_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+):
+    """Create an interactive agentic node based on subagent_name.
+
+    Args:
+        subagent_name: Name of the subagent, or None for default chat node.
+        agent_config: Agent configuration.
+        node_id_suffix: Suffix appended to node_id (e.g. "_cli", "_print").
+        scope: Optional session scope for directory isolation.
+        execution_mode: Node execution mode. CLI defaults to ``interactive``;
+            API workflow runs pass ``workflow``.
+        node_id: Override the auto-generated ``f"{subagent_name}{node_id_suffix}"``
+            id. API path passes ``session_id`` here so the node's id matches the
+            HTTP session.
+        session_id: Optional resume target. When provided, forwarded into the
+            node constructor so :meth:`AgenticNode.restore_plan_mode_state` runs
+            before the first turn, rehydrating persisted plan-mode fields. When
+            omitted, the node eagerly generates a fresh ``session_id`` in its
+            ``__init__``.
+    """
+    if subagent_name:
+        from pico.agent.node.semantic_authoring import ensure_semantic_agent_available
+
+        ensure_semantic_agent_available(subagent_name, agent_config)
+        node_class_type = _resolve_node_class_type(subagent_name, agent_config)
+        from pico.utils.constants import RETIRED_SYS_SUB_AGENTS
+
+        if subagent_name == "semantic_modeling" or node_class_type in RETIRED_SYS_SUB_AGENTS:
+            from pico.agent.node.semantic_modeling_agentic_node import SemanticModelingAgenticNode
+
+            return SemanticModelingAgenticNode(
+                agent_config=agent_config, execution_mode=execution_mode, scope=scope, session_id=session_id
+            )
+
+        elif subagent_name == "gen_sql_summary":
+            from pico.agent.node.sql_summary_agentic_node import SqlSummaryAgenticNode
+
+            return SqlSummaryAgenticNode(
+                node_name=subagent_name,
+                agent_config=agent_config,
+                execution_mode=execution_mode,
+                scope=scope,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "gen_table" or node_class_type == "gen_table":
+            from pico.agent.node.gen_table_agentic_node import GenTableAgenticNode
+
+            return GenTableAgenticNode(
+                agent_config=agent_config,
+                execution_mode=execution_mode,
+                node_name=subagent_name if node_class_type == "gen_table" else None,
+                scope=scope,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "gen_job":
+            from pico.agent.node.gen_job_agentic_node import GenJobAgenticNode
+
+            return GenJobAgenticNode(
+                agent_config=agent_config, execution_mode=execution_mode, scope=scope, session_id=session_id
+            )
+
+        elif subagent_name == "ask_metrics" or node_class_type == "ask_metrics":
+            from pico.agent.node.ask_metrics_agentic_node import AskMetricsAgenticNode
+            from pico.configuration.node_type import NodeType
+
+            return AskMetricsAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Metric question-answering node for {subagent_name}",
+                node_type=NodeType.TYPE_ASK_METRICS,
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "gen_report" or node_class_type == "gen_report":
+            from pico.agent.node.gen_report_agentic_node import GenReportAgenticNode
+
+            return GenReportAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Report generation node for {subagent_name}",
+                node_type="gen_report",
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "gen_visual_report" or node_class_type == "gen_visual_report":
+            from pico.agent.node.gen_visual_report_agentic_node import GenVisualReportAgenticNode
+
+            return GenVisualReportAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Visual report generation node for {subagent_name}",
+                node_type="gen_visual_report",
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "gen_visual_dashboard" or node_class_type == "gen_visual_dashboard":
+            from pico.agent.node.gen_visual_dashboard_agentic_node import GenVisualDashboardAgenticNode
+
+            return GenVisualDashboardAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Visual dashboard generation node for {subagent_name}",
+                node_type="gen_visual_dashboard",
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "explore" or node_class_type == "explore":
+            # Wire the read-only `explore` sub-agent into the interactive
+            # path. `ExploreAgenticNode` is a first-class node type (see
+            # pico/configuration/node_type.py TYPE_EXPLORE) that exposes
+            # db_tools / context_search / filesystem in read-only mode. It's
+            # used by the DAComp runner to chain explore -> dbt_layered so
+            # the second agent sees pre-flight data-reality findings in its
+            # user prompt instead of having to run the discovery itself.
+            from pico.agent.node.explore_agentic_node import ExploreAgenticNode
+
+            return ExploreAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Explore node for {subagent_name}",
+                node_type="explore",
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "gen_skill" or node_class_type == "gen_skill":
+            from pico.agent.node.gen_skill_agentic_node import SkillCreatorAgenticNode
+
+            return SkillCreatorAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Skill generation node for {subagent_name}",
+                node_type="gen_skill",
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name if node_class_type == "gen_skill" else "gen_skill",
+                execution_mode=execution_mode,
+                scope=scope,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "feedback":
+            from pico.agent.node.feedback_agentic_node import FeedbackAgenticNode
+
+            return FeedbackAgenticNode(
+                agent_config=agent_config,
+                execution_mode=execution_mode,
+                scope=scope,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "ask_report" or node_class_type == "ask_report":
+            from pico.agent.node.ask_report_agentic_node import AskReportAgenticNode
+            from pico.configuration.node_type import NodeType
+
+            # ask_* subagents are conversational (ChatAgenticNode subclass),
+            # so they reuse ``NodeType.TYPE_CHAT`` rather than minting a new
+            # action type. The behavioural difference (artifact binding,
+            # constrained filesystem root, prompt prefix) lives entirely on
+            # the class; the node-level type just signals "chat-flavored".
+            return AskReportAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Ask-report follow-up node for {subagent_name}",
+                node_type=NodeType.TYPE_CHAT,
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        elif subagent_name == "ask_dashboard" or node_class_type == "ask_dashboard":
+            from pico.agent.node.ask_dashboard_agentic_node import AskDashboardAgenticNode
+            from pico.configuration.node_type import NodeType
+
+            return AskDashboardAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"Ask-dashboard follow-up node for {subagent_name}",
+                node_type=NodeType.TYPE_CHAT,
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+
+        else:
+            from pico.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+
+            return GenSQLAgenticNode(
+                node_id=node_id if node_id is not None else f"{subagent_name}{node_id_suffix}",
+                description=f"SQL generation node for {subagent_name}",
+                node_type="gen_sql",
+                input_data=None,
+                agent_config=agent_config,
+                tools=None,
+                node_name=subagent_name,
+                scope=scope,
+                execution_mode=execution_mode,
+                session_id=session_id,
+            )
+    else:
+        from pico.agent.node.chat_agentic_node import ChatAgenticNode
+
+        return ChatAgenticNode(
+            node_id=node_id if node_id is not None else f"chat{node_id_suffix}",
+            description="Chat node for interactive mode",
+            node_type="chat",
+            input_data=None,
+            agent_config=agent_config,
+            tools=None,
+            scope=scope,
+            execution_mode=execution_mode,
+            session_id=session_id,
+        )
+
+
+def create_node_input(
+    user_message: str,
+    node,
+    catalog: Optional[str] = None,
+    database: Optional[str] = None,
+    db_schema: Optional[str] = None,
+    scoped_tables=None,
+    at_tables=None,
+    at_metrics=None,
+    at_sqls=None,
+    external_knowledge: Optional[str] = None,
+    context_hints=None,
+    prompt_language: str = "en",
+    plan_mode: bool = False,
+    source_session_id: Optional[str] = None,
+):
+    """Create node input for *node*, then attach resolved @-context uniformly.
+
+    The type dispatch lives in :func:`_build_typed_node_input`; @-context
+    (``at_tables`` / ``at_metrics`` / ``at_sqls`` / ``external_knowledge``) is
+    applied here through the single :func:`apply_at_context` choke point so no
+    per-node branch can forget it. Any input inheriting
+    :class:`~pico.schemas.at_context.AtContextInput` picks the context up;
+    others are skipped silently.
+
+    Args:
+        user_message: The user's message.
+        node: The target node instance (used for isinstance dispatch).
+        catalog: Optional catalog name.
+        database: Optional database name.
+        db_schema: Optional schema name.
+        at_tables: @-referenced tables.
+        at_metrics: @-referenced metrics.
+        at_sqls: @-referenced SQL queries.
+        external_knowledge: @-referenced supplementary knowledge text.
+        prompt_language: Language for prompts (default "en").
+        plan_mode: Whether to enable plan mode.
+        source_session_id: Source session the feedback node should copy from.
+            Only consumed by :class:`FeedbackAgenticNode`.
+    """
+    node_input = _build_typed_node_input(
+        user_message=user_message,
+        node=node,
+        catalog=catalog,
+        database=database,
+        db_schema=db_schema,
+        scoped_tables=scoped_tables,
+        prompt_language=prompt_language,
+        plan_mode=plan_mode,
+        source_session_id=source_session_id,
+    )
+    return apply_at_context(
+        node_input,
+        schemas=at_tables,
+        metrics=at_metrics,
+        reference_sql=at_sqls,
+        external_knowledge=external_knowledge,
+        context_hints=context_hints,
+    )
+
+
+def _build_typed_node_input(
+    user_message: str,
+    node,
+    catalog: Optional[str] = None,
+    database: Optional[str] = None,
+    db_schema: Optional[str] = None,
+    scoped_tables=None,
+    prompt_language: str = "en",
+    plan_mode: bool = False,
+    source_session_id: Optional[str] = None,
+):
+    """Construct the node-type-specific input object (no @-context wiring)."""
+    from pico.agent.node.ask_metrics_agentic_node import AskMetricsAgenticNode
+    from pico.agent.node.gen_job_agentic_node import GenJobAgenticNode
+    from pico.agent.node.gen_report_agentic_node import GenReportAgenticNode
+    from pico.agent.node.gen_sql_agentic_node import GenSQLAgenticNode
+    from pico.agent.node.gen_table_agentic_node import GenTableAgenticNode
+    from pico.agent.node.gen_visual_dashboard_agentic_node import GenVisualDashboardAgenticNode
+    from pico.agent.node.gen_visual_report_agentic_node import GenVisualReportAgenticNode
+    from pico.agent.node.semantic_modeling_agentic_node import SemanticModelingAgenticNode
+    from pico.agent.node.sql_summary_agentic_node import SqlSummaryAgenticNode
+
+    if isinstance(
+        node,
+        (
+            SemanticModelingAgenticNode,
+            GenTableAgenticNode,
+            GenJobAgenticNode,
+        ),
+    ):
+        from pico.schemas.semantic_agentic_node_models import SemanticNodeInput
+
+        return SemanticNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+            prompt_language=prompt_language,
+        )
+
+    elif isinstance(node, SqlSummaryAgenticNode):
+        from pico.schemas.sql_summary_agentic_node_models import SqlSummaryNodeInput
+
+        return SqlSummaryNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+            prompt_language=prompt_language,
+        )
+
+    elif isinstance(node, GenReportAgenticNode):
+        from pico.schemas.gen_report_agentic_node_models import GenReportNodeInput
+
+        return GenReportNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+        )
+
+    elif isinstance(node, AskMetricsAgenticNode):
+        from pico.schemas.ask_metrics_agentic_node_models import AskMetricsNodeInput
+
+        return AskMetricsNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+        )
+
+    elif isinstance(node, GenVisualReportAgenticNode):
+        from pico.schemas.gen_visual_report_models import GenVisualReportNodeInput
+
+        return GenVisualReportNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+        )
+
+    elif isinstance(node, GenVisualDashboardAgenticNode):
+        from pico.schemas.gen_visual_dashboard_models import GenVisualDashboardNodeInput
+
+        return GenVisualDashboardNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+        )
+
+    elif isinstance(node, GenSQLAgenticNode):
+        from pico.schemas.gen_sql_agentic_node_models import GenSQLNodeInput
+
+        return GenSQLNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+            prompt_language=prompt_language,
+            plan_mode=plan_mode,
+        )
+
+    # ExploreAgenticNode is a read-only data exploration node. It takes
+    # ExploreNodeInput (user_message + optional database). This branch is
+    # required for the DAComp runner's explore -> dbt_layered chain where
+    # the runner instantiates an `explore` sub-agent via
+    # create_interactive_node() and then needs a matching input type.
+    from pico.agent.node.explore_agentic_node import ExploreAgenticNode
+
+    if isinstance(node, ExploreAgenticNode):
+        from pico.schemas.explore_agentic_node_models import ExploreNodeInput
+
+        return ExploreNodeInput(
+            user_message=user_message,
+            database=database,
+            scoped_tables=list(scoped_tables) if scoped_tables else None,
+        )
+
+    from pico.agent.node.gen_skill_agentic_node import SkillCreatorAgenticNode
+
+    if isinstance(node, SkillCreatorAgenticNode):
+        from pico.schemas.gen_skill_agentic_node_models import SkillCreatorNodeInput
+
+        return SkillCreatorNodeInput(user_message=user_message)
+
+    from pico.agent.node.feedback_agentic_node import FeedbackAgenticNode
+
+    if isinstance(node, FeedbackAgenticNode):
+        from pico.schemas.feedback_agentic_node_models import FeedbackNodeInput
+
+        # CLI path leaves source_session_id=None because _copy_session_for_switch
+        # seeds the feedback node's session directly. API/Gateway paths pass a
+        # real source_session_id so the node copies the source session itself.
+        return FeedbackNodeInput(
+            user_message=user_message,
+            database=database,
+            source_session_id=source_session_id,
+        )
+
+    else:
+        from pico.schemas.chat_agentic_node_models import ChatNodeInput
+
+        return ChatNodeInput(
+            user_message=user_message,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+            plan_mode=plan_mode,
+        )
+
+
+def resolve_node_name(subagent_name: Optional[str]) -> str:
+    """Return the canonical ``get_node_name()`` for a factory-produced node.
+
+    Mirrors :func:`create_interactive_node` so callers that need the node name
+    *before* construction (e.g. to compute a session_id prefix via
+    :meth:`SessionManager.copy_session`) don't have to instantiate the node.
+
+    For every subagent dispatched by :func:`create_interactive_node`, the
+    resulting node's ``get_node_name()`` equals ``subagent_name`` (or ``"chat"``
+    when ``subagent_name`` is ``None``). Aliased custom subagents are no
+    exception: the factory threads ``subagent_name`` into ``node_name``,
+    which becomes ``configured_node_name``.
+    """
+    return subagent_name or "chat"
+
+
+def _resolve_node_class_type(subagent_name: str, agent_config: "AgentConfig") -> Optional[str]:
+    """Resolve runtime node class from agent config for a subagent.
+
+    ``node_class`` wins for older/custom yaml, while API-created agents store
+    the selected runtime class under ``type``.
+    """
+    if hasattr(agent_config, "agentic_nodes") and agent_config.agentic_nodes:
+        node_config = agent_config.agentic_nodes.get(subagent_name, {})
+        if hasattr(node_config, "model_dump"):
+            node_config = node_config.model_dump()
+        if isinstance(node_config, dict):
+            return node_config.get("node_class") or node_config.get("type")
+    return None

@@ -1,0 +1,1491 @@
+"""
+Chat Task Manager — decouples the agentic loop into background asyncio.Tasks.
+
+The agentic loop runs in a background Task, writing SSE events to a buffer.
+SSE endpoints consume events from the buffer via ``consume_events``.
+Disconnecting a client does **not** cancel the background computation;
+the client can reconnect and resume from where it left off.
+"""
+
+import asyncio
+import copy
+import os
+import uuid
+from datetime import datetime
+from typing import Any, AsyncGenerator, Dict, List, Literal, Optional
+
+from pico.agent.node.agentic_node import AgenticNode
+from pico.api.models.cli_models import (
+    IMessageContent,
+    SSEDataType,
+    SSEEndData,
+    SSEErrorData,
+    SSEEvent,
+    SSEMessageData,
+    SSEMessagePayload,
+    SSEPingData,
+    SSESessionData,
+    SSEUsageData,
+    StreamChatInput,
+)
+from pico.api.services.action_sse_converter import action_to_sse_event
+from pico.cli.autocomplete import AtReferenceCompleter
+from pico.cli.execution_state import PendingInputQueue
+from pico.configuration.agent_config import AgentConfig
+from pico.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from pico.schemas.node_models import Metric, ReferenceSql, TableSchema
+from pico.tools.proxy.proxy_tool import apply_proxy_tools
+from pico.utils.loggings import get_logger
+from pico.utils.path_manager import set_current_path_manager
+from pico.utils.time_utils import now_utc_iso
+from pico.utils.trace_context import (
+    build_chat_trace_context,
+    reset_trace_context,
+    resolve_trace_identity,
+    set_trace_context,
+)
+
+
+def _release_stamp() -> Optional[str]:
+    """Build identity for the running agent.
+
+    ``PICO_RELEASE`` wins so a deployment can stamp the image tag it actually
+    rolled out; the package version is the fallback for anything that runs
+    outside a container.
+    """
+    release = os.environ.get("PICO_RELEASE")
+    if release and release.strip():
+        return release.strip()
+    try:
+        from pico import __version__
+
+        return str(__version__).strip() or None
+    except Exception:  # noqa: BLE001 - never fail a chat turn over a version lookup
+        return None
+
+
+logger = get_logger(__name__)
+
+HEARTBEAT_INTERVAL = 10  # seconds
+
+# Max run-boundary auto-continuations per task, bounding a client that keeps
+# POSTing /chat/insert from running one task indefinitely.
+_MAX_INSERT_CONTINUATIONS = 20
+
+
+def is_thinking_only_content(content_items) -> bool:
+    """Return True if all content items are thinking chunks (i.e. a delta message).
+
+    Used by both the SSE coalescing logic and the bridge outbound conversion
+    to avoid duplicating the detection heuristic.
+    """
+    return bool(content_items) and all(getattr(item, "type", "") == "thinking" for item in content_items)
+
+
+def _is_thinking_delta(event: SSEEvent) -> bool:
+    """Return True if *event* is a thinking delta (consecutive-mergeable)."""
+    if event.event != "message":
+        return False
+    data = event.data
+    if not isinstance(data, SSEMessageData):
+        return False
+    if data.type not in (SSEDataType.CREATE_MESSAGE, SSEDataType.APPEND_MESSAGE):
+        return False
+    return is_thinking_only_content(data.payload.content)
+
+
+def _delta_message_id(event: SSEEvent) -> str:
+    """Extract the message_id from a thinking-delta event.
+
+    Callers must ensure *event* passes ``_is_thinking_delta`` first.
+    """
+    data = event.data
+    if isinstance(data, SSEMessageData):
+        return data.payload.message_id
+    return ""
+
+
+def _has_visible_content(event: SSEEvent) -> bool:
+    if event.event != "message" or not isinstance(event.data, SSEMessageData):
+        return False
+    return any(bool(getattr(item, "payload", {}).get("content")) for item in event.data.payload.content)
+
+
+def _assistant_content_fingerprint(event: SSEEvent) -> str:
+    if event.event != "message" or not isinstance(event.data, SSEMessageData):
+        return ""
+    if event.data.payload.role != "assistant":
+        return ""
+    parts = []
+    for item in event.data.payload.content:
+        if item.type not in {"markdown", "thinking", "code"}:
+            continue
+        payload = getattr(item, "payload", {}) or {}
+        content = payload.get("content")
+        if content:
+            parts.append(str(content).strip())
+    return "\n".join(part for part in parts if part)
+
+
+def _should_skip_duplicate_assistant_message(
+    action,
+    event: SSEEvent,
+    seen_fingerprints: dict[str, str],
+) -> bool:
+    """Return True when this event repeats text already sent this turn.
+
+    ``seen_fingerprints`` maps rendered text -> the message_id that first
+    carried it, because UPDATE has to be judged differently from CREATE:
+
+    * CREATE re-stating known text is always a duplicate.
+    * UPDATE re-stating it is a duplicate only under a *different* message_id.
+      An UPDATE on the id that already owns the text is the legitimate
+      overwrite path (streamed thinking deltas replaced by the finished
+      response, ``finalize_progress`` stepping one bubble through its stages).
+
+    Judging UPDATE at all is the point: one assistant turn carrying text plus N
+    parallel tool calls opens N ``thinking_stream_*`` messages that each stream
+    the same prose and each close with an UPDATE. Skipping UPDATE entirely —
+    which this did — let all N through, and a mission thread rendered the same
+    paragraph four times in a row.
+    """
+    if action.role != ActionRole.ASSISTANT or action.status != ActionStatus.SUCCESS:
+        return False
+    if action.action_type == "thinking_delta":
+        return False
+    if event.event != "message" or not isinstance(event.data, SSEMessageData):
+        return False
+    if event.data.type not in (SSEDataType.CREATE_MESSAGE, SSEDataType.UPDATE_MESSAGE):
+        return False
+
+    fingerprint = _assistant_content_fingerprint(event)
+    if not fingerprint:
+        return False
+
+    owner = seen_fingerprints.get(fingerprint)
+    if owner is None:
+        return False
+    if event.data.type == SSEDataType.UPDATE_MESSAGE:
+        return owner != event.data.payload.message_id
+    return True
+
+
+def _remember_assistant_message(event: SSEEvent, seen_fingerprints: dict[str, str]) -> None:
+    fingerprint = _assistant_content_fingerprint(event)
+    if not fingerprint:
+        return
+    # First writer wins — it is the one whose UPDATEs stay legitimate.
+    seen_fingerprints.setdefault(fingerprint, _message_id_of(event))
+
+
+def _message_id_of(event: SSEEvent) -> str:
+    data = event.data
+    return data.payload.message_id if isinstance(data, SSEMessageData) else ""
+
+
+def _should_include_final_response(action, assistant_response_sent: bool) -> bool:
+    """Return True for top-level wrapper responses that should be rendered.
+
+    Sub-agent actions are forwarded with ``depth > 0``. Their own
+    ``*_response`` wrappers must stay inside the tool/sub-agent transcript and
+    must not become the top-level assistant bubble.
+    """
+    return (
+        action.role == ActionRole.ASSISTANT
+        and action.status == ActionStatus.SUCCESS
+        and getattr(action, "depth", 0) == 0
+        and bool(action.action_type)
+        and action.action_type.endswith("_response")
+        and not assistant_response_sent
+    )
+
+
+def _is_visible_assistant_response(action, event: SSEEvent, *, tool_result_seen: bool) -> bool:
+    """Return True when an action already emitted user-visible assistant text.
+
+    Model providers do not agree on whether final text appears as ``response``,
+    ``message`` or a completed thinking chunk. For web de-duping we care about
+    the observable SSE message: after a tool result, any visible assistant text
+    means the wrapper ``chat_response`` would duplicate it.
+    """
+    if action.role != ActionRole.ASSISTANT or action.status != ActionStatus.SUCCESS:
+        return False
+    if not action.action_type or action.action_type == "thinking_delta" or action.action_type.endswith("_response"):
+        return False
+    if not _has_visible_content(event):
+        return False
+    output = action.output if isinstance(action.output, dict) else {}
+    return tool_result_seen or output.get("is_thinking") is not True
+
+
+def _coalesce_deltas(events: list[SSEEvent]) -> list[SSEEvent]:
+    """Merge consecutive thinking-delta events **for the same message** into single events.
+
+    Non-delta events pass through unchanged and break any ongoing run of deltas.
+    A change in ``message_id`` between adjacent deltas also breaks the run so
+    that deltas from different logical messages are never merged together.
+    """
+    if not events:
+        return []
+
+    result: list[SSEEvent] = []
+    run_start: int | None = None  # index of first delta in the current run
+    run_msg_id: str = ""  # message_id of the current run
+
+    for i, ev in enumerate(events):
+        if _is_thinking_delta(ev):
+            msg_id = _delta_message_id(ev)
+            if run_start is None:
+                run_start = i
+                run_msg_id = msg_id
+            elif msg_id != run_msg_id:
+                # Different message — flush the current run and start a new one
+                result.append(_merge_delta_run(events[run_start:i]))
+                run_start = i
+                run_msg_id = msg_id
+        else:
+            # Flush any accumulated delta run before emitting this non-delta
+            if run_start is not None:
+                result.append(_merge_delta_run(events[run_start:i]))
+                run_start = None
+            result.append(ev)
+
+    # Flush trailing delta run
+    if run_start is not None:
+        result.append(_merge_delta_run(events[run_start:]))
+
+    return result
+
+
+def _merge_delta_run(run: list[SSEEvent]) -> SSEEvent:
+    """Merge a non-empty run of thinking-delta events into a single event."""
+    if len(run) == 1:
+        return run[0]
+
+    first = run[0]
+    # Concatenate the text from content[0].payload["content"] of each event
+    parts: list[str] = []
+    for ev in run:
+        data = ev.data
+        if not isinstance(data, SSEMessageData):  # guaranteed by caller; guard for safety
+            continue
+        for item in data.payload.content:
+            parts.append(item.payload.get("content", ""))
+
+    merged_content_items = copy.deepcopy(first.data.payload.content)  # type: ignore[union-attr]
+    # Replace the first item's text with the concatenated text
+    if merged_content_items:
+        merged_content_items[0].payload["content"] = "".join(parts)
+        # Keep only one content item for the merged event
+        merged_content_items = merged_content_items[:1]
+
+    merged_payload = copy.deepcopy(first.data.payload)  # type: ignore[union-attr]
+    merged_payload.content = merged_content_items
+    merged_data = SSEMessageData(type=first.data.type, payload=merged_payload)  # type: ignore[union-attr]
+
+    return SSEEvent(
+        id=first.id,
+        event=first.event,
+        data=merged_data,
+        timestamp=first.timestamp,
+    )
+
+
+def _fill_database_context(
+    agent_config: Optional[AgentConfig],
+    catalog: Optional[str] = None,
+    database: Optional[str] = None,
+    schema: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve API database context without changing the active datasource."""
+    config = None
+    if agent_config is not None:
+        try:
+            config = agent_config.current_db_config()
+        except Exception:
+            config = None
+
+    def first_string(*values):
+        for value in values:
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    return (
+        first_string(catalog, getattr(config, "catalog", None)),
+        first_string(database, getattr(config, "database", None)),
+        first_string(schema, getattr(config, "schema", None)),
+    )
+
+
+class ChatTask:
+    """Represents a single running agentic loop."""
+
+    def __init__(self, session_id: str, asyncio_task: asyncio.Task):
+        self.session_id = session_id
+        self.asyncio_task = asyncio_task
+        self.node: Optional[AgenticNode] = None
+        self.events: list[SSEEvent] = []
+        self.status: str = "running"  # running | completed | error | cancelled
+        self.condition = asyncio.Condition()
+        self.created_at = datetime.now()
+        self.error: Optional[str] = None
+        self.consumer_offset: int = 0
+        # Created up-front — before the node exists — so ``POST /chat/insert``
+        # can enqueue during node startup (node creation is an ``await
+        # to_thread`` that can take hundreds of ms). ``_run_loop`` points the
+        # node at this same instance, so the filter drains these on turn one.
+        self.pending_input_queue: PendingInputQueue = PendingInputQueue()
+        # Whether ``/chat/insert`` may still enqueue. ``_run_loop`` flips this
+        # off once it stops draining (final drain empty), so inserts arriving
+        # during the run's tail (persist / usage / end events) get
+        # SESSION_NOT_RUNNING and the client falls back to a fresh turn, rather
+        # than enqueueing with nothing left to drain them.
+        self.accepting_inserts: bool = True
+        # Pico patch P1: the user_id that started this task; None = anonymous/single-tenant.
+        self.owner_user_id: Optional[str] = None
+
+
+COMPLETED_TASK_TTL = 300  # seconds to keep completed tasks for resume
+
+# Web clients run a FULL server-side bash (all commands allowed), confined by
+# the strict OS sandbox rather than a command whitelist — see ``start_chat``.
+WEB_BASH_ALLOWED_PATTERNS = ["*"]
+
+
+class ChatTaskManager:
+    """Per-project manager for active chat tasks.
+
+    Owned by DatusService — one instance per cached project.
+    """
+
+    def __init__(
+        self,
+        default_source: Optional[str] = None,
+        default_interactive: bool = True,
+        stream_thinking: bool = False,
+    ) -> None:
+        self._tasks: Dict[str, ChatTask] = {}
+        self._completed_tasks: Dict[str, ChatTask] = {}
+        self._default_source = default_source
+        self._default_interactive = default_interactive
+        self._stream_thinking = stream_thinking
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def start_chat(
+        self,
+        agent_config: AgentConfig,
+        request: StreamChatInput,
+        sub_agent_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
+    ) -> ChatTask:
+        """Create a background task for the agentic loop.
+            :param sub_agent_id: builtin name or custom sub-agent DB ID
+        Raises ``ValueError`` if a task is already running for the session.
+        """
+        # Clone config to avoid cross-request mutation of shared AgentConfig
+        agent_config = copy.deepcopy(agent_config)
+        agent_config.policy_context = dict(policy_context or {})
+        # API surface has no interactive broker to confirm EXTERNAL file
+        # access, so force filesystem strict mode — every node constructed
+        # below reads this flag via AgenticNode._resolve_filesystem_strict().
+        agent_config.filesystem_strict = True
+        # API responses render dashboards/reports dynamically server-side
+        # (e.g. /dashboard/detail); never compile the CLI's standalone HTML.
+        agent_config.compile_visual_html = False
+        # Multi-tenant API surface: the AgentConfig may be supplied by an
+        # AuthProvider and the agent must never modify configuration. Hides
+        # ``requires_mutable_config`` setup skills and switches the plugin
+        # prompt preamble to read-only wording. Set on the per-request clone
+        # only — the shared config keeps its default.
+        agent_config.config_mutable = False
+        # vscode owns its own local shell: the daemon must not offer a
+        # server-side BashTool at all. web has no shell of its own; it runs a
+        # FULL server-side bash (all commands allowed) confined by the strict
+        # OS sandbox instead of a command whitelist. Strict gives
+        # kernel-enforced file isolation (workspace + tmp + explicit allowlist
+        # only, ``~/.pico`` blocked) plus a minimized child environment that
+        # hides process-wide secrets — a far stronger boundary than the old
+        # ``pico*``-prefix soft whitelist. Fail-closed: if no OS sandbox
+        # mechanism is available (e.g. a Linux host without bubblewrap) the
+        # tool rejects every command rather than run it unconfined. An
+        # agent.yml ``bash.enabled: false`` still wins: this never re-enables a
+        # disabled tool. ``project_root`` is intentionally left untouched — web
+        # keeps its configured root, and the read-only
+        # ``AgentConfig.project_root`` property already falls back to the launch
+        # CWD when no root was supplied, so an empty project_root naturally
+        # resolves to the current directory.
+        effective_source = request.source or self._default_source
+        if effective_source == "vscode":
+            agent_config.bash_tool_enabled = False
+        elif effective_source == "web":
+            agent_config.bash_allowed_patterns = WEB_BASH_ALLOWED_PATTERNS
+            agent_config.bash_sandbox.enabled = True
+            agent_config.bash_sandbox.mode = "strict"
+        # Stash the resolved source on the cloned config so downstream nodes
+        # can adapt prompt-side hints to the front-end (e.g. vscode renders
+        # the literal "." for the SQL files root because the IDE owns its own
+        # workspace path).
+        agent_config._client_source = effective_source
+        # Who dispatched this run. Read by ``_setup_task_result_tool`` to decide
+        # whether the agent gets a way to declare a structured outcome. Stashed
+        # on the cloned config, like _client_source, so concurrent requests on
+        # the same project do not see each other's origin.
+        agent_config._request_origin = getattr(request, "origin", None)
+        # Per-request response language override. Empty / None keeps the
+        # yaml-level ``agent.language`` default intact.
+        if request.language:
+            agent_config.language = request.language
+        if request.model:
+            provider, _, model_id = request.model.partition("/")
+            if not model_id:
+                raise ValueError(f"Invalid model format '{request.model}': expected 'provider/model_id'")
+            if provider == "custom":
+                agent_config.set_active_custom(model_id, persist=False)
+            else:
+                agent_config.set_active_provider_model(provider, model_id, persist=False)
+        # Per-request datasource override (e.g. an IM channel pinned to a datasource).
+        # Switches the connection profile; the setter validates it exists in config.
+        if request.datasource:
+            agent_config.current_datasource = request.datasource
+        request.catalog, request.database, request.db_schema = _fill_database_context(
+            agent_config,
+            catalog=request.catalog,
+            database=request.database,
+            schema=request.db_schema,
+        )
+        agent_name = sub_agent_id or "chat"
+        safe_name = agent_name.replace(" ", "_")
+        session_id = request.session_id or f"{safe_name}_session_{str(uuid.uuid4())[:8]}"
+        request.session_id = session_id
+
+        if session_id in self._tasks:
+            raise ValueError(f"A task is already running for session {session_id}")
+
+        # Placeholder — asyncio_task set immediately after
+        task = ChatTask(session_id=session_id, asyncio_task=None)  # type: ignore[arg-type]
+        task.owner_user_id = user_id
+        self._tasks[session_id] = task
+
+        asyncio_task = asyncio.create_task(
+            self._run_loop(
+                task,
+                agent_config,
+                request,
+                sub_agent_id=sub_agent_id,
+                user_id=user_id,
+            )
+        )
+        task.asyncio_task = asyncio_task
+        return task
+
+    async def stop_task(self, session_id: str, user_id: Optional[str] = None) -> bool:
+        """Stop a running task by interrupting its node."""
+        task = self._tasks.get(session_id)
+        if not task or (task.owner_user_id is not None and task.owner_user_id != user_id):
+            return False
+
+        if task.node:
+            try:
+                task.node.interrupt_controller.interrupt()
+                logger.info(f"Interrupted running task: {session_id}")
+            except Exception as e:
+                logger.error(f"Failed to interrupt task {session_id}: {e}")
+
+        if task.asyncio_task and not task.asyncio_task.done():
+            task.asyncio_task.cancel()
+            logger.info(f"Cancelled asyncio task: {session_id}")
+            return True
+
+        return False
+
+    def has_active_tasks(self) -> bool:
+        """Return True if any task is still running."""
+        return any(t.status == "running" for t in self._tasks.values())
+
+    def get_task(self, session_id: str, user_id: Optional[str] = None) -> Optional[ChatTask]:
+        task = self._tasks.get(session_id) or self._completed_tasks.get(session_id)
+        if task is None:
+            return None
+        # Pico patch P1: owned tasks are invisible to every other caller.
+        if task.owner_user_id is not None and task.owner_user_id != user_id:
+            return None
+        return task
+
+    async def consume_events(self, task: ChatTask, start_from: Optional[int] = None) -> AsyncGenerator[SSEEvent, None]:
+        """Yield events from *task*'s buffer.
+
+        If *start_from* is ``None``, resume from the last recorded
+        ``consumer_offset`` — but back up by one event so the client
+        can safely re-process the last event it may not have fully handled.
+        """
+        if start_from is not None:
+            cursor = start_from
+        else:
+            cursor = max(task.consumer_offset - 1, 0)
+
+        while True:
+            ping_event = None
+            async with task.condition:
+                while cursor >= len(task.events) and task.status == "running":
+                    try:
+                        await asyncio.wait_for(task.condition.wait(), timeout=HEARTBEAT_INTERVAL)
+                    except asyncio.TimeoutError:
+                        if cursor >= len(task.events) and task.status == "running":
+                            ping_event = SSEEvent(
+                                id=-1,
+                                event="ping",
+                                data=SSEPingData(),
+                                timestamp=now_utc_iso(),
+                            )
+                            break  # exit inner loop so ping can be yielded
+                new_events = task.events[cursor:]
+                is_done = task.status != "running"
+
+            # Yield outside the lock to avoid blocking producers
+            if ping_event is not None:
+                yield ping_event
+
+            coalesced = _coalesce_deltas(new_events)
+            for event in coalesced:
+                yield event
+            cursor += len(new_events)
+            task.consumer_offset = cursor
+
+            if is_done and cursor >= len(task.events):
+                break
+
+    async def wait_all_tasks(self) -> None:
+        """Wait for all running tasks to finish without cancelling them."""
+        pending = [t.asyncio_task for t in self._tasks.values() if t.asyncio_task and not t.asyncio_task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def shutdown(self) -> None:
+        """Cancel every running task (called at application shutdown)."""
+        for task in list(self._tasks.values()):
+            if task.asyncio_task and not task.asyncio_task.done():
+                task.asyncio_task.cancel()
+        pending = [t.asyncio_task for t in self._tasks.values() if t.asyncio_task and not t.asyncio_task.done()]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._tasks.clear()
+        self._completed_tasks.clear()
+
+    # ------------------------------------------------------------------
+    # Background loop (full agentic loop implementation)
+    # ------------------------------------------------------------------
+
+    async def _run_loop(
+        self,
+        task: ChatTask,
+        agent_config: AgentConfig,
+        request: StreamChatInput,
+        sub_agent_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+    ) -> None:
+        """Execute the full agentic loop, pushing SSE events to the task buffer."""
+        session_id = task.session_id
+        event_id = 0
+        trace_token = None
+
+        # Pin the path manager into this task's context. Required when the caller
+        # dispatched us from a thread that never inherited AgentConfig's ContextVar
+        # (e.g. gateway bridge dispatching from an IM SDK worker thread via
+        # ``asyncio.run_coroutine_threadsafe``); otherwise downstream stores fall
+        # back to ``get_path_manager()`` and get an empty project_name.
+        set_current_path_manager(agent_config.path_manager)
+
+        try:
+            start_time = datetime.now()
+
+            # Snapshot the turn counter BEFORE the run so the @-context persist
+            # below only fires when this run actually adds a new user turn.
+            pre_turn_number = await asyncio.to_thread(self._max_user_turn_number, agent_config, session_id, user_id)
+
+            # 1. Create node.
+            #    Runs in thread pool because setup_tools() triggers synchronous
+            #    operations (psycopg ConnectionPool creation, PG DDL for table
+            #    creation via get_storage()) that would freeze the event loop.
+            interactive_enabled = request.interactive if request.interactive is not None else self._default_interactive
+
+            def _init_node():
+                # Feedback runs triggered with a source_session_id pre-copy the
+                # source conversation into a fresh feedback session file BEFORE
+                # node construction. The node then opens that cloned id directly
+                # — no post-construction mutation needed.
+                feedback_session_id: Optional[str] = None
+                if sub_agent_id == "feedback" and request.source_session_id:
+                    from pico.models.session_manager import SessionManager
+                    from pico.utils.path_manager import get_path_manager
+
+                    base_dir = getattr(agent_config, "session_dir", None) or str(
+                        get_path_manager(agent_config=agent_config).sessions_dir
+                    )
+                    sm = SessionManager(session_dir=base_dir, scope=user_id)
+                    feedback_session_id = sm.copy_session(request.source_session_id, "feedback")
+
+                return self._create_node(
+                    agent_config,
+                    subagent_id=sub_agent_id,
+                    node_id=session_id,
+                    user_id=user_id,
+                    interactive=interactive_enabled,
+                    session_id=feedback_session_id,
+                )
+
+            node = await asyncio.to_thread(_init_node)
+            task.node = node
+            # Enable mid-run insert (steering): point the node at the
+            # task-scoped queue that ``start_chat`` created before the node
+            # existed, so messages POSTed to ``/chat/insert`` during node
+            # startup are preserved. The model layer's
+            # ``call_model_input_filter`` — wired ONLY when the queue is
+            # non-None — injects queued messages at the next LLM turn boundary.
+            # Without this the API path silently drops mid-run messages (the
+            # CLI wires its own queue in chat_commands).
+            node.pending_input_queue = task.pending_input_queue
+            trace_token = set_trace_context(
+                build_chat_trace_context(
+                    session_id=session_id,
+                    llm_session_id=node.session_id,
+                    node_name=node.get_node_name() if hasattr(node, "get_node_name") else None,
+                    subagent_id=sub_agent_id,
+                    user_id=user_id,
+                    datasource=agent_config.current_datasource,
+                    source_session_id=request.source_session_id,
+                    source=request.source or self._default_source,
+                    model=request.model,
+                    agent_home=agent_config.home,
+                    identity=resolve_trace_identity(),
+                    max_turns=getattr(node, "max_turns", None),
+                    release=_release_stamp(),
+                )
+            )
+
+            # Per-request permission profile override. We deliberately do
+            # NOT mutate ``agent_config.active_profile_name`` here because
+            # the AgentConfig instance is shared across concurrent SaaS
+            # users; rewriting it on one request would leak the new profile
+            # to every other in-flight or future request. Instead we
+            # switch the freshly created node's PermissionManager in
+            # place — it is scoped to this request only.
+            self._apply_permission_mode_override(node, agent_config, request.permission_mode)
+
+            await self._push_event(
+                task,
+                SSEEvent(
+                    id=event_id,
+                    event="session",
+                    data=SSESessionData(
+                        session_id=session_id,
+                        llm_session_id=node.session_id,
+                    ),
+                    timestamp=now_utc_iso(),
+                ),
+            )
+            event_id += 1
+            event_id = await self._push_degraded_capability_warnings(task, node, event_id)
+
+            # 3. Resolve @-references. Run in a worker thread (like node
+            # creation): the metric/reference-sql stores use blocking psycopg
+            # connections that must not be driven from the event-loop thread —
+            # doing so corrupts the pooled connection ("the connection is lost").
+            at_tables, at_metrics, at_sqls, at_hints = await asyncio.to_thread(
+                self._resolve_at_context,
+                agent_config,
+                request.table_paths,
+                request.metric_paths,
+                request.sql_paths,
+                request.knowledge_paths,
+            )
+
+            # 4. Build typed input and assign to node
+            node_input = self._create_node_input(
+                user_message=request.message,
+                current_node=node,
+                at_tables=at_tables,
+                at_metrics=at_metrics,
+                at_sqls=at_sqls,
+                at_hints=at_hints,
+                catalog=request.catalog,
+                database=request.database,
+                db_schema=request.db_schema,
+                plan_mode=request.plan_mode or False,
+                source_session_id=request.source_session_id,
+            )
+            node.input = node_input
+
+            # 5. Replace filesystem tools with proxy if applicable.
+            # ``apply_proxy_tools`` consults ``_FS_DEPENDENT_NODES`` and the
+            # node's ``tool_registry`` to leave filesystem tools un-proxied
+            # for nodes that author server-side artifacts (e.g.
+            # ``gen_visual_report`` writing ``render/*.jsx``). No isinstance
+            # guard is needed here.
+            effective_source = request.source or self._default_source
+            if effective_source == "vscode":
+                # VSCode edits the user's *local* filesystem — the client is
+                # always the executor, whatever the permission profile.
+                apply_proxy_tools(node, ["filesystem_tools.*"])
+            elif effective_source == "web":
+                # The active profile (not request.permission_mode) is checked
+                # because a failed ``switch_profile`` silently keeps the
+                # node's original profile — proxying must follow what will
+                # actually gate execution.
+                active_profile = getattr(getattr(node, "permission_manager", None), "active_profile", None)
+                if active_profile in ("auto", "dangerous"):
+                    # These profiles ALLOW workspace writes without asking and
+                    # the web client skips its confirmation UI for them, so a
+                    # browser round-trip buys nothing and only adds failure
+                    # modes (hidden/closed tab, dropped SSE → the proxy-result
+                    # wait timing out after 600s). Run filesystem tools
+                    # server-side. The empty set reaches the SSE converter so
+                    # call-tool frames carry ``proxied: false`` and the client
+                    # knows not to execute them itself.
+                    # Mutate in place like ``apply_proxy_tools`` does —
+                    # PermissionHooks may hold a shared reference to the set.
+                    existing_proxied = getattr(node, "proxied_tool_names", None)
+                    if isinstance(existing_proxied, set):
+                        existing_proxied.clear()
+                    else:
+                        node.proxied_tool_names = set()
+                    logger.info(
+                        "Filesystem tools run server-side for session=%s (profile=%s)", session_id, active_profile
+                    )
+                else:
+                    apply_proxy_tools(node, ["write_file", "edit_file", "delete_file"])
+            elif effective_source:
+                logger.warning("Unsupported source '%s'; skipping proxy shortcut", effective_source)
+
+            # 6. Execute streaming
+            action_history = ActionHistoryManager()
+            action_count = 0
+            # action_id is globally unique, so delta de-dup can safely span passes.
+            seen_delta_action_ids: set[str] = set()
+
+            async def _run_pass() -> None:
+                nonlocal event_id, action_count
+                # Per-run render state — reset each pass. A continuation pass is a
+                # fresh turn, so its reply must not be dropped as a duplicate of an
+                # earlier pass ("re-run it" is a common steering ask) nor suppressed
+                # by a stale assistant_response_sent carried over between passes.
+                assistant_response_sent = False
+                tool_result_seen = False
+                seen_assistant_message_fingerprints: dict[str, str] = {}
+                async for action in node.execute_stream_with_interactions(action_history):
+                    action_count += 1
+
+                    # Convert action to SSE
+                    # Per-request stream_response overrides the server-level --stream flag
+                    effective_stream = (
+                        request.stream_response if request.stream_response is not None else self._stream_thinking
+                    )
+
+                    is_first_delta = True
+                    if action.action_type == "thinking_delta":
+                        is_first_delta = action.action_id not in seen_delta_action_ids
+                        seen_delta_action_ids.add(action.action_id)
+
+                    # finalize_progress actions reuse the same id across stages
+                    # so the SSE wire emits CREATE then UPDATE_MESSAGE; we mark
+                    # everything past the first emission as an update.
+                    is_finalize_progress_update = False
+                    if action.action_type == "finalize_progress":
+                        is_finalize_progress_update = action.action_id in seen_delta_action_ids
+                        seen_delta_action_ids.add(action.action_id)
+
+                    is_update = is_finalize_progress_update or (
+                        effective_stream
+                        and action.action_type == "response"
+                        and isinstance(action.output, dict)
+                        and action.action_id in seen_delta_action_ids
+                    )
+
+                    sse = action_to_sse_event(
+                        action,
+                        event_id,
+                        action.action_id,
+                        stream_thinking=effective_stream,
+                        is_first_delta=is_first_delta,
+                        is_update=bool(is_update),
+                        include_final_response=_should_include_final_response(action, assistant_response_sent),
+                        proxied_tool_names=getattr(node, "proxied_tool_names", None),
+                    )
+                    if sse:
+                        # Per-LLM-call usage event: the converter has no access
+                        # to the service-level session ids, so we stamp them
+                        # here before fan-out. Skip the assistant-message dedup
+                        # path entirely since usage carries no rendered text.
+                        if sse.event == "usage" and isinstance(sse.data, SSEUsageData):
+                            sse.data.session_id = session_id
+                            # Only main-agent usage (depth==0) belongs to this
+                            # node's LLM session. Sub-agent usage (depth>0) keeps the
+                            # sub-agent session id stamped by the converter so the
+                            # consumer can attribute it to the right session instead
+                            # of mislabelling it as the parent's.
+                            if sse.data.depth == 0:
+                                sse.data.llm_session_id = node.session_id
+                            await self._push_event(task, sse)
+                            event_id += 1
+                            continue
+                        if _should_skip_duplicate_assistant_message(
+                            action,
+                            sse,
+                            seen_assistant_message_fingerprints,
+                        ):
+                            continue
+                        await self._push_event(task, sse)
+                        event_id += 1
+                        _remember_assistant_message(sse, seen_assistant_message_fingerprints)
+                        if _is_visible_assistant_response(action, sse, tool_result_seen=tool_result_seen):
+                            assistant_response_sent = True
+                        if action.role == ActionRole.TOOL and action.status != ActionStatus.PROCESSING:
+                            tool_result_seen = True
+
+            # Mid-run insert (steering) auto-continuation: a message queued
+            # AFTER the final LLM turn is never seen by the SDK's
+            # call_model_input_filter (no further turn boundary fires), so after
+            # each run drain any residue and continue with a fresh turn. Mirrors
+            # the CLI's execute_chat_command loop and prevents silently dropping
+            # late mid-run messages. Messages queued mid-turn are injected in-run
+            # by the filter and never reach here.
+            continuations = 0
+            while True:
+                await _run_pass()
+                residual = self._drain_pending_for_continuation(node)
+                if not residual:
+                    # Close the accept window, then drain once more. An insert
+                    # that landed during this run's tail must not be stranded;
+                    # after the window closes /chat/insert returns
+                    # SESSION_NOT_RUNNING and the client re-sends as a new turn.
+                    task.accepting_inserts = False
+                    residual = self._drain_pending_for_continuation(node)
+                    if not residual:
+                        break
+                    task.accepting_inserts = True
+
+                continuations += 1
+                if continuations > _MAX_INSERT_CONTINUATIONS:
+                    # Defensive bound: a client that inserts without pause could
+                    # otherwise keep one task running forever. Stop accepting and
+                    # log what we drop rather than silently truncating.
+                    task.accepting_inserts = False
+                    logger.warning(
+                        "Mid-run insert continuation cap (%d) hit for session %s; dropping %d residual message(s)",
+                        _MAX_INSERT_CONTINUATIONS,
+                        session_id,
+                        len(residual),
+                    )
+                    break
+
+                # Echo each residual as a user_insert frame so the client
+                # dismisses its pending entry and renders the user bubble —
+                # the same wire shape the in-run filter path emits via the
+                # InteractionBroker.
+                for text in residual:
+                    event_id = await self._emit_user_insert_sse(task, text, event_id)
+                node.input = self._create_node_input(
+                    user_message="\n\n".join(residual),
+                    current_node=node,
+                    at_tables=[],
+                    at_metrics=[],
+                    at_sqls=[],
+                    at_hints=[],
+                    catalog=request.catalog,
+                    database=request.database,
+                    db_schema=request.db_schema,
+                    plan_mode=request.plan_mode or False,
+                    source_session_id=None,
+                )
+
+            # 6.5 Persist this turn's @-context (table/metric/sql/knowledge refs)
+            # so the history API can re-render them. Best-effort and off the
+            # event loop; must never fail the turn.
+            await asyncio.to_thread(
+                self._persist_turn_at_context, agent_config, session_id, request, user_id, pre_turn_number
+            )
+
+            # 7. End event
+            token_kwargs: dict = {}
+            try:
+                turn_usage = await node.get_last_turn_usage()
+                if turn_usage:
+                    token_kwargs = {
+                        "requests": turn_usage.requests,
+                        "input_tokens": turn_usage.input_tokens,
+                        "output_tokens": turn_usage.output_tokens,
+                        "total_tokens": turn_usage.total_tokens,
+                        "cached_tokens": turn_usage.cached_tokens,
+                        "session_total_tokens": turn_usage.session_total_tokens,
+                        "context_length": turn_usage.context_length,
+                    }
+            except Exception:
+                logger.debug("Failed to extract turn token usage for end event", exc_info=True)
+
+            await self._push_event(
+                task,
+                SSEEvent(
+                    id=event_id,
+                    event="end",
+                    data=SSEEndData(
+                        session_id=session_id,
+                        llm_session_id=node.session_id,
+                        total_events=event_id,
+                        action_count=action_count,
+                        duration=(datetime.now() - start_time).total_seconds(),
+                        **token_kwargs,
+                    ),
+                    timestamp=now_utc_iso(),
+                ),
+            )
+            event_id += 1
+
+            task.status = "completed"
+
+        except asyncio.CancelledError:
+            task.status = "cancelled"
+
+        except Exception as e:
+            logger.error(f"Chat task error for session {session_id}: {e}")
+            task.status = "error"
+            task.error = str(e)
+            await self._push_event(
+                task,
+                SSEEvent(
+                    id=event_id,
+                    event="error",
+                    data=SSEErrorData(
+                        error=str(e),
+                        error_type=type(e).__name__,
+                        session_id=session_id,
+                        llm_session_id=task.node.session_id if task.node else None,
+                    ),
+                    timestamp=now_utc_iso(),
+                ),
+            )
+            event_id += 1
+
+        finally:
+            if trace_token is not None:
+                reset_trace_context(trace_token)
+            async with task.condition:
+                task.condition.notify_all()
+            self._tasks.pop(session_id, None)
+            # Keep completed task for resume within TTL
+            self._completed_tasks[session_id] = task
+            self._purge_expired_completed()
+
+    @staticmethod
+    def _drain_pending_for_continuation(node) -> Optional[List[str]]:
+        """Drain mid-run messages left in the queue after a run finished.
+
+        Returns the FIFO list to continue with, or ``None`` when there is
+        nothing to continue or the run was interrupted (in which case the
+        queue is cleared, matching the CLI's cancel semantics).
+        """
+        queue = getattr(node, "pending_input_queue", None)
+        if queue is None or len(queue) == 0:
+            return None
+        ic = getattr(node, "interrupt_controller", None)
+        if ic is not None and getattr(ic, "is_interrupted", False):
+            queue.clear()
+            return None
+        return queue.drain()
+
+    async def _emit_user_insert_sse(self, task: "ChatTask", text: str, event_id: int) -> int:
+        """Emit a ``user_insert`` SSE frame for a residual mid-run message.
+
+        Mirrors the in-run filter path (which surfaces injections via
+        ``InteractionBroker.emit_user_insert``) so the client dismisses the
+        matching pending entry and renders the user bubble. Returns the next
+        ``event_id``.
+        """
+        action = ActionHistory(
+            action_id=str(uuid.uuid4()),
+            role=ActionRole.USER,
+            status=ActionStatus.SUCCESS,
+            action_type="user_insert",
+            messages=text,
+            input={"user_message": text, "source": "mid_run_insert"},
+            output={"user_message": text},
+        )
+        sse = action_to_sse_event(action, event_id, action.action_id)
+        if sse:
+            await self._push_event(task, sse)
+            return event_id + 1
+        return event_id
+
+    @staticmethod
+    def _session_manager(agent_config: AgentConfig, user_id: Optional[str]):
+        """Build a SessionManager pointed at this run's session dir + scope."""
+        from pico.models.session_manager import SessionManager
+        from pico.utils.path_manager import get_path_manager
+
+        base_dir = getattr(agent_config, "session_dir", None) or str(
+            get_path_manager(agent_config=agent_config).sessions_dir
+        )
+        return SessionManager(session_dir=base_dir, scope=user_id)
+
+    def _max_user_turn_number(self, agent_config: AgentConfig, session_id: str, user_id: Optional[str]) -> int:
+        """Best-effort snapshot of the session's turn counter (0 on any error)."""
+        try:
+            return self._session_manager(agent_config, user_id).get_max_user_turn_number(session_id)
+        except Exception:
+            return 0
+
+    def _persist_turn_at_context(
+        self,
+        agent_config: AgentConfig,
+        session_id: str,
+        request: StreamChatInput,
+        user_id: Optional[str],
+        previous_turn_number: int = -1,
+    ) -> None:
+        """Persist the just-completed turn's @-references to the session side table.
+
+        Stores the raw request path identifiers (not the resolved objects) so
+        :meth:`ChatService.get_history` can echo them back for front-end display.
+        ``previous_turn_number`` (captured before the run) gates the write so a
+        run that added no new user turn never mis-attaches to the prior bubble.
+        No-op when the turn carried no references; failures are swallowed.
+        """
+        context: Dict[str, Any] = {}
+        if request.table_paths:
+            context["table_paths"] = list(request.table_paths)
+        if request.metric_paths:
+            context["metric_paths"] = list(request.metric_paths)
+        if request.sql_paths:
+            context["sql_paths"] = list(request.sql_paths)
+        if request.knowledge_paths:
+            context["knowledge_paths"] = list(request.knowledge_paths)
+        if not context:
+            return
+        try:
+            self._session_manager(agent_config, user_id).save_user_message_context(
+                session_id, context, previous_turn_number=previous_turn_number
+            )
+        except Exception:
+            logger.debug("Failed to persist turn @-context for session %s", session_id, exc_info=True)
+
+    async def _push_event(self, task: ChatTask, event: SSEEvent) -> None:
+        """Append an event to the task buffer and notify consumers."""
+        logger.debug(f"Pushing event: {event}")
+        async with task.condition:
+            task.events.append(event)
+            task.condition.notify_all()
+
+    def _purge_expired_completed(self) -> None:
+        """Remove completed tasks older than COMPLETED_TASK_TTL."""
+        now = datetime.now()
+        expired = [
+            sid for sid, t in self._completed_tasks.items() if (now - t.created_at).total_seconds() > COMPLETED_TASK_TTL
+        ]
+        for sid in expired:
+            self._completed_tasks.pop(sid, None)
+
+    # ------------------------------------------------------------------
+    # Node factory
+    # ------------------------------------------------------------------
+
+    def _create_node(
+        self,
+        agent_config: AgentConfig,
+        subagent_id: Optional[str],
+        node_id: str,
+        user_id: Optional[str] = None,
+        interactive: bool = True,
+        session_id: Optional[str] = None,
+    ) -> AgenticNode:
+        """Create a fresh AgenticNode based on subagent_id (builtin name or custom DB ID).
+
+        Delegates dispatch to :func:`pico.agent.node.node_factory.create_interactive_node`
+        so the API path matches the CLI exactly: every built-in sub_agent is wired to
+        its dedicated AgenticNode subclass, and custom sub_agents honour their
+        ``node_class`` field (``gen_report`` / ``gen_table`` / ``gen_dashboard`` /
+        ``scheduler`` / ``gen_skill`` / ``explore``) instead of always falling back
+        to ``GenSQLAgenticNode``.
+
+        ``user_id`` is propagated as the node ``scope`` so that session files
+        are isolated per user under ``{session_dir}/{user_id}/``. ``session_id``
+        becomes the on-disk session identifier (defaults to ``node_id``); the
+        feedback flow passes a pre-copied id so the new node opens the cloned
+        session file directly instead of mutating ``node.session_id`` later.
+        """
+        from pico.agent.node.node_factory import create_interactive_node
+
+        execution_mode: Literal["interactive", "workflow"] = "interactive" if interactive else "workflow"
+
+        # ``agentic_nodes`` is keyed by sanitized node_name; the API receives the
+        # custom sub_agent's UUID under the "id" field. Translate UUID -> name so
+        # the factory's ``_resolve_node_class_type`` can look up node_class and
+        # downstream tools can resolve scoped_context via sub_agent_config().
+        node_name = subagent_id
+        if subagent_id:
+            for key, entry in (agent_config.agentic_nodes or {}).items():
+                entry_id = entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None)
+                if entry_id == subagent_id:
+                    node_name = key
+                    break
+
+        return create_interactive_node(
+            subagent_name=node_name,
+            agent_config=agent_config,
+            scope=user_id,
+            execution_mode=execution_mode,
+            node_id=node_id,
+            session_id=session_id if session_id is not None else node_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Per-request permission profile override
+    # ------------------------------------------------------------------
+
+    def _apply_permission_mode_override(
+        self,
+        node: AgenticNode,
+        agent_config: AgentConfig,
+        permission_mode: Optional[str],
+    ) -> None:
+        """Apply a per-request permission profile to the freshly created node.
+
+        Switches ``node.permission_manager`` to ``permission_mode`` without
+        touching ``agent_config.active_profile_name`` — the AgentConfig is
+        shared by every concurrent request in the SaaS deployment, so
+        mutating it would leak the override across users. The CLI's
+        ``/profile`` flow can still mutate the global field because it
+        owns the process exclusively; this API path cannot.
+
+        Because the override lives on the node, a subagent built later from
+        the same shared config does not see it — ``SubAgentTaskTool`` copies
+        it down explicitly.
+
+        See :func:`apply_profile_override` for the no-op and failure rules;
+        a raise from there aborts the turn in ``_run_loop`` and emits an SSE
+        error, which is the intended fail-closed behaviour.
+        """
+        from pico.tools.permission.profile_override import apply_profile_override
+
+        apply_profile_override(
+            getattr(node, "permission_manager", None),
+            agent_config,
+            permission_mode,
+            subject=f"session={getattr(node, 'session_id', None)}",
+        )
+
+    # ------------------------------------------------------------------
+    # Node input factory
+    # ------------------------------------------------------------------
+
+    def _create_node_input(
+        self,
+        user_message: str,
+        current_node: AgenticNode,
+        at_tables: List[TableSchema],
+        at_metrics: List[Metric],
+        at_sqls: List[ReferenceSql],
+        at_hints: Optional[List[Dict[str, Any]]] = None,
+        catalog: Optional[str] = None,
+        database: Optional[str] = None,
+        db_schema: Optional[str] = None,
+        plan_mode: bool = False,
+        source_session_id: Optional[str] = None,
+    ):
+        """Create node input based on node type.
+
+        Delegates to :func:`pico.agent.node.node_factory.create_node_input` so
+        the API path covers every AgenticNode subclass the CLI knows about
+        (GenReport / Explore / SkillCreator / GenTable / GenJob in addition to
+        the GenSQL / Semantic / SqlSummary / Feedback / Chat branches).
+        """
+        from pico.agent.node.node_factory import create_node_input
+
+        node_agent_config = getattr(current_node, "agent_config", None)
+        if not isinstance(node_agent_config, AgentConfig):
+            node_agent_config = None
+        catalog, database, db_schema = _fill_database_context(
+            node_agent_config,
+            catalog=catalog,
+            database=database,
+            schema=db_schema,
+        )
+
+        return create_node_input(
+            user_message=user_message,
+            node=current_node,
+            catalog=catalog,
+            database=database,
+            db_schema=db_schema,
+            at_tables=at_tables,
+            at_metrics=at_metrics,
+            at_sqls=at_sqls,
+            context_hints=at_hints,
+            prompt_language="en",
+            plan_mode=plan_mode,
+            source_session_id=source_session_id,
+        )
+
+    # ------------------------------------------------------------------
+    # @ reference resolution
+    # ------------------------------------------------------------------
+
+    async def _push_degraded_capability_warnings(self, task: ChatTask, node: AgenticNode, event_id: int) -> int:
+        degraded = getattr(node, "degraded_capabilities", {}) or {}
+        context_warning = degraded.get("context_search_tools")
+        if not context_warning:
+            return event_id
+
+        await self._push_event(
+            task,
+            SSEEvent(
+                id=event_id,
+                event="message",
+                data=SSEMessageData(
+                    type=SSEDataType.CREATE_MESSAGE,
+                    payload=SSEMessagePayload(
+                        message_id=f"context-degraded-{uuid.uuid4().hex[:8]}",
+                        role="assistant",
+                        content=[
+                            IMessageContent(
+                                type="markdown",
+                                payload={"content": context_warning},
+                            )
+                        ],
+                    ),
+                ),
+                timestamp=now_utc_iso(),
+            ),
+        )
+        return event_id + 1
+
+    @staticmethod
+    def _match_table_entry(flatten: Dict[str, Any], path: str) -> Optional[Dict[str, Any]]:
+        """Best-effort match when the picker's fullName != the metadata-store key.
+
+        The @-picker builds table paths from live introspection (the catalog
+        tree), while the completer indexes the schema-metadata store; the two can
+        differ in catalog presence or schema level (e.g. picker sends
+        ``default_catalog.db.table`` but the store key is ``db.schema.table``).
+        Fall back to matching the trailing components — table name, plus the
+        database when the path carries one. Returns a hit only when exactly one
+        candidate matches, so a genuinely ambiguous name never resolves to the
+        wrong table.
+        """
+        segs = [s.strip().strip('"').lower() for s in path.split(".") if s.strip()]
+        if not segs:
+            return None
+        want_table = segs[-1]
+        want_db = segs[-2] if len(segs) >= 2 else None
+        candidates: List[Dict[str, Any]] = []
+        for entry in flatten.values():
+            if str(entry.get("table_name", "")).lower() != want_table:
+                continue
+            if want_db is not None:
+                entry_db = str(entry.get("database_name", "")).lower()
+                if entry_db and entry_db != want_db:
+                    continue
+            candidates.append(entry)
+        return candidates[0] if len(candidates) == 1 else None
+
+    @staticmethod
+    def _none_to_empty(detail: Dict[str, Any]) -> Dict[str, Any]:
+        """Coerce ``None`` values to ``""`` for typed-model construction.
+
+        The path-scoped store returns optional string columns as ``None`` (e.g.
+        a reference SQL with no ``comment`` / ``tags``), but Metric / ReferenceSql
+        declare those as ``str``; ``from_dict``'s ``.get(k, "")`` doesn't catch a
+        present-but-None value, so normalise here.
+        """
+        return {k: ("" if v is None else v) for k, v in detail.items()}
+
+    @staticmethod
+    def _split_subject_path(path: str) -> tuple[List[str], str]:
+        """Split a subject-tree ref path into ``(subject_path, name)``.
+
+        The canonical form is ``/``-joined (``Commerce/Orders/aov``). A path that
+        contains no ``/`` is treated as an older ``.``-joined form and converted;
+        a ``/``-joined path is trusted verbatim so a ``.`` inside a leaf name
+        (``v1.2``) is preserved. The last segment is the leaf name.
+        """
+        normalized = path if "/" in path else path.replace(".", "/")
+        segs = [s.strip().strip('"') for s in normalized.split("/") if s.strip()]
+        if not segs:
+            return [], ""
+        return segs[:-1], segs[-1]
+
+    @staticmethod
+    def _synthesize_table_entry(path: str) -> Optional[Dict[str, Any]]:
+        """Build a name-only table entry from a picked path when the store can't resolve it.
+
+        Only ``table_name`` is surfaced to the prompt ("Available tables"), so an
+        empty ``definition`` is fine — the node inspects the real DDL via its own
+        ``describe_table``. ``database_name`` is a best-effort guess from the
+        leading segment for display/scoping; it isn't required for resolution.
+        """
+        segs = [s.strip().strip('"') for s in path.split(".") if s.strip()]
+        if not segs:
+            return None
+        return {
+            "identifier": path,
+            "catalog_name": "",
+            "database_name": segs[-2] if len(segs) >= 2 else "",
+            "schema_name": "",
+            "table_name": segs[-1],
+            "table_type": "table",
+            "definition": "",
+        }
+
+    def _resolve_at_context(
+        self,
+        agent_config: AgentConfig,
+        table_paths: Optional[List[str]],
+        metric_paths: Optional[List[str]],
+        sql_paths: Optional[List[str]],
+        knowledge_paths: Optional[List[str]] = None,
+    ) -> tuple[List[TableSchema], List[Metric], List[ReferenceSql], List[Dict[str, Any]]]:
+        """Resolve @-reference paths to typed objects (+ look-up hints).
+
+        Tables come from the schema-metadata completer with a name-only fallback.
+        Metrics and reference SQL are resolved by EXACT subject path via the same
+        non-vector, path-scoped store lookup the get_metrics / get_reference_sql
+        tools use — deliberately NOT the completer's vector search, which is empty
+        until the KB is vectorised (and is slated for removal).
+
+        Anything that can't be pre-loaded (a metric/sql that didn't resolve, and
+        every @Knowledge ref, which has no store loader) becomes a ``hint`` —
+        ``{kind, name, subject_path}`` — so the prompt can still name it and tell
+        the model which tool to call, instead of dropping it and forcing a blind
+        search.
+        """
+        logger.info(
+            "AT-CONTEXT resolving: table_paths=%s metric_paths=%s sql_paths=%s knowledge_paths=%s "
+            "(project=%s, datasource=%s)",
+            table_paths,
+            metric_paths,
+            sql_paths,
+            knowledge_paths,
+            getattr(agent_config, "project_name", None),
+            getattr(agent_config, "current_datasource", None),
+        )
+        tables = self._resolve_table_paths(agent_config, table_paths)
+        metrics, metric_hints = self._resolve_metric_paths(agent_config, metric_paths)
+        sqls, sql_hints = self._resolve_sql_paths(agent_config, sql_paths)
+        hints = metric_hints + sql_hints + self._knowledge_hints(knowledge_paths)
+        logger.info(
+            "AT-CONTEXT resolved: tables=%s metrics=%s sqls=%s hints=%s",
+            [t.table_name for t in tables],
+            [m.name for m in metrics],
+            [s.name for s in sqls],
+            [f"{h['kind']}:{h['name']}" for h in hints],
+        )
+        return tables, metrics, sqls, hints
+
+    def _knowledge_hints(self, knowledge_paths: Optional[List[str]]) -> List[Dict[str, Any]]:
+        """@Knowledge has no store loader yet — surface every ref as a hint."""
+        hints: List[Dict[str, Any]] = []
+        for path in knowledge_paths or []:
+            subject_path, name = self._split_subject_path(path)
+            if name:
+                hints.append({"kind": "knowledge", "name": name, "subject_path": subject_path})
+        return hints
+
+    def _resolve_table_paths(self, agent_config: AgentConfig, table_paths: Optional[List[str]]) -> List[TableSchema]:
+        tables: List[TableSchema] = []
+        if not table_paths:
+            return tables
+        try:
+            completer = AtReferenceCompleter(agent_config)
+            completer.table_completer.reload_data()
+            table_flatten = completer.table_completer.flatten_data
+        except Exception as exc:
+            logger.warning("Table completer unavailable; falling back to name-only @Table refs: %s", exc)
+            table_flatten = {}
+        for path in table_paths:
+            try:
+                entry = table_flatten.get(path) or self._match_table_entry(table_flatten, path)
+                if not entry:
+                    # The @-picker builds table paths from live introspection, so a
+                    # picked table always exists even when the schema-metadata store
+                    # is empty/stale (KB not indexed for this datasource). The prompt
+                    # injection only needs the table NAME (the node's own describe_table
+                    # fetches the DDL), so synthesise a name-only entry rather than
+                    # silently dropping the reference and re-asking the user.
+                    logger.warning(
+                        "Unresolved @Table path '%s' (%d indexed tables); using name-only reference. Sample keys: %s",
+                        path,
+                        len(table_flatten),
+                        list(table_flatten.keys())[:5],
+                    )
+                    entry = self._synthesize_table_entry(path)
+                if entry:
+                    tables.append(TableSchema.from_dict(entry))
+            except Exception as e:
+                logger.warning(f"Failed to resolve table path '{path}': {e}")
+        return tables
+
+    def _resolve_metric_paths(
+        self, agent_config: AgentConfig, metric_paths: Optional[List[str]]
+    ) -> tuple[List[Metric], List[Dict[str, Any]]]:
+        metrics: List[Metric] = []
+        hints: List[Dict[str, Any]] = []
+        if not metric_paths:
+            return metrics, hints
+        try:
+            from pico.storage.metric.store import MetricRAG
+
+            rag = MetricRAG(agent_config)
+        except Exception as exc:
+            logger.warning("MetricRAG unavailable; emitting @Metric look-up hints: %s", exc)
+            rag = None
+        for path in metric_paths:
+            subject_path, name = self._split_subject_path(path)
+            if not name:
+                continue
+            try:
+                details = rag.get_metrics_detail(subject_path=subject_path, name=name) if rag else []
+                if details:
+                    metric = Metric.from_dict(self._none_to_empty(details[0]))
+                    # Authoritative subject_path from the picked path (the store row
+                    # may omit it), so the prompt can name where the metric lives.
+                    metric.subject_path = subject_path
+                    metrics.append(metric)
+                    continue
+                logger.warning("Unresolved @Metric path '%s'; emitting look-up hint", path)
+            except Exception as e:
+                logger.warning("Failed to resolve metric path '%s': %s; emitting look-up hint", path, e)
+            hints.append({"kind": "metric", "name": name, "subject_path": subject_path})
+        return metrics, hints
+
+    def _resolve_sql_paths(
+        self, agent_config: AgentConfig, sql_paths: Optional[List[str]]
+    ) -> tuple[List[ReferenceSql], List[Dict[str, Any]]]:
+        sqls: List[ReferenceSql] = []
+        hints: List[Dict[str, Any]] = []
+        if not sql_paths:
+            return sqls, hints
+        try:
+            from pico.storage.reference_sql.store import ReferenceSqlRAG
+
+            store = ReferenceSqlRAG(agent_config)
+        except Exception as exc:
+            logger.warning("ReferenceSqlRAG unavailable; emitting @Sql look-up hints: %s", exc)
+            store = None
+        for path in sql_paths:
+            subject_path, name = self._split_subject_path(path)
+            if not name:
+                continue
+            try:
+                details = store.get_reference_sql_detail(subject_path=subject_path, name=name) if store else []
+                if details:
+                    ref = ReferenceSql.from_dict(self._none_to_empty(details[0]))
+                    ref.subject_path = subject_path
+                    sqls.append(ref)
+                    continue
+                logger.warning("Unresolved @Sql path '%s'; emitting look-up hint", path)
+            except Exception as e:
+                logger.warning("Failed to resolve sql path '%s': %s; emitting look-up hint", path, e)
+            hints.append({"kind": "reference_sql", "name": name, "subject_path": subject_path})
+        return sqls, hints

@@ -1,13 +1,13 @@
-# Runs the CloudPi Agent (standalone) on the customer's EC2. Setup and first run: CUSTOMER-SETUP-GUIDE.md.
+# Runs the Pico FinOps Agent on the customer's EC2. Setup and first run: docs/CUSTOMER-SETUP-GUIDE.md.
 # One container, one process: data collection, the Lambda, notices and alerts, and Pico's Slack agent when both
 # Slack tokens are in .env. It opens no port (Slack is reached outbound). Host networking keeps the EC2's instance
 # role reachable with IMDSv2 hop limit 1; never add `ports:`.
 services:
   agent:
-    # Required: the image tag to run, e.g. AGENT_IMAGE_TAG=Cloudpi_agent_nightly_2026-11-06-1200 in .env.
-    image: cloudpi1/cloudpi:${AGENT_IMAGE_TAG:?set AGENT_IMAGE_TAG in .env to the image tag to run}
-    container_name: cloudpi-agent
-    pull_policy: always
+    # Built from this repo: `docker compose build` (the Dockerfile in this folder), then `docker compose up -d`.
+    build: .
+    image: pico-finops-agent:${AGENT_IMAGE_TAG:-local}
+    container_name: pico-finops-agent
     # The agent exits for a restart when Slack has been down 10 minutes or the scheduler is stuck (see the README's
     # health table); this brings it back.
     restart: unless-stopped

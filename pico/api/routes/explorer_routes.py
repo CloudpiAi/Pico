@@ -1,0 +1,218 @@
+"""
+API routes for Explorer endpoints.
+"""
+
+from fastapi import APIRouter
+
+from pico.api.deps import AppContextDep, ServiceDep, SubAgentDep
+from pico.api.models.base_models import Result
+from pico.api.models.explorer_models import (
+    CreateDirectoryInput,
+    DeleteSubjectInput,
+    EditMetricInput,
+    EditSemanticModelInput,
+    MetricDimensionsData,
+    MetricInfo,
+    MetricPreviewData,
+    MetricPreviewInput,
+    ReferenceSQLInfo,
+    ReferenceSQLInput,
+    RenameSubjectInput,
+    SubjectListData,
+    SubjectPathInput,
+)
+
+router = APIRouter(prefix="/api/v1", tags=["explorer"])
+
+
+# ========== Subject Endpoints ==========
+
+
+@router.get(
+    "/subject/list",
+    response_model=Result[SubjectListData],
+    summary="Get Subject List",
+    description="Get nested subject tree structure with directories, metrics, and reference SQL items",
+)
+async def get_subject_list(
+    svc: ServiceDep,
+    sub_agent: SubAgentDep,
+) -> Result[SubjectListData]:
+    """Get subject tree."""
+    return await svc.explorer_for(sub_agent).get_subject_list()
+
+
+@router.post(
+    "/subject/create",
+    response_model=Result[dict],
+    summary="Create Directory",
+    description="Create a new directory in the subject tree at the specified path",
+)
+async def create_directory(
+    request: CreateDirectoryInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Create directory."""
+    return await svc.explorer.create_directory(request)
+
+
+@router.post(
+    "/subject/rename",
+    response_model=Result[dict],
+    summary="Rename or Move Subject",
+    description="Rename a subject node or move it to a different location in the tree",
+)
+async def rename_subject(
+    request: RenameSubjectInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Rename/move subject."""
+    return await svc.explorer.rename_subject(request)
+
+
+@router.delete(
+    "/subject/delete",
+    response_model=Result[dict],
+    summary="Delete Subject",
+    description="Delete a subject node (directory, metric, or reference SQL) from the tree",
+)
+async def delete_subject(
+    request: DeleteSubjectInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Delete subject."""
+    return await svc.explorer.delete_subject(request)
+
+
+@router.post(
+    "/subject/metric",
+    response_model=Result[MetricInfo],
+    summary="Get Metric",
+    description="Get metric information including YAML configuration by subject path",
+)
+async def get_metric(
+    request: SubjectPathInput,
+    svc: ServiceDep,
+    sub_agent: SubAgentDep,
+) -> Result[MetricInfo]:
+    """Get metric info."""
+    return await svc.explorer_for(sub_agent).get_metric(request.subject_path)
+
+
+@router.post(
+    "/subject/metric/dimensions",
+    response_model=Result[MetricDimensionsData],
+    summary="Get Metric Dimensions",
+    description="List the queryable dimensions of a saved metric for the preview panel",
+)
+async def get_metric_dimensions(
+    request: SubjectPathInput,
+    svc: ServiceDep,
+    sub_agent: SubAgentDep,
+) -> Result[MetricDimensionsData]:
+    """List a metric's queryable dimensions."""
+    return await svc.explorer_for(sub_agent).get_metric_dimensions(request)
+
+
+@router.post(
+    "/subject/metric/preview",
+    response_model=Result[MetricPreviewData],
+    summary="Preview Metric",
+    description="Compile a saved metric into runnable SQL (dry-run) for previewing its data",
+)
+async def preview_metric(
+    request: MetricPreviewInput,
+    svc: ServiceDep,
+    sub_agent: SubAgentDep,
+    ctx: AppContextDep,
+) -> Result[MetricPreviewData]:
+    """Compile a saved metric to SQL for preview."""
+    # The compiled SQL is handed straight to the result panel, which runs it —
+    # so a metric row policy has to narrow it here, while the datasets it
+    # matches on are still known. Nothing downstream can put it back.
+    return await svc.explorer_for(sub_agent).preview_metric(request, policy_context=ctx.policy_context)
+
+
+@router.post(
+    "/subject/reference_sql",
+    response_model=Result[ReferenceSQLInfo],
+    summary="Get Reference SQL",
+    description="Get reference SQL details including summary, comment, and SQL query",
+)
+async def get_reference_sql(
+    request: SubjectPathInput,
+    svc: ServiceDep,
+    sub_agent: SubAgentDep,
+) -> Result[ReferenceSQLInfo]:
+    """Get reference SQL."""
+    return await svc.explorer_for(sub_agent).get_reference_sql(request.subject_path)
+
+
+@router.post(
+    "/subject/reference_sql/create",
+    response_model=Result[dict],
+    summary="Create Reference SQL",
+    description="Create a new reference SQL entry in the subject tree",
+)
+async def create_reference_sql(
+    request: ReferenceSQLInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Create reference SQL."""
+    return await svc.explorer.create_reference_sql(request)
+
+
+@router.post(
+    "/subject/reference_sql/edit",
+    response_model=Result[dict],
+    summary="Edit Reference SQL",
+    description="Update reference SQL summary, comment, and SQL query",
+)
+async def edit_reference_sql(
+    request: ReferenceSQLInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Edit reference SQL."""
+    return await svc.explorer.edit_reference_sql(request)
+
+
+@router.post(
+    "/subject/metric/create",
+    response_model=Result[dict],
+    summary="Create Metric",
+    description="Create a new metric from YAML definition",
+)
+async def create_metric(
+    request: EditMetricInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Create metric from YAML."""
+    return await svc.explorer.create_metric(request)
+
+
+@router.post(
+    "/subject/metric/edit",
+    response_model=Result[dict],
+    summary="Edit Metric",
+    description="Update an existing metric's YAML definition",
+)
+async def edit_metric(
+    request: EditMetricInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Edit metric YAML."""
+    return await svc.explorer.edit_metric(request)
+
+
+@router.post(
+    "/subject/semantic_model/edit",
+    response_model=Result[dict],
+    summary="Edit Semantic Model",
+    description="Update a semantic model entry (table or column) by entry ID",
+)
+async def edit_semantic_model(
+    request: EditSemanticModelInput,
+    svc: ServiceDep,
+) -> Result[dict]:
+    """Edit semantic model entry."""
+    return await svc.explorer.edit_semantic_model(request)

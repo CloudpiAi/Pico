@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=80.9.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pico-plugin-focus-data"
+version = "0.1.0"
+description = "Load AWS FOCUS exports into an S3 table and refresh the local DuckDB cache the Pico agent queries"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = ["boto3", "duckdb==1.5.2"]
+
+[project.entry-points."pico.plugins"]
+focus-data = "pico_plugin_focus_data"
+
+[tool.setuptools.packages.find]
+include = ["pico_plugin_focus_data*"]
+
+[tool.setuptools.package-data]
+pico_plugin_focus_data = ["pico-plugin.yml", "skills/*/SKILL.md", "prompts/*.j2"]

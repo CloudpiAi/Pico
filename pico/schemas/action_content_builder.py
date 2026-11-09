@@ -1,0 +1,266 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Pure functions for converting ActionHistory objects to MessageContent lists.
+
+Extracted from ChatService to be shared between API SSE streaming and CLI print mode.
+"""
+
+import json
+from typing import List, Optional
+
+from pico.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from pico.schemas.message_content import MessageContent
+from pico.utils.json_utils import llm_result2json
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+def extract_function(action: ActionHistory) -> tuple[str, dict]:
+    """Extract function name and arguments from action.input."""
+    input_data = action.input
+    if not isinstance(input_data, dict):
+        return "unknown", {}
+
+    function_name = input_data.get("function_name", "unknown")
+    arguments = input_data.get("arguments", {})
+
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except json.JSONDecodeError:
+            arguments = {}
+
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    return function_name, arguments
+
+
+def build_tool_call_content(action: ActionHistory) -> List[MessageContent]:
+    """Build content for tool call started event."""
+    function_name, arguments = extract_function(action)
+    payload_data = {
+        "callToolId": action.action_id,
+        "toolName": function_name,
+        "toolParams": arguments,
+    }
+    return [MessageContent(type="call-tool", payload=payload_data)]
+
+
+def build_tool_result_content(action: ActionHistory) -> List[MessageContent]:
+    """Build content for tool call completed event."""
+    output = action.output
+
+    start_time = action.start_time
+    end_time = action.end_time
+    duration = 0.0
+    if start_time and end_time:
+        duration = (end_time - start_time).total_seconds()
+
+    is_dict_output = isinstance(output, dict)
+    short_desc = output.get("summary", "") if is_dict_output else ""
+    function_name, _ = extract_function(action)
+
+    payload_data = {
+        "callToolId": action.action_id.removeprefix("complete_"),
+        "toolName": function_name,
+        "duration": duration,
+        "shortDesc": short_desc,
+        "result": output.get("raw_output", output) if is_dict_output else output,
+    }
+    return [MessageContent(type="call-tool-result", payload=payload_data)]
+
+
+def build_token_usage_content(action: ActionHistory) -> Optional[List[MessageContent]]:
+    """Build a structured ``usage`` content from a ``token_usage`` action.
+
+    Emitted once per LLM call so print-mode / programmatic consumers
+    (``pico -p``, desktop bridge) see the real token counts instead of a
+    bare "Token usage update" thinking line. Mirrors the API ``usage`` SSE
+    event payload (cumulative turn totals + this call's delta).
+    """
+    output = action.output if isinstance(action.output, dict) else {}
+    cumulative = output.get("cumulative") if isinstance(output.get("cumulative"), dict) else {}
+    delta = output.get("delta") if isinstance(output.get("delta"), dict) else {}
+
+    def _i(d: dict, key: str) -> int:
+        try:
+            return int(d.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    payload = {
+        "requests": _i(cumulative, "requests"),
+        "input_tokens": _i(cumulative, "input_tokens"),
+        "output_tokens": _i(cumulative, "output_tokens"),
+        "total_tokens": _i(cumulative, "total_tokens"),
+        "cached_tokens": _i(cumulative, "cached_tokens"),
+        "reasoning_tokens": _i(cumulative, "reasoning_tokens"),
+        "last_call_input_tokens": _i(output, "last_call_input_tokens"),
+        "context_length": _i(output, "context_length"),
+        "delta": {
+            "requests": _i(delta, "requests"),
+            "input_tokens": _i(delta, "input_tokens"),
+            "output_tokens": _i(delta, "output_tokens"),
+            "total_tokens": _i(delta, "total_tokens"),
+            "cached_tokens": _i(delta, "cached_tokens"),
+            "reasoning_tokens": _i(delta, "reasoning_tokens"),
+        },
+    }
+    return [MessageContent(type="usage", payload=payload)]
+
+
+def build_thinking_content(action: ActionHistory) -> Optional[List[MessageContent]]:
+    """Extract text content from action for thinking/markdown display."""
+    action_type = action.action_type
+
+    if action_type == "llm_generation":
+        return [MessageContent(type="thinking", payload={"content": action.messages})]
+
+    output = action.output
+    content = None
+    if output and isinstance(output, dict):
+        for key in ["response", "raw_output", "output", "thinking", "content"]:
+            if key in output and output[key]:
+                content = str(output[key])
+                break
+
+    if not content:
+        return [MessageContent(type="thinking", payload={"content": action.messages})]
+
+    result_json = llm_result2json(content)
+
+    if result_json:
+        contents = []
+        if "sql" in result_json and result_json["sql"]:
+            sql = result_json.get("sql")
+            sql_payload = {"codeType": "sql", "content": sql}
+            contents.append(MessageContent(type="code", payload=sql_payload))
+        if "output" in result_json and result_json["output"]:
+            resp_payload = {"content": result_json.get("output", "")}
+            contents.append(MessageContent(type="markdown", payload=resp_payload))
+
+        if contents:
+            return contents
+
+    return [MessageContent(type="thinking", payload={"content": content})]
+
+
+def build_interaction_content(action: ActionHistory) -> List[MessageContent]:
+    """Build content for user interaction event (PROCESSING status)."""
+    from pico.schemas.interaction_event import InteractionEvent
+
+    events = InteractionEvent.from_broker_input(action.input if isinstance(action.input, dict) else {})
+
+    if len(events) > 1:
+        content = "\n".join(f"{i + 1}. {ev.content}" for i, ev in enumerate(events))
+    elif events:
+        content = events[0].content
+    else:
+        content = ""
+
+    choices = events[0].choices if events else {}
+    options = [{"key": key, "title": title} for key, title in choices.items()] if choices else None
+
+    payload_data = {
+        "interactionKey": action.action_id,
+        "content": content,
+        "options": options,
+    }
+    return [MessageContent(type="user-interaction", payload=payload_data)]
+
+
+def build_interaction_result_content(action: ActionHistory) -> Optional[List[MessageContent]]:
+    """Build content for interaction result event (SUCCESS status)."""
+    output = action.output if isinstance(action.output, dict) else {}
+    content = output.get("content", "")
+    if not content:
+        return None
+    payload_data = {"content": content}
+    return [MessageContent(type="markdown", payload=payload_data)]
+
+
+def build_response_content(action: ActionHistory) -> List[MessageContent]:
+    """Build content for final response event."""
+    contents = []
+    action_output = action.output
+    if "sql" in action_output and action_output["sql"]:
+        sql = action_output.get("sql")
+        sql_payload = {"codeType": "sql", "content": sql}
+        contents.append(MessageContent(type="code", payload=sql_payload))
+
+    resp_payload = {"content": action_output.get("response", "")}
+    contents.append(MessageContent(type="markdown", payload=resp_payload))
+    return contents
+
+
+def build_user_content(action: ActionHistory) -> List[MessageContent]:
+    """Build content for user message event."""
+    input_data = action.input
+    user_message = input_data.get("user_message", "") if isinstance(input_data, dict) else ""
+    payload_data = {"content": user_message}
+    return [MessageContent(type="markdown", payload=payload_data)]
+
+
+def build_compact_summary_content(action: ActionHistory) -> Optional[List[MessageContent]]:
+    """Build a markdown content from a ``compact_summary`` action.
+
+    Carries a ``kind`` marker so a print/API frontend can recognise the
+    compacted-context summary (and e.g. collapse the prior transcript) instead
+    of treating it as a normal assistant message. The backend never clears the
+    screen or mutates anything here — it only emits data.
+    """
+    out = action.output if isinstance(action.output, dict) else {}
+    summary = str(out.get("summary", "") or "")
+    if not summary:
+        return None
+    # ``history_jsonl`` is a server-local filesystem path; it is intentionally
+    # excluded here so API/print consumers never receive backend filesystem
+    # details (the local CLI panel reads the path from the action output
+    # directly, not from this externally visible payload).
+    payload = {
+        "content": summary,
+        "kind": "compact_summary",
+        "summary_token": int(out.get("summary_token", 0) or 0),
+    }
+    return [MessageContent(type="markdown", payload=payload)]
+
+
+def action_to_content(action: ActionHistory) -> Optional[List[MessageContent]]:
+    """Convert an ActionHistory object to a list of MessageContent.
+
+    Routes to the appropriate build function based on role/status.
+    Returns None if the action should be skipped.
+    """
+    role = action.role
+    status = action.status
+
+    if action.action_type == "token_usage":
+        return build_token_usage_content(action)
+    if action.action_type == "compact_progress":
+        return None  # in-progress hint is REPL-only; print/API frontends skip it
+    if action.action_type == "compact_summary":
+        return build_compact_summary_content(action)
+    if role == ActionRole.TOOL and status == ActionStatus.PROCESSING:
+        return build_tool_call_content(action)
+    elif role == ActionRole.TOOL:
+        return build_tool_result_content(action)
+    elif role == ActionRole.INTERACTION and status == ActionStatus.PROCESSING:
+        return build_interaction_content(action)
+    elif role == ActionRole.INTERACTION and status == ActionStatus.SUCCESS:
+        return build_interaction_result_content(action)
+    elif role == ActionRole.USER:
+        return None
+    elif (
+        role == ActionRole.ASSISTANT
+        and status == ActionStatus.SUCCESS
+        and action.action_type
+        and action.action_type.endswith("_response")
+    ):
+        return None  # ignore parsed final response
+    else:
+        return build_thinking_content(action)

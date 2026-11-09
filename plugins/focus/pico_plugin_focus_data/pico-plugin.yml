@@ -1,0 +1,46 @@
+manifest_version: 1
+description: "FOCUS cost data: load the AWS FOCUS export into the S3 table and refresh the local DuckDB cache."
+cli: pico_plugin_focus_data.cli:main
+
+# load is allow in both the API and Slack (decided 2026-11-04): it is idempotent, locked and only
+# replaces months from the export; the Slack gateway refuses every `ask`.
+# `--config` before the command would point the plugin at another agent.yml: denied outright
+# (Pico would only ask; deny rules are also matched against the raw argv).
+permissions:
+  normal:
+    allow: ["status", "load:*"]
+    deny: ["--config:*", "--config=*:*"]
+  auto:
+    allow: ["status", "load:*"]
+    deny: ["--config:*", "--config=*:*"]
+
+skills: skills
+
+# Answer only AWS cost questions (this agent only; Pico's own chat prompt is unchanged).
+system_prompt: prompts/scope.j2
+
+config_schema:
+  type: object
+  required: [table_bucket_arn, export_bucket, export_prefix, cache_path]
+  properties:
+    aws_profile: {type: string, description: "Optional AWS profile for developer runs; unset in the container (instance role)"}
+    region: {type: string, default: "us-east-1"}
+    table_bucket_arn: {type: string, description: "arn:aws:s3tables:<region>:<account>:bucket/<name>"}
+    namespace: {type: string, default: "pico_finops_agent"}
+    table: {type: string, default: "focus"}
+    export_bucket: {type: string, description: "S3 bucket of the FOCUS Data Export"}
+    export_prefix: {type: string, description: "Prefix up to and including data/, e.g. focus/acme-focus/data/"}
+    cache_path: {type: string, description: "DuckDB cache file the agent reads"}
+    duckdb_threads: {type: integer, default: 3}
+    state_bucket: {type: string, description: "S3 bucket holding the Lambda's state.json"}
+    state_key: {type: string, default: "pico-finops-agent/state.json", description: "Key of state.json in state_bucket"}
+    lambda_role_arn: {type: string, description: "Execution role passed to the pico-finops-agent-loader Lambda on create"}
+    zip_dir: {type: string, default: "/opt/pico-finops-agent-loader", description: "Folder with duckdb-layer.zip and loader.zip (baked into the image)"}
+
+commands:
+  - name: load
+    description: "Create/update the pico-finops-agent-loader Lambda, load new export deliveries into the S3 table, then rebuild the cache"
+    args:
+      - {name: "--force", required: false, description: "reload even if the delivery was already loaded"}
+  - name: status
+    description: "Show the AWS identity, the last load and error, and the months in the table (state.json)"

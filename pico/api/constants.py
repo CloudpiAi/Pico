@@ -1,0 +1,17 @@
+"""Constants for Pico API."""
+
+import re
+
+from pico.utils.constants import HIDDEN_SYS_SUB_AGENTS, SYS_SUB_AGENTS
+
+# Header carrying the caller's user identifier for the open-source default auth.
+HEADER_USER_ID = "X-Pico-User-Id"
+
+# Header carrying JSON inputs for active execution policies.
+HEADER_POLICY_CONTEXT = "X-Pico-Policy-Context"
+
+# Allowed characters for header-provided user_id (also used as SessionManager scope).
+USER_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# Builtin subagents matching /agent visible list
+BUILTIN_SUBAGENTS = SYS_SUB_AGENTS - HIDDEN_SYS_SUB_AGENTS

@@ -1,0 +1,1329 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+import json
+from functools import lru_cache
+from typing import Any, Dict, List, Optional
+
+from datus_db_core import BaseSqlConnector
+from rich import box
+from rich.console import Group
+from rich.table import Table
+from rich.text import Text
+from textual import events, work
+from textual.app import ComposeResult
+from textual.binding import Binding
+from textual.containers import Container, Horizontal, ScrollableContainer, Vertical
+from textual.screen import ModalScreen
+from textual.widget import Widget
+from textual.widgets import Footer, Header, Static
+from textual.widgets import Tree as TextualTree
+from textual.widgets._tree import TreeNode
+from textual.worker import get_current_worker
+
+from pico.cli.cli_styles import HEADER_BOLD_CYAN, TABLE_BORDER_STYLE, TABLE_HEADER_STYLE
+from pico.cli.screen.base_widgets import FocusableStatic
+from pico.cli.screen.context_screen import ContextScreen
+from pico.storage.semantic_dataset.store import SemanticDatasetRAG
+from pico.tools.db_tools.capabilities import supports_namespace
+from pico.utils.constants import DBType
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.json_utils import to_pretty_str
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+_NESTED_TABLE_PRIMARY_KEYS = (
+    "name",
+    "expr",
+    "role",
+    "type",
+    "time_granularity",
+    "entity",
+    "agg",
+    "agg_time_dimension",
+    "from",
+    "to",
+    "from_columns",
+    "to_columns",
+)
+_NESTED_TABLE_TRAILING_KEYS = ("description", "ai_context")
+
+
+def _ordered_nested_table_keys(items: List[Dict[str, Any]]) -> List[str]:
+    """Return stable, human-readable columns for semantic nested tables."""
+    seen_keys = set()
+    encountered_keys = []
+    for item in items:
+        for key in item.keys():
+            if key not in seen_keys:
+                encountered_keys.append(key)
+                seen_keys.add(key)
+
+    primary = [key for key in _NESTED_TABLE_PRIMARY_KEYS if key in seen_keys]
+    trailing = [key for key in _NESTED_TABLE_TRAILING_KEYS if key in seen_keys]
+    middle = [
+        key
+        for key in encountered_keys
+        if key not in _NESTED_TABLE_PRIMARY_KEYS and key not in _NESTED_TABLE_TRAILING_KEYS
+    ]
+    return primary + middle + trailing
+
+
+@lru_cache(maxsize=100)
+def _fetch_schema_with_cache(
+    db_connector: BaseSqlConnector,
+    catalog_name: str = "",
+    database_name: str = "",
+    schema_name: str = "",
+    table_name: str = "",
+) -> list:
+    """Fetch schema with LRU cache support."""
+    try:
+        return (
+            db_connector.get_schema(
+                catalog_name=catalog_name, database_name=database_name, schema_name=schema_name, table_name=table_name
+            )
+            or []
+        )
+    except Exception as e:
+        logger.error(f"Schema fetch failed: {str(e)}")
+        return []
+
+
+class CatalogScreen(ContextScreen):
+    """Screen for displaying database catalogs."""
+
+    CSS = """
+        /* Main layout containers */
+        #tree-container {
+            width: 35%;
+            height: 100%;
+            background: $surface;
+            overflow: hidden;
+        }
+
+        .semantic-panel:focus,
+        .semantic-panel:focus-within {
+            background: $foreground 10%;
+            color: $text;
+            # margin: 0 0;
+            # padding: 0 0;
+        }
+
+        #details-container {
+            height: 100%;
+            background: $surface-lighten-1;
+            overflow: hidden;
+        }
+
+        #columns-panel-container {
+            width: 100%;
+            height: 35%;
+            background: $surface;
+            color: $text;
+            overflow-y: auto;
+            overflow-x: auto;
+        }
+
+        #semantic-panel-container {
+            height: 1fr;
+            min-height: 0;
+            background: $surface;
+            color: $text;
+            overflow-y: auto;
+            overflow-x: auto;
+        }
+
+        #panel-divider {
+            height: 1;
+            background: $surface-darken-1;
+            margin: 0;
+        }
+
+        /* Tree styling - minimal borders */
+        #catalogs-tree {
+            width: 100%;
+            height: 1fr;
+            background: $surface;
+            border: none;
+            overflow-y: auto;
+        }
+
+        #catalogs-tree > .tree--guides {
+            color: $primary-lighten-2;
+        }
+
+        #catalogs-tree:focus {
+            border: none;
+        }
+
+        /* Loading states */
+        .loading {
+            color: $text-muted;
+            text-style: italic;
+        }
+
+        .loading-spinner {
+            color: $accent;
+            text-style: italic;
+        }
+
+        .error {
+            color: $error;
+            text-style: bold;
+        }
+
+        /* Enhanced loading indicator */
+        .loading-pulse {
+            color: $accent;
+            text-style: italic;
+        }
+
+        /* Table styling enhancements */
+        #columns-panel {
+            width: 100%;
+            height: auto;
+            background: $surface;
+            color: $text;
+            padding: 1 1;
+        }
+
+        /* Fullscreen mode */
+        .fullscreen #tree-container {
+            width: 100%;
+        }
+
+        .fullscreen #details-container {
+            width: 100%;
+        }
+
+        /* Tree node styling */
+        .tree--cursor {
+            background: $accent-darken-1;
+            color: $text;
+        }
+
+        .tree--highlighted {
+            background: $accent-lighten-1;
+            color: $text;
+        }
+
+        #tree-help {
+            width: 100%;
+            height: 1;
+            background: $surface-darken-1;
+            color: $text-muted;
+            text-align: center;
+        }
+    """
+
+    BINDINGS = [
+        Binding("f1", "toggle_fullscreen", "Fullscreen"),
+        Binding("f2", "show_navigation_help", "Help"),
+        Binding("down", "cursor_down", "Down", show=False),
+        Binding("up", "cursor_up", "Up", show=False),
+        Binding("right", "expand_node", "Expand", show=False),
+        Binding("left", "collapse_node", "Collapse", show=False),
+        # Binding("enter", "load_details", "Load Details", show=False),
+        # Binding("f3", "preview_details", "Preview"),
+        Binding("f4", "show_path", "Show Path"),
+        Binding("f5", "exit_with_selection", "Select"),
+        Binding("q", "quit_if_idle", "Quit", show=False),
+        Binding("escape", "exit_or_cancel", "Exit", show=False),
+        Binding("ctrl+r", "retry_current_node", "Retry", show=False),
+        Binding("ctrl+e", "start_edit", "Edit", show=False, priority=True),
+        Binding("ctrl+q", "exit_or_cancel", "Exit", show=True, priority=True),
+    ]
+
+    def __init__(self, title: str, context_data: Dict, inject_callback=None):
+        """
+        Initialize the catalogs screen.
+
+        Args:
+            context_data: Dictionary containing database connection info
+                - datasource: Database datasource
+                - db_type: Database type
+                - database_name: Specific database name (optional)
+            inject_callback: Callback for injecting data into the CLI
+        """
+        super().__init__(title=title, context_data=context_data, inject_callback=inject_callback)
+        self.db_type: DBType = context_data.get("db_type", DBType.SQLITE)
+        self.catalog_name = context_data.get("catalog_name", "")
+        self.database_name = context_data.get("database_name", "")
+        self._agent_config = context_data.get("agent_config")
+
+        self.inject_callback = inject_callback
+        self.selected_path = ""
+        # Current cursor data
+        self.selected_data = {}
+        self.tree_data = {}
+        self.current_node_data = None
+        self.is_fullscreen = False
+        self.db_connector: BaseSqlConnector = context_data.get("db_connector")
+
+        self.semantic_datasets: Optional[SemanticDatasetRAG] = None
+        try:
+            self.semantic_datasets = SemanticDatasetRAG(self._agent_config)
+        except Exception as exc:
+            logger.debug(f"Failed to initialize table semantic profile storage for catalog screen: {exc}")
+
+        self.loading_nodes = set()  # Track which nodes are currently loading
+        self._current_loading_task = None  # Track current async task
+        self.timeout_seconds = context_data.get("timeout_seconds", 30)  # Default 30 seconds timeout
+        self._semantic_current_record: Optional[Dict[str, Any]] = None
+
+    def _supports(self, namespace: str) -> bool:
+        return supports_namespace(namespace, connector=self.db_connector, dialect=str(self.db_type))
+
+    def compose(self) -> ComposeResult:
+        """Compose the layout of the screen."""
+        yield Header(show_clock=True, name="Catalogs")
+
+        with Horizontal():
+            # Left side: Catalog tree
+            with Vertical(id="tree-container", classes="tree-panel"):
+                yield Static("", id="tree-help")
+                yield TextualTree(label="Database Catalogs", id="catalogs-tree")
+
+            # Right side: Details panel with split layout
+            with Vertical(id="details-container", classes="details-panel"):
+                # Upper section: Columns
+                yield ScrollableContainer(
+                    Static(
+                        "Select a table and press Enter to view columns",
+                        id="columns-panel",
+                    ),
+                    can_focus=False,
+                    id="columns-panel-container",
+                )
+
+                # Divider between panels
+                yield Static(id="panel-divider")
+
+                # Lower section: Semantic model details
+                yield ScrollableContainer(
+                    Static("Select a table to view semantic model information"),
+                    id="semantic-panel-container",
+                    can_focus=False,
+                )
+
+        yield Footer()
+
+    def on_mount(self) -> None:
+        """Called when the screen is mounted."""
+        self._build_catalog_tree()
+
+    async def on_key(self, event: events.Key) -> None:
+        if event.key == "enter" or event.key == "right":
+            self.action_load_details()
+        elif event.key == "escape":
+            self.action_exit_or_cancel()
+            event.prevent_default()
+            event.stop()
+            return
+        else:
+            await super()._on_key(event)
+
+    def on_unmount(self):
+        self.clear_cache()
+        self._agent_config = None
+        self.semantic_datasets = None
+        self.db_connector = None
+
+    def _build_catalog_tree(self) -> None:
+        """Load catalog data from database connectors and populate the tree with lazy loading."""
+        try:
+            tree = self.query_one("#catalogs-tree", TextualTree)
+            tree.root.expand()
+            if not self.db_connector:
+                self.app.notify("No database connection selected", severity="warning")
+                return
+
+            # Clear existing tree
+            tree.clear()
+
+            # Show loading state
+            tree_helper = self.query_one("#tree-help", Static)
+            tree_helper.update("[dim]Loading database structure...[/dim]")
+
+            # Get top-level items based on database type - only load first level
+            if self.db_type in (DBType.SQLITE, DBType.DUCKDB):
+                # Built-in single-database connectors: show the known database directly
+                self._add_db_name(tree, self.database_name)
+            elif self._supports("catalog"):
+                # Catalog-first dialects may expose database, schema, or both below the catalog.
+                self._load_catalogs_lazy(tree)
+            else:
+                # Standard dialects: database → [schema →] tables
+                self._load_databases_lazy(tree)
+
+            # Clear loading message
+            tree_helper.update("")
+
+        except Exception as e:
+            logger.error(f"Failed to load catalog data: {str(e)}")
+            self.query_one("#tree-help", Static).update(f"[red]Error:[/] Failed to load catalog data: {str(e)}")
+            self.app.notify(f"Failed to load catalog data: {str(e)}", severity="error")
+
+    def populate_tree(self, tree: TextualTree, data: Dict) -> None:
+        """Populate the tree with catalog data."""
+        tree.clear()
+
+        for first_name, first_data in data.items():
+            first_node = tree.root.add(first_name)
+
+            for second_name, second_data in first_data.items():
+                if "identifier" in second_data:
+                    first_node.add_leaf(second_name, data=second_data)
+                    continue
+                second_node = first_node.add(second_name)
+
+                for third_name, third_data in second_data.items():
+                    if "identifier" in third_data:
+                        second_node.add_leaf(third_name, data=third_data)
+                        continue
+                    third_node = second_node.add(third_name)
+
+                    for fourth_name, fourth_data in third_data.items():
+                        third_node.add_leaf(fourth_name, data=fourth_data)
+
+    def on_tree_node_selected(self, event: TextualTree.NodeSelected) -> None:
+        """Handle tree node selection."""
+        node = event.node
+        self.current_node_data = node.data
+
+        # Update path display
+        self.update_path_display(node)
+
+        # No automatic loading - user must press Enter or Right arrow
+
+    def on_tree_node_highlighted(self, event: TextualTree.NodeHighlighted) -> None:
+        """Handle tree node highlighting."""
+        node = event.node
+        self.current_node_data = node.data
+
+        # Update path display
+        self.update_path_display(node)
+
+        # No automatic loading - user must press Enter or Right arrow
+
+    def update_path_display(self, node: TreeNode) -> None:
+        """Update the header with the current path."""
+        path_parts = []
+        current = node
+        if node.data:
+            self.selected_data = node.data
+
+        # Build path from current node up to root
+        while current and str(current.label) != "Database Catalogs":
+            name = str(current.data.get("name", ""))
+            if name:
+                path_parts.insert(0, name)
+            current = current.parent
+
+        # If we're at the root or have no data, clear the path
+        if path_parts:
+            self.selected_path = ".".join(path_parts)
+            # Update header with only the path
+            header = self.query_one(Header)
+            header._name = self.selected_path
+        else:
+            self.selected_path = ""
+            header = self.query_one(Header)
+            header._name = "Catalogs"
+
+    def show_table_details(self, table_info: Dict[str, Any]) -> None:
+        """Show table details using database connector with async loading and performance optimization."""
+        # Cancel any existing loading task
+        if (
+            hasattr(self, "_current_loading_task")
+            and self._current_loading_task
+            and not self._current_loading_task.is_finished
+        ):
+            self._current_loading_task.cancel()
+
+        # Start async loading
+        self._current_loading_task = self.load_table_details_async(table_info)
+
+    @work(thread=True)
+    async def load_table_details_async(self, table_info: Dict[str, Any]) -> None:
+        """Async worker to load table details and semantic model without blocking UI."""
+        get_current_worker()  # Get worker context
+
+        columns_panel = self.query_one("#columns-panel", Static)
+
+        try:
+            if not self.db_connector:
+                self.app.call_from_thread(columns_panel.update, "[red]No database connection available[/red]")
+                return
+
+            # Extract identifiers for downstream lookups
+            catalog_name = table_info.get("catalog_name", "")
+            database_name = table_info.get("database_name", "")
+            schema_name = table_info.get("schema_name", "")
+            table_name = table_info.get("name", "")
+            full_name = self.db_connector.full_name(catalog_name, database_name, schema_name, table_name)
+
+            # Show loading state
+            self.app.call_from_thread(
+                self._show_semantic_message,
+                f"[bold cyan]⏳ Loading[/bold cyan] [yellow]{full_name}[/yellow]\n\n"
+                f"[dim]Fetching semantic model information...[/dim]",
+            )
+            self.app.call_from_thread(
+                columns_panel.update,
+                "[bold cyan]⏳ Loading[/bold cyan] [yellow]Columns[/yellow]\n\n[dim]Fetching column schema...[/dim]",
+            )
+
+            # Load schema information (cached)
+            columns_renderable: Any
+
+            table_schema = self._get_cached_schema(
+                catalog_name=catalog_name,
+                database_name=database_name,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+
+            if len(table_schema) == 0:
+                columns_renderable = f"[yellow]No schema information available for {full_name}[/yellow]"
+            else:
+                columns_renderable = self._create_optimized_table(table_schema, full_name)
+
+            self.app.call_from_thread(columns_panel.update, columns_renderable)
+            self.app.call_from_thread(self.load_semantic_detail, catalog_name, database_name, schema_name, table_name)
+
+        except Exception as e:  # pragma: no cover - defensive logging for UI thread
+            logger.error(f"Failed to load table details: {str(e)}")
+            error_msg = str(e)
+            message = (
+                (
+                    "[yellow]⏱️ Timeout:[/] Failed to load table details (press 'r' to retry)\n\n[dim]"
+                    f"Error: {error_msg}[/dim]"
+                )
+                if "timeout" in error_msg.lower()
+                else f"[red]❌ Error:[/] Failed to display table details: {error_msg}"
+            )
+            self._show_semantic_message(message)
+            columns_panel.update("")
+
+    def action_load_details(self) -> None:
+        """Load table details when Enter or Right arrow is pressed on a table."""
+        tree = self.query_one("#catalogs-tree", TextualTree)
+        if not tree.has_focus or tree.cursor_node is None:
+            return
+
+        node = tree.cursor_node
+        if node.data and node.data.get("type") == "table":
+            self.selected_data = node.data
+            self.show_table_details(node.data)
+        else:
+            # For non-table nodes, expand/collapse them
+            if node.is_expanded:
+                node.collapse()
+            else:
+                node.expand()
+
+    def action_start_edit(self) -> None:
+        """Explain where semantic models are edited, since it is no longer here.
+
+        The YAML under ``subject/semantic_models`` is the single source of
+        truth, and ``semantic_modeling`` is the only path that validates a
+        change against the OSI spec before writing it back.
+        """
+        self.app.notify(
+            "Semantic models are read-only here. Use the semantic_modeling agent to edit them.",
+            severity="warning",
+        )
+
+    def _get_cached_schema(self, catalog_name: str, database_name: str, schema_name: str, table_name: str) -> list:
+        """Get cached schema data using LRU cache."""
+        return _fetch_schema_with_cache(self.db_connector, catalog_name, database_name, schema_name, table_name)
+
+    def _replace_semantic_panel(self, widget: Widget) -> None:
+        container = self.query_one("#semantic-panel-container", ScrollableContainer)
+        for child in list(container.children):
+            child.remove()
+        container.mount(widget)
+        self.app.call_after_refresh(lambda: container.refresh(layout=True))
+
+    def _show_semantic_message(self, message: str, *, style: Optional[str] = None) -> None:
+        text = Text(message, style=style) if style else message
+        self._semantic_current_record = None
+        self._replace_semantic_panel(Static(text))
+
+    def _render_readonly_panel(self, semantic_record: Dict[str, Any]) -> Group:
+        """Build the semantic model panel content."""
+        from rich import box
+
+        sections: List[Table] = []
+
+        table = Table(
+            title=(f"[bold cyan]📋 Semantic Model: {semantic_record.get('semantic_model_name', 'Unnamed')}[/]"),
+            show_header=False,
+            box=box.SIMPLE,
+            border_style=TABLE_BORDER_STYLE,
+            expand=True,
+            padding=(0, 1),
+        )
+
+        table.add_column("Key", style="bright_cyan", ratio=1)
+        table.add_column("Value", style="yellow", justify="left", ratio=3, no_wrap=False)
+
+        table.add_row("Semantic Model Name", semantic_record.get("semantic_model_name", "") or "[dim]N/A[/dim]")
+        if semantic_record.get("dataset_name"):
+            table.add_row("Dataset", semantic_record.get("dataset_name", "") or "[dim]N/A[/dim]")
+        table.add_row("Description", semantic_record.get("description", "") or "[dim]N/A[/dim]")
+        table.add_row("AI Context", self._create_nested_table_for_json(semantic_record.get("ai_context")))
+        table.add_row("Relationships", self._create_nested_table_for_json(semantic_record.get("relationships")))
+
+        sections.append(table)
+
+        columns_table = self._create_columns_table(semantic_record)
+        if columns_table is not None:
+            sections.append(columns_table)
+            # Below the table, not as a per-column mark: a key may span several
+            # columns, and ticking each one loses which columns form it.
+            unique_keys = semantic_record.get("unique_keys") or []
+            if unique_keys:
+                rendered = "  ".join(f"({', '.join(str(c) for c in key)})" for key in unique_keys if key)
+                sections.append(Text.from_markup(f"[bright_cyan]Unique keys[/]  [yellow]{rendered}[/]"))
+
+        return Group(*sections)
+
+    def _create_columns_table(self, semantic_record: Dict[str, Any]) -> Optional[Table]:
+        """One row per physical column, annotated with what the model says.
+
+        Physical columns that no field models are shown dimmed rather than
+        hidden: the gap between the two is the point of the view.
+        """
+        from rich import box
+
+        fields = [f for f in semantic_record.get("modelled_fields") or [] if f.get("name")]
+        # Aliases resolve a physical column to its field; they are lookup keys
+        # only. Emitting a row per alias would list a field whose expression
+        # names a different column twice.
+        by_alias: Dict[str, Dict[str, Any]] = {}
+        for field in fields:
+            by_alias.setdefault(str(field.get("name", "")).strip("`").lower(), field)
+        for field in fields:
+            # Strip after taking the basename: a qualifier carries its own
+            # quotes, so `orders.\`created_at\`` would otherwise keep the
+            # leading backtick and match no column.
+            expr = str(field.get("expr", "") or "").lower()
+            basename = expr.rsplit(".", 1)[-1].strip("`").strip('"').strip()
+            if basename:
+                by_alias.setdefault(basename, field)
+
+        physical = self._physical_columns(semantic_record)
+        if not physical and not fields:
+            return None
+
+        rows: List[tuple] = []
+        matched: set = set()
+        for column in physical:
+            name = str(column.get("name", ""))
+            field = by_alias.get(name.strip("`").lower())
+            if field is not None:
+                matched.add(id(field))
+            rows.append((name, str(column.get("type", "")), field, str(column.get("comment", "") or "")))
+        # A field the connector reported no column for still belongs here: a
+        # computed expression has no physical column of its own.
+        for field in fields:
+            if id(field) not in matched:
+                rows.append((str(field.get("name", "")), "", field, ""))
+
+        modelled_count = sum(1 for _, _, field, _ in rows if field)
+        columns_table = Table(
+            title=f"[bold cyan]Columns[/] [dim]({modelled_count} modelled / {len(rows)} total)[/dim]",
+            box=box.SIMPLE,
+            border_style=TABLE_BORDER_STYLE,
+            header_style=TABLE_HEADER_STYLE,
+            expand=True,
+            padding=(0, 1),
+        )
+        columns_table.add_column("column", ratio=2, no_wrap=True)
+        columns_table.add_column("type", ratio=2, no_wrap=True)
+        columns_table.add_column("key", ratio=1, justify="center", no_wrap=True)
+        columns_table.add_column("time", ratio=1, justify="center", no_wrap=True)
+        columns_table.add_column("description", ratio=5, no_wrap=False)
+
+        for name, physical_type, field, ddl_comment in rows:
+            if field:
+                description = field.get("description") or ddl_comment
+                columns_table.add_row(
+                    name,
+                    physical_type,
+                    "✓" if field.get("is_primary_key") else "",
+                    str(field.get("time_granularity") or "") if field.get("is_time") else "",
+                    description,
+                )
+            else:
+                dim = "[dim]{}[/dim]".format
+                columns_table.add_row(dim(name), dim(physical_type), "", "", dim(ddl_comment) if ddl_comment else "")
+        return columns_table
+
+    def _physical_columns(self, semantic_record: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Live columns for the selected table, or [] when unavailable.
+
+        The catalog is a browser: a datasource that is slow or down must dim
+        the physical half of this view, never fail the panel.
+        """
+        table_name = str(semantic_record.get("table_name", "") or "")
+        if not table_name or self.db_connector is None:
+            return []
+        try:
+            # Through the screen's LRU cache: the table details pane has
+            # usually fetched this already, and a slow datasource must not be
+            # hit twice from the Textual event thread.
+            return list(
+                self._get_cached_schema(
+                    semantic_record.get("catalog_name", "") or self.catalog_name,
+                    semantic_record.get("database_name", "") or self.database_name,
+                    semantic_record.get("schema_name", "") or "",
+                    table_name,
+                )
+                or []
+            )
+        except Exception as exc:  # pragma: no cover - defensive, datasource may be down
+            logger.debug(f"Could not read physical columns for {table_name!r}: {exc}")
+            return []
+
+    def _show_semantic_panel(
+        self, record: Optional[Dict[str, Any]], message: Optional[str] = None, message_style: Optional[str] = None
+    ) -> None:
+        if not record:
+            self._show_semantic_message(message or "No semantic model information available.", style=message_style)
+            return
+        self._semantic_current_record = dict(record)
+        self._replace_semantic_panel(
+            FocusableStatic(
+                self._render_readonly_panel(semantic_record=record),
+                classes="semantic-panel",
+                id="semantic-panel",
+            )
+        )
+
+    def _create_nested_table_for_json(self, field_value: Any) -> Any:
+        """Create nested table for JSON field values."""
+        from rich import box
+
+        if not field_value or field_value == "N/A":
+            return "[dim]N/A[/dim]"
+
+        # Parse JSON string if needed
+        parsed_data = field_value
+        if isinstance(field_value, str):
+            try:
+                parsed_data = json.loads(field_value)
+            except (json.JSONDecodeError, TypeError):
+                # If not valid JSON, return as simple colored text
+                if field_value.startswith("[") and field_value.endswith("]"):
+                    return f"[bright_green]{field_value}[/bright_green]"
+                if field_value.startswith("{") and field_value.endswith("}"):
+                    return f"[bright_blue]{field_value}[/bright_blue]"
+                return str(field_value)
+
+        # Create nested table based on data type
+        if isinstance(parsed_data, list):
+            if not parsed_data:
+                return "[dim]Empty list[/dim]"
+
+            nested_table = Table(
+                show_header=True,
+                box=box.ROUNDED,
+                border_style="dim",
+                padding=(0, 0),
+                expand=True,
+                row_styles=["on grey15", "on grey23"],
+            )
+            if parsed_data and isinstance(parsed_data[0], dict):
+                # Collect all unique keys with a readable semantic-column order.
+                all_keys = _ordered_nested_table_keys(parsed_data)
+
+                for key in all_keys:
+                    nested_table.add_column(str(key), style="dim cyan", justify="center")
+
+                for item in parsed_data:
+                    # Get values in the same order as all_keys, use "-" for missing keys
+                    values = [str(item.get(key, "-")) for key in all_keys]
+                    nested_table.add_row(*values)
+            else:
+                nested_table.add_column("Value", style="dim cyan")
+                for item in parsed_data:
+                    nested_table.add_row(str(item))
+
+            return nested_table
+
+        if isinstance(parsed_data, dict):
+            if not parsed_data:
+                return "[dim]Empty object[/dim]"
+
+            nested_table = Table(
+                show_header=True,
+                box=box.ROUNDED,
+                border_style="dim",
+                padding=(0, 1),
+                expand=True,
+                row_styles=["on grey15", "on grey23"],
+            )
+            nested_table.add_column("Property", style="bright_cyan", width=15)
+            nested_table.add_column("Value", style="bright_yellow")
+
+            for key, value in parsed_data.items():
+                if isinstance(value, (dict, list)):
+                    value_str = to_pretty_str(value)
+                else:
+                    value_str = str(value)
+                nested_table.add_row(str(key), value_str)
+
+            return nested_table
+
+        # For simple values, return as formatted string
+        return f"[bright_white]{str(parsed_data)}[/bright_white]"
+
+    def _create_optimized_table(self, table_schema: list, full_name: str) -> Table:
+        """Create optimized Rich table with performance considerations."""
+        # Use simpler styling for performance
+        table = Table(
+            title=f"[bold cyan]📊 {full_name}[/bold cyan]",
+            show_header=True,
+            box=box.SIMPLE,
+            border_style=TABLE_BORDER_STYLE,
+            header_style=HEADER_BOLD_CYAN,
+            expand=True,
+            padding=(0, 1),
+            row_styles=["on grey15", "on grey23"],
+        )
+
+        table.add_column("#", style="dim", width=3, justify="left")
+        table.add_column("Column", style="bright_cyan", min_width=15, max_width=25)
+        table.add_column("Type", style="bright_magenta", min_width=8, max_width=15)
+        table.add_column("Null", style="yellow", width=3, justify="left")
+        table.add_column("Default", style="green", min_width=5, max_width=12)
+        table.add_column("PK", style="red", width=2, justify="left")
+        table.add_column("Comment", style="bright_white", min_width=10, max_width=30)
+
+        # Batch add rows for better performance
+        # max_columns = min(len(table_schema), 100)  # Limit for very large schemas
+        for idx, column in enumerate(table_schema, 1):
+            if not isinstance(column, dict):
+                continue
+
+            # Skip invalid columns with no name or 'unknown' name
+            col_name = str(column.get("name", "")).strip()
+            if not col_name or col_name.lower() == "unknown":
+                continue
+
+            col_type = str(column.get("type", "Unknown"))[:15]
+            nullable = "✓" if column.get("nullable", True) else "✗"
+            default = str(column.get("default_value", ""))[:12] or "-"
+            is_key = "✓" if column.get("pk", False) else "-"
+            comment = str(column.get("comment", ""))[:30] or "-"
+
+            table.add_row(str(idx), col_name, col_type, nullable, default, is_key, comment)
+
+        # Add note if truncated
+        # if len(table_schema) > max_columns:
+        #     table.add_row("...", f"+{len(table_schema) - max_columns} more", "", "", "", "")
+
+        return table
+
+    def _fetch_table_semantic_profile_record(
+        self,
+        *,
+        catalog_name: str = "",
+        database_name: str = "",
+        schema_name: str = "",
+        table_name: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        if not self.semantic_datasets:
+            return None
+        return self.semantic_datasets.get_table_projection(
+            catalog_name=catalog_name,
+            database_name=database_name,
+            schema_name=schema_name,
+            table_name=table_name,
+        )
+
+    @staticmethod
+    def _decode_profile_json(value: Any, default: Any) -> Any:
+        if value in (None, ""):
+            return default
+        if isinstance(value, (dict, list)):
+            return value
+        if not isinstance(value, str):
+            return default
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _semantic_record_from_table_profile(self, projection: Dict[str, Any]) -> Dict[str, Any]:
+        ai_context = self._decode_profile_json(projection.get("ai_context_json"), None)
+
+        # Every authored field, in order. Splitting them into identifiers and
+        # dimensions dropped the rest: OSI has no measure concept, so a field
+        # that is neither a key nor a time dimension is still a perfectly
+        # ordinary column, and most of them are.
+        modelled_fields = []
+        for field in projection.get("fields") or []:
+            if not isinstance(field, dict):
+                continue
+            modelled_fields.append(
+                {
+                    "name": str(field.get("name", "") or ""),
+                    "expr": str(field.get("expr", "") or ""),
+                    "time_granularity": str(field.get("time_granularity", "") or ""),
+                    "is_time": bool(field.get("is_time")),
+                    "is_primary_key": bool(field.get("is_primary_key")),
+                    "description": str(field.get("description", "") or ""),
+                    "ai_context": self._decode_profile_json(field.get("ai_context_json"), None),
+                }
+            )
+
+        relationships = [
+            {
+                key: value
+                for key, value in {
+                    "name": relationship.get("name", ""),
+                    "from": relationship.get("from_dataset", ""),
+                    "to": relationship.get("to_dataset", ""),
+                    "from_columns": self._decode_profile_json(relationship.get("from_columns_json"), []),
+                    "to_columns": self._decode_profile_json(relationship.get("to_columns_json"), []),
+                    "type": relationship.get("rel_type", ""),
+                }.items()
+                if value not in (None, "", [], {})
+            }
+            for relationship in projection.get("relationships") or []
+        ]
+
+        return {
+            "_source": "table_semantic_profile",
+            "table_name": projection.get("source_table", ""),
+            "catalog_name": projection.get("catalog_name", ""),
+            "database_name": projection.get("database_name", ""),
+            "schema_name": projection.get("schema_name", ""),
+            "semantic_model_name": projection.get("semantic_model_name", ""),
+            "dataset_name": projection.get("dataset_name", ""),
+            "description": projection.get("description", ""),
+            "ai_context": ai_context,
+            "unique_keys": self._decode_profile_json(projection.get("unique_keys_json"), []) or [],
+            "modelled_fields": modelled_fields,
+            "relationships": relationships,
+        }
+
+    def action_cursor_down(self) -> None:
+        """Move cursor down."""
+        tree = self.query_one("#catalogs-tree", TextualTree)
+        if not tree.has_focus:
+            return
+        tree.action_cursor_down()
+        self.clear_header()
+
+    def clear_header(self):
+        self.query_one("#tree-help", Static).update("")
+
+    def action_cursor_up(self) -> None:
+        """Move cursor up."""
+        tree = self.query_one("#catalogs-tree", TextualTree)
+        if not tree.has_focus:
+            return
+        tree.action_cursor_up()
+        self.clear_header()
+
+    def action_collapse_node(self) -> None:
+        """Collapse the current node."""
+        tree = self.query_one("#catalogs-tree", TextualTree)
+        if not tree.has_focus:
+            return
+        if tree.cursor_node is not None:
+            tree.cursor_node.collapse()
+
+    def action_show_navigation_help(self) -> None:
+        """Toggle navigation help popup."""
+        # Check if navigation help is currently the top screen
+        current_screen = self.app.screen_stack[-1] if self.app.screen_stack else None
+
+        if isinstance(current_screen, NavigationHelpScreen):
+            # Close the navigation help if it's already open
+            self.app.pop_screen()
+        else:
+            # Show navigation help
+            self.app.push_screen(NavigationHelpScreen())
+
+    def action_toggle_fullscreen(self) -> None:
+        """Toggle fullscreen mode."""
+        self.is_fullscreen = not self.is_fullscreen
+        tree_container = self.query_one("#tree-container")
+        details_container = self.query_one("#details-container")
+
+        if self.is_fullscreen:
+            tree_container.styles.width = "100%"
+            details_container.styles.width = "0%"
+            tree_container.add_class("fullscreen")
+            details_container.remove_class("fullscreen")
+        else:
+            tree_container.styles.width = "50%"
+            details_container.styles.width = "50%"
+            tree_container.remove_class("fullscreen")
+            details_container.add_class("fullscreen")
+
+    def action_show_path(self) -> None:
+        """Show the current selected full path in details panel."""
+        if self.selected_path:
+            tree_header = self.query_one("#tree-help", Static)
+            tree_header.update(f"Selected Path: {self.selected_path}")
+
+    def action_exit_with_selection(self) -> None:
+        """Exit screen and send selected path to CLI."""
+        if self.selected_path and self.inject_callback:
+            # Send the selected path to the CLI
+            self.inject_callback(self.selected_path, self.selected_data)
+        # Exit the screen
+        self.app.exit()
+
+    def action_quit_if_idle(self) -> None:
+        """Exit on a bare `q`."""
+        self.action_exit_without_selection()
+
+    def action_exit_or_cancel(self):
+        self.action_exit_without_selection()
+
+    def action_exit_without_selection(self) -> None:
+        """Exit screen without selection and clear selected path."""
+        # Clear the selected path when ESC is pressed
+        self.selected_path = ""
+        self.selected_data = {}
+        # Exit the screen
+        self.app.exit()
+
+    def action_retry_current_node(self) -> None:
+        """Retry loading the current node if it failed with timeout."""
+        tree = self.query_one("#catalogs-tree", TextualTree)
+        if tree.cursor_node is None:
+            return
+
+        node = tree.cursor_node
+        if node.data and node.data.get("type") in ["timeout", "error"]:
+            # Find the parent node to retry loading
+            parent = node.parent
+            if parent:
+                # Remove timeout/error node
+                node.remove()
+                # Retry loading the parent node
+                self._retry_load_node(parent)
+
+    def _retry_load_node(self, node: TreeNode) -> None:
+        """Retry loading a specific node."""
+        if not node.data:
+            return
+
+        node_type = node.data.get("type")
+
+        # Clear any existing children by removing them individually
+        for child in list(node.children):
+            child.remove()
+
+        # Add loading indicator
+        if node_type == "database":
+            if self._supports("schema"):
+                node.add_leaf("⏳ Loading schemas...", data={"type": "loading"})
+            else:
+                node.add_leaf("⏳ Loading tables...", data={"type": "loading"})
+        elif node_type == "catalog":
+            node.add_leaf("⏳ Loading databases...", data={"type": "loading"})
+        elif node_type == "schema":
+            node.add_leaf("⏳ Loading tables...", data={"type": "loading"})
+
+        # Trigger reload
+        node.expand()
+
+    def _load_databases_lazy(self, tree: TextualTree) -> None:
+        """Lazy load databases for MySQL, PostgreSQL, DuckDB, etc."""
+        try:
+            databases = self.db_connector.get_databases()
+            if not databases:
+                tree.root.add_leaf("📂 No databases found", data={"type": "empty"})
+                return
+
+            for db_name in databases:
+                self._add_db_name(tree, db_name)
+        except Exception as e:
+            logger.error(f"Failed to load databases: {str(e)}")
+            if "timeout" in str(e).lower():
+                tree.root.add_leaf(
+                    "⏱️ Timeout loading databases (press 'r' to retry)",
+                    data={"type": "timeout", "operation": "databases"},
+                )
+            else:
+                tree.root.add_leaf("❌ Error loading databases", data={"type": "error"})
+
+    def _add_db_name(self, tree: TextualTree, db_name: str):
+        db_node = tree.root.add(f"📁 {db_name}", data={"type": "database", "name": db_name})
+        support_schema = self._supports("schema")
+        db_node.add_leaf(
+            f"⏳ Loading {'schemas' if support_schema else 'tables'}...",
+            data={"type": "loading"},
+        )
+
+    def _load_catalogs_lazy(self, tree: TextualTree) -> None:
+        """Lazy load catalogs for StarRocks and similar systems."""
+        try:
+            catalogs = [self.catalog_name or self.db_connector.catalog_name]
+            if not catalogs:
+                self._load_databases_lazy(tree)
+            else:
+                for catalog_name in catalogs:
+                    catalog_node = tree.root.add(f"📁 {catalog_name}", data={"type": "catalog", "name": catalog_name})
+                    catalog_node.add_leaf("⏳ Loading databases...", data={"type": "loading"})
+        except Exception as e:
+            logger.error(f"Failed to load catalogs: {str(e)}")
+            if "timeout" in str(e).lower():
+                tree.root.add_leaf(
+                    "⏱️ Timeout loading catalogs (press 'r' to retry)",
+                    data={"type": "timeout", "operation": "catalogs"},
+                )
+            else:
+                tree.root.add_leaf("❌ Error loading catalogs", data={"type": "error"})
+
+    def on_tree_node_expanded(self, event: TextualTree.NodeExpanded) -> None:
+        """Handle tree node expansion for lazy loading - optimized for speed."""
+        node = event.node
+        if not node.data:
+            return
+
+        node_type = node.data.get("type")
+
+        # Check for loading placeholders
+        loading_children = [child for child in node.children if child.data and child.data.get("type") == "loading"]
+        for loading_child in loading_children:
+            loading_child.remove()
+
+        # Check if this node has already been loaded or is currently loading
+        node_key = str(node.label)
+        if node_key in self.loading_nodes:
+            return
+
+        # Skip if node already has children (except loading placeholders)
+        if node.children and not loading_children:
+            return
+
+        # Mark as loading
+        self.loading_nodes.add(node_key)
+
+        try:
+            if node_type == "database":
+                if self._supports("schema"):
+                    self._load_schemas_for_database(node)
+                else:
+                    self._load_tables_for_schema(node)
+            elif node_type == "catalog":
+                if self._supports("database"):
+                    self._load_databases_for_catalog(node)
+                else:
+                    self._load_schemas_for_database(node)
+            elif node_type == "schema":
+                self._load_tables_for_schema(node)
+        except Exception as e:
+            logger.error(f"Error loading node {node_key}: {str(e)}")
+            node.add_leaf("❌ Error loading data", data={"type": "error"})
+        finally:
+            # Remove from loading set
+            self.loading_nodes.discard(node_key)
+
+    def clear_cache(self) -> None:
+        """Clear all caches to free memory."""
+        _fetch_schema_with_cache.cache_clear()
+
+    def _load_schemas_for_database(self, parent_node: TreeNode) -> None:
+        """Load schemas below a database or directly below a catalog."""
+        node_name = str(parent_node.label).replace("📁 ", "")
+        node_data = parent_node.data or {}
+        if node_data.get("type") == "catalog":
+            catalog_name = str(node_data.get("name") or node_name)
+            db_name = ""
+        else:
+            catalog_name = str(node_data.get("catalog") or "")
+            db_name = str(node_data.get("name") or node_name)
+        try:
+            self.db_connector.switch_context(catalog_name=catalog_name, database_name=db_name)
+            schemas = self.db_connector.get_schemas(catalog_name=catalog_name, database_name=db_name)
+
+            if not schemas:
+                parent_node.add_leaf("📂 No schemas found", data={"type": "empty"})
+                return
+
+            for schema_name in schemas:
+                schema_node = parent_node.add(
+                    f"📂 {schema_name}",
+                    data={
+                        "type": "schema",
+                        "name": schema_name,
+                        "database": db_name,
+                        "catalog": catalog_name,
+                    },
+                )
+                schema_node.add_leaf("⏳ Loading tables...", data={"type": "loading"})
+        except DatusException as e:
+            context_name = db_name or catalog_name
+            logger.error(f"Failed to load schemas for {context_name}: {str(e)}")
+            if e.code == ErrorCode.DB_EXECUTION_TIMEOUT.code:
+                parent_node.add_leaf(
+                    "⏱️ Timeout loading schemas (press 'r' to retry)",
+                    data={"type": "timeout", "operation": "schemas", "parent": context_name},
+                )
+            else:
+                parent_node.add_leaf("❌ Error loading schemas", data={"type": "error"})
+
+    def _load_databases_for_catalog(self, catalog_node: TreeNode) -> None:
+        """Load databases for a catalog node."""
+        catalog_name = str(catalog_node.label).replace("📁 ", "")
+        try:
+            databases = self.db_connector.get_databases(catalog_name=catalog_name)
+
+            if not databases:
+                catalog_node.add_leaf("📂 No databases found", data={"type": "empty"})
+                return
+
+            for db_name in databases:
+                db_node = catalog_node.add(
+                    f"📁 {db_name}", data={"type": "database", "name": db_name, "catalog": catalog_name}
+                )
+                db_node.add_leaf("⏳ Loading schemas...", data={"type": "loading"})
+        except DatusException as e:
+            logger.error(f"Failed to load databases for catalog {catalog_name}: {str(e)}")
+            if e.code == ErrorCode.DB_EXECUTION_TIMEOUT.code:
+                catalog_node.add_leaf(
+                    "⏱️ Timeout loading databases (press 'r' to retry)",
+                    data={"type": "timeout", "operation": "databases", "parent": catalog_name},
+                )
+            else:
+                catalog_node.add_leaf("❌ Error loading databases", data={"type": "error"})
+
+    def _load_tables_for_schema(self, schema_node: TreeNode) -> None:
+        """Load tables for a schema node."""
+        if not self._supports("schema"):
+            schema_name = ""
+            db_name = schema_node.data.get("name")
+            if not self._supports("catalog"):
+                catalog_name = ""
+            else:
+                catalog_name = "" if not schema_node.parent else schema_node.parent.data.get("name")
+
+        else:
+            schema_name = str(schema_node.data.get("name", ""))
+            parent = schema_node.parent
+            if not parent:
+                return
+            if self._supports("database"):
+                db_name = parent.data.get("name")
+                if self._supports("catalog"):
+                    parent = parent.parent
+                    catalog_name = "" if not parent or not parent.data else parent.data.get("name")
+                else:
+                    catalog_name = ""
+            else:
+                db_name = ""
+                catalog_name = "" if not self._supports("catalog") else parent.data.get("name")
+
+        try:
+            tables = self.db_connector.get_tables(
+                catalog_name=catalog_name, database_name=db_name, schema_name=schema_name
+            )
+
+            if not tables:
+                schema_node.add_leaf("📂 No tables found", data={"type": "empty"})
+                return
+
+            for table_name in sorted(tables):
+                table_data = {
+                    "type": "table",
+                    "name": table_name,
+                    "table_type": "table",
+                    "schema_name": schema_name,
+                    "database_name": db_name,
+                    "catalog_name": catalog_name,
+                    "identifier": self.db_connector.identifier(catalog_name, db_name, schema_name, table_name),
+                }
+                schema_node.add_leaf(f"📋 {table_name}", data=table_data)
+        except DatusException as e:
+            logger.error(f"Failed to load tables for schema {schema_name}: {str(e)}")
+            if e.code == ErrorCode.DB_EXECUTION_TIMEOUT.code:
+                schema_node.add_leaf(
+                    "⏱️ Timeout loading tables (press 'r' to retry)",
+                    data={"type": "timeout", "operation": "tables", "parent": schema_name},
+                )
+            else:
+                schema_node.add_leaf("❌ Error loading tables", data={"type": "error"})
+
+    def load_semantic_detail(
+        self, catalog_name: str = "", database_name: str = "", schema_name: str = "", table_name: str = ""
+    ):
+        # Load semantic model details, if storage is available
+        semantic_record: Optional[Dict[str, Any]] = None
+        message: Optional[str] = None
+        message_style = "dim"
+
+        if self.semantic_datasets:
+            try:
+                profile_record = self._fetch_table_semantic_profile_record(
+                    catalog_name=catalog_name,
+                    database_name=database_name,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                )
+                if profile_record:
+                    semantic_record = self._semantic_record_from_table_profile(profile_record)
+            except Exception as storage_error:  # pragma: no cover - defensive logging
+                message = f"Failed to load table semantic profile: {storage_error}"
+                message_style = "red"
+                logger.error(
+                    (
+                        f"Failed to load table semantic profile: catalog_name={catalog_name}, "
+                        f"database_name={database_name}, schema_name={schema_name}, table_name={table_name}, "
+                        f"error_msg = {storage_error}"
+                    )
+                )
+
+        if not semantic_record and message is None:
+            message = "No semantic model found for this table."
+
+        self._show_semantic_panel(semantic_record, message, message_style)
+
+
+class NavigationHelpScreen(ModalScreen):
+    """Modal screen to display navigation help."""
+
+    def compose(self) -> ComposeResult:
+        """Compose the navigation help modal."""
+        yield Container(
+            Static(
+                "# Navigation Help\n\n"
+                "## Arrow Key Navigation:\n"
+                "• ↑ - Move cursor up\n"
+                "• ↓ - Move cursor down\n"
+                "• → - Expand current node\n"
+                "• ← - Collapse current node\n\n"
+                "## Other Keys:\n"
+                "• F1 - Toggle fullscreen\n"
+                "• F2 - Toggle this help\n"
+                "• Enter - Load table details\n"
+                "• F4 - Show path\n"
+                "• F5 - Select and exit\n"
+                "• Ctrl+r - Retry loading (on timeout/error)\n"
+                "• Esc - Exit\n\n"
+                "Semantic models are read-only here; edit them with the "
+                "semantic_modeling agent.\n\n"
+                "Press any key to close this help.",
+                id="navigation-help-content",
+            ),
+            id="navigation-help-container",
+        )
+
+    def on_key(self, event) -> None:
+        """Close the modal on any key press."""
+        self.dismiss()
