@@ -110,10 +110,10 @@ pico-finops-agent = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Vangala23/Pico"
-Documentation = "https://github.com/Vangala23/Pico/blob/main/docs/CUSTOMER-SETUP-GUIDE.md"
-Repository = "https://github.com/Vangala23/Pico"
-"Bug Tracker" = "https://github.com/Vangala23/Pico/issues"
+Homepage = "https://github.com/CloudpiAi/Pico"
+Documentation = "https://github.com/CloudpiAi/Pico/blob/main/docs/CUSTOMER-SETUP-GUIDE.md"
+Repository = "https://github.com/CloudpiAi/Pico"
+"Bug Tracker" = "https://github.com/CloudpiAi/Pico/issues"
 
 [project.scripts]
 pico-agent = "pico.entrypoints:agent_main"

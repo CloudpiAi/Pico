@@ -159,7 +159,7 @@ The permission files are in this repo under [`policies/aws/`](../policies/aws/):
 `ec2-role-trust.json`, `loader-role-policy.json` and `loader-role-trust.json`. Copy them into a new folder:
 
 ```bash
-git clone https://github.com/Vangala23/Pico.git pico-finops-agent
+git clone https://github.com/CloudpiAi/Pico.git pico-finops-agent
 mkdir pico-finops-agent-iam && cp pico-finops-agent/policies/aws/*.json pico-finops-agent-iam/
 cd pico-finops-agent-iam
 ```
@@ -278,7 +278,7 @@ On the EC2:
 
 ```bash
 sudo dnf install -y git                     # or: sudo apt-get install -y git
-git clone https://github.com/Vangala23/Pico.git ~/pico-finops-agent && cd ~/pico-finops-agent
+git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent && cd ~/pico-finops-agent
 docker compose build                        # builds the image pico-finops-agent:local (a few minutes)
 umask 077                                   # the settings file holds keys: readable by you only
 cp .env.example .env
@@ -451,6 +451,6 @@ To remove everything, also delete these in AWS:
 - **Hardened containers:** they run as a normal user, read-only, with no extra privileges.
 - **Keep `.env` private:** it holds the LLM API keys and the Slack tokens.
 
-**Questions or problems:** open an issue at [github.com/Vangala23/Pico](https://github.com/Vangala23/Pico/issues) and include the output of
+**Questions or problems:** open an issue at [github.com/CloudpiAi/Pico](https://github.com/CloudpiAi/Pico/issues) and include the output of
 `docker logs --tail 100 pico-finops-agent`. The agent doesn't print your keys or tokens, but please look through it
 before you send it.
