@@ -1,0 +1,205 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+from typing import AsyncGenerator, Dict, List, Optional
+
+from pico.agent.node import Node
+from pico.agent.workflow import Workflow
+from pico.configuration.agent_config import AgentConfig
+from pico.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from pico.schemas.base import BaseInput
+from pico.schemas.node_models import TableSchema, TableValue
+from pico.schemas.schema_linking_node_models import SchemaLinkingInput, SchemaLinkingResult
+from pico.tools.lineage_graph_tools.schema_lineage import SchemaLineageTool
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+class SchemaLinkingNode(Node):
+    def __init__(
+        self,
+        node_id: str,
+        description: str,
+        node_type: str,
+        input_data: Optional[BaseInput] = None,
+        agent_config: Optional[AgentConfig] = None,
+    ):
+        super().__init__(
+            node_id=node_id,
+            description=description,
+            node_type=node_type,
+            input_data=input_data,
+            agent_config=agent_config,
+        )
+        self._table_schemas: List[TableSchema] = []
+        self._table_values: List[TableValue] = []
+
+    def execute(self):
+        self.result = self._execute_schema_linking()
+
+    async def execute_stream(
+        self, action_history_manager: Optional[ActionHistoryManager] = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Execute schema linking with streaming support."""
+        async for action in self._schema_linking_stream(action_history_manager):
+            yield action
+
+    def update_context(self, workflow: Workflow) -> Dict:
+        """Update schema linking results to workflow context."""
+        result = self.result
+        try:
+            if len(workflow.context.table_schemas) == 0:
+                workflow.context.table_schemas = result.table_schemas
+                workflow.context.table_values = result.table_values
+            else:
+                pass  # if it's not the first schema linking, wait it after execute_sql
+
+            return {"success": True, "message": "Updated schema linking context"}
+        except Exception as e:
+            logger.error(f"Failed to update schema linking context: {str(e)}")
+            return {"success": False, "message": f"Schema linking context update failed: {str(e)}"}
+
+    def setup_input(self, workflow: Workflow) -> Dict:
+        logger.info("Setup schema linking input")
+
+        if workflow.context and workflow.context.table_schemas:
+            self._table_schemas = workflow.context.table_schemas
+            self._table_values = workflow.context.table_values
+            self.input = SchemaLinkingInput(
+                input_text=workflow.task.task,
+                matching_rate=self.agent_config.schema_linking_rate,
+                database_type=workflow.task.database_type,
+                database_name=workflow.task.database_name,
+                sql_context=None,
+                table_type=workflow.task.schema_linking_type,
+            )
+        else:
+            # Setup schema linking input
+            next_input = SchemaLinkingInput(
+                input_text=workflow.task.task,
+                matching_rate=self.agent_config.schema_linking_rate,
+                database_type=workflow.task.database_type,
+                database_name=workflow.task.database_name,
+                sql_context=None,
+                table_type=workflow.task.schema_linking_type,
+            )
+            self.input = next_input
+        return {"success": True, "message": "Schema prepared"}
+
+    def _execute_schema_linking(self) -> SchemaLinkingResult:
+        """Execute schema linking action to analyze database schema.
+        Input:
+            query - The input query to analyze.
+        Returns:
+            A validated SchemaLinkingResult containing table schemas and values.
+        """
+        if self._table_schemas:
+            return SchemaLinkingResult(
+                success=True,
+                table_schemas=self._table_schemas,
+                table_values=self._table_values,
+                schema_count=0 if not self._table_schemas else len(self._table_schemas),
+                value_count=0 if not self._table_values else len(self._table_values),
+            )
+        import os
+
+        path = self.agent_config.rag_storage_path()
+        logger.debug(f"Checking if rag storage path exists: {path}")
+        if not os.path.exists(path):
+            logger.info(f"RAG storage path `{path}` does not exist.")
+            return self._execute_schema_linking_fallback(SchemaLineageTool(self.agent_config))
+        else:
+            tool = SchemaLineageTool(agent_config=self.agent_config)
+            try:
+                # Import SchemaLineageTool only when needed
+                if tool:
+                    result = tool.execute(self.input, self.model)
+                    if not result.success:
+                        logger.warning(f"Schema linking failed: {result.error}")
+                        return self._execute_schema_linking_fallback(tool)
+                    logger.info(f"Schema linking result: found {len(result.table_schemas)} tables")
+                    if len(result.table_schemas) > 0:
+                        return result
+                    logger.info("No tables found, using fallback method")
+                    return self._execute_schema_linking_fallback(tool)
+                else:
+                    logger.warning("Schema linking tool not found")
+                    return self._execute_schema_linking_fallback(tool)
+            except Exception as e:
+                logger.warning(f"Schema linking tool initialization failed: {e}")
+                return self._execute_schema_linking_fallback(tool)
+
+    def _execute_schema_linking_fallback(self, tool: SchemaLineageTool) -> SchemaLinkingResult:
+        # Fallback: directly get tables from current database
+        logger.info("Get tables directly from database")
+        try:
+            # Get database connector through db_manager
+            from pico.tools.db_tools.db_manager import db_manager_instance
+
+            db_manager = db_manager_instance(self.agent_config.datasource_configs)
+
+            # Get current datasource and database connection
+            current_datasource = self.agent_config.current_datasource
+            database_name = getattr(self.input, "database_name", "") or ""
+
+            # Get database connector bound to the task's database (per-database schema scope).
+            connector = db_manager.get_conn(current_datasource, database_name)
+
+            return tool.get_schems_by_db(connector=connector, input_param=self.input)
+
+        except Exception as e:
+            logger.warning(f"Schema linking failed: {e}")
+            return SchemaLinkingResult(
+                success=False,
+                error=f"Schema linking failed: {e}",
+                schema_count=0,
+                value_count=0,
+                table_schemas=[],
+                table_values=[],
+            )
+
+    async def _schema_linking_stream(
+        self, action_history_manager: Optional[ActionHistoryManager] = None
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Execute schema linking with streaming support and action history tracking."""
+        try:
+            # Schema linking action
+            schema_action = ActionHistory(
+                action_id="schema_linking",
+                role=ActionRole.WORKFLOW,
+                messages="Analyzing database schema and linking relevant tables",
+                action_type="schema_linking",
+                input={
+                    "input_text": self.input.input_text if hasattr(self.input, "input_text") else "",
+                    "database_name": self.input.database_name if hasattr(self.input, "database_name") else "",
+                    "matching_rate": self.input.matching_rate if hasattr(self.input, "matching_rate") else "medium",
+                },
+                status=ActionStatus.PROCESSING,
+            )
+            yield schema_action
+
+            # Execute schema linking - reuse existing logic
+            try:
+                result = self._execute_schema_linking()
+
+                schema_action.status = ActionStatus.SUCCESS
+                schema_action.output = {
+                    "success": result.success,
+                    "tables_found": len(result.table_schemas) if result.table_schemas else 0,
+                    "values_found": len(result.table_values) if result.table_values else 0,
+                }
+
+                # Store result for later use
+                self.result = result
+
+            except Exception as e:
+                schema_action.status = ActionStatus.FAILED
+                schema_action.output = {"error": str(e)}
+                logger.error(f"Schema linking error: {str(e)}")
+                raise
+
+        except Exception as e:
+            logger.error(f"Schema linking streaming error: {str(e)}")
+            raise

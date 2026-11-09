@@ -1,0 +1,562 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+from pathlib import Path
+from typing import Any, Dict, List
+
+import yaml
+
+from pico.configuration.agent_config import AgentConfig, NodeConfig
+from pico.configuration.node_type import NodeType
+from pico.configuration.project_config import ProjectTarget, load_project_override
+from pico.utils.constants import DBType
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+def load_node_config(node_type: str, data: dict) -> NodeConfig:
+    if data and isinstance(data, dict) and "model" in data.keys():
+        model = data.pop("model")
+        return NodeConfig(model=model, input=NodeType.type_input(node_type, data, ignore_require_check=True))
+    else:
+        return NodeConfig(model="", input=NodeType.type_input(node_type, data, ignore_require_check=True))
+
+
+class ConfigurationManager:
+    def __init__(self, config_path: str = "", create_if_missing: bool = False):
+        self.config_path: Path = parse_config_path(config_path, create_if_missing=create_if_missing)
+
+        self.data = self._load().get("agent", {})
+
+    def _load(self) -> Dict[str, Any]:
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
+        except yaml.YAMLError as e:
+            print(f"Error parsing YAML file: {e}")
+            return {}
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.data.get(key, default)
+
+    def update(self, updates: Dict[str, Any], delete_old_key: bool = False, save: bool = True) -> bool:
+        try:
+            for key, value in updates.items():
+                self.update_item(key, value, delete_old_key, False)
+            if save:
+                self.save()
+            return True
+        except Exception as e:
+            print(f"Error updating YAML file: {e}")
+            return False
+
+    def update_item(self, key: str, value: Any, delete_old_key: bool = False, save: bool = True) -> bool:
+        try:
+            if delete_old_key:
+                self.data[key] = value
+            elif isinstance(value, dict) and key in self.data:
+                self.data[key].update(value)
+            else:
+                self.data[key] = value
+            if save:
+                self.save()
+            return True
+        except Exception as e:
+            print(f"Error updating YAML file: {e}")
+            return False
+
+    def remove_item_recursively(self, *keys) -> bool:
+        """
+        Delete recursively the corresponding keys.
+        Example:
+            keys = ['a', 'b', 'c'], The deleted item should be self.data['a']['b']['c']
+        """
+        if not keys:
+            return False
+        key_path = []
+        temp_data = self.data
+        for key in keys[:-1]:
+            key_path.append(key)
+            if key not in temp_data:
+                error_path = ".".join(key_path)
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message=f"The key path '{error_path}' does not exist in the configuration data. ",
+                )
+            temp_data = temp_data[key]
+        del temp_data[keys[-1]]
+        self.save()
+        return True
+
+    def save(self):
+        with open(self.config_path, "w", encoding="utf-8") as file:
+            yaml.safe_dump({"agent": self.data}, file, allow_unicode=True, sort_keys=False)
+
+    def __getitem__(self, key: str) -> Any:
+        return self.data[key]
+
+    def __setitem__(self, key: str, value: Any):
+        self.data[key] = value
+        self.save()
+
+
+CONFIGURATION_MANAGER: ConfigurationManager | None = None
+
+
+def configuration_manager(
+    config_path: str = "", reload: bool = False, create_if_missing: bool = False
+) -> ConfigurationManager:
+    global CONFIGURATION_MANAGER
+    should_reload = reload or not CONFIGURATION_MANAGER
+    if not should_reload and config_path:
+        requested_path = parse_config_path(config_path, create_if_missing=create_if_missing)
+        should_reload = CONFIGURATION_MANAGER.config_path.resolve() != requested_path.resolve()
+    if should_reload:
+        CONFIGURATION_MANAGER = ConfigurationManager(config_path, create_if_missing=create_if_missing)
+    return CONFIGURATION_MANAGER
+
+
+def _bootstrap_agent_config(config_path: Path) -> None:
+    """Create a minimal agent.yml and copy template + sample resources.
+
+    Also pre-registers the bundled ``california_schools`` datasource and
+    benchmark so a fresh install can run the tutorial without any manual
+    setup.
+    """
+    home_dir = config_path.parent.parent
+    sample_dir = home_dir / "sample"
+    benchmark_dir = home_dir / "benchmark"
+    # Datasource URI points at the benchmark copy (replace=False), so user
+    # edits to the SQLite file survive future package upgrades.
+    schools_db = benchmark_dir / "california_schools" / "california_schools.sqlite"
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    minimal_config = {
+        "agent": {
+            "services": {
+                "datasources": {
+                    "california_schools": {
+                        "type": "sqlite",
+                        "name": "california_schools",
+                        "uri": str(schools_db),
+                    }
+                }
+            },
+            "benchmark": {
+                "california_schools": {
+                    "question_file": "california_schools.csv",
+                    "question_id_key": "task_id",
+                    "question_key": "question",
+                    "ext_knowledge_key": "evidence",
+                    "gold_sql_path": "california_schools.csv",
+                    "gold_sql_key": "gold_sql",
+                    "gold_result_path": "california_schools.csv",
+                }
+            },
+        }
+    }
+    with open(config_path, "w", encoding="utf-8") as f:
+        yaml.dump(minimal_config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    logger.info("Created minimal agent config at %s", config_path)
+
+    from pico.utils.resource_utils import copy_data_file
+
+    try:
+        template_dir = home_dir / "template"
+        template_dir.mkdir(parents=True, exist_ok=True)
+        # Only copy the rendered Jinja templates, not the surrounding Python
+        # modules that share the ``pico/prompts/`` package.
+        copy_data_file(resource_path="prompts/prompt_templates", target_dir=template_dir, replace=True)
+    except Exception as e:
+        logger.warning("Error copying template files during bootstrap: %s", e)
+    try:
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        # Overwrite on every bootstrap so users always have the latest bundled
+        # sample data after upgrading the package.
+        copy_data_file(resource_path="sample_data", target_dir=sample_dir, replace=True)
+    except Exception as e:
+        logger.warning("Error copying sample files during bootstrap: %s", e)
+    try:
+        # Mirror the california_schools sample into the benchmark dir so the
+        # bundled tutorial can run `pico-agent benchmark` without a manual
+        # cp; preserve user edits with replace=False.
+        target = benchmark_dir / "california_schools"
+        target.mkdir(parents=True, exist_ok=True)
+        copy_data_file(
+            resource_path="sample_data/california_schools",
+            target_dir=target,
+            replace=False,
+        )
+    except Exception as e:
+        logger.warning("Error seeding california_schools benchmark dir: %s", e)
+    # Built-in skills are no longer copied to ``~/.pico/skills``; the registry
+    # scans ``pico/resources/skills`` directly via the SkillConfig default.
+    # This keeps users on the latest bundled skill content as Pico upgrades,
+    # while still letting them override per-project (``./.pico/skills``) or
+    # globally (``~/.pico/skills``) without first running a bootstrap.
+
+
+def parse_config_path(config_file: str = "", create_if_missing: bool = False) -> Path:
+    """
+    Parse and resolve agent configuration file path.
+
+    Priority:
+    1. Explicit config_file parameter if provided
+    2. ./conf/agent.yml in current directory
+    3. ~/.pico/conf/agent.yml (fixed path, not from agent.home config)
+
+    When ``create_if_missing`` is True and no config file is found, a minimal
+    agent.yml is bootstrapped at ``~/.pico/conf/agent.yml`` instead of raising.
+
+    Args:
+        config_file: Optional explicit config file path
+        create_if_missing: Bootstrap a minimal config when no file exists
+
+    Returns:
+        Resolved Path to configuration file
+
+    Raises:
+        DatusException: If configuration file not found (and create_if_missing is False)
+    """
+    # 1. Check explicit config file
+    if config_file:
+        config_path = Path(config_file).expanduser()
+        if config_path.exists():
+            return config_path.resolve()
+        elif config_file != "conf/agent.yml":
+            raise DatusException(
+                code=ErrorCode.COMMON_FILE_NOT_FOUND, message=f"Agent configuration file not found: {config_path}"
+            )
+
+    # 2. Check current directory
+    local_config = Path("conf/agent.yml")
+    if local_config.exists():
+        return local_config.resolve()
+
+    # 3. Check default home directory (~/.pico/conf/agent.yml)
+    # Note: This path is fixed because we need to read the config file
+    # to determine agent.home location for other directories
+    home_config = Path.home() / ".pico" / "conf" / "agent.yml"
+    if home_config.exists():
+        return home_config.resolve()
+
+    if create_if_missing:
+        _bootstrap_agent_config(home_config)
+        return home_config.resolve()
+
+    raise DatusException(
+        code=ErrorCode.COMMON_FILE_NOT_FOUND,
+        message=(
+            "Agent configuration file not found. Please configure your `conf/agent.yaml` or `.pico/conf/agent.yml`"
+            ". You can also use --config <your_config_file_path>"
+        ),
+    )
+
+
+def _apply_project_override(agent_raw: Dict[str, Any]) -> None:
+    """Merge ``./.pico/config.yml`` overlay into the raw agent config dict.
+
+    Only three keys are honored: ``target``, ``project_name``, and
+    ``default_datasource``. All three are written back into ``agent_raw``
+    so ``AgentConfig.__init__`` picks them up naturally. For
+    ``default_datasource`` this means flipping ``datasources[*].default``
+    flags, since ``AgentConfig.services.default_datasource`` is derived
+    from those flags — this keeps the overlay effective for every
+    entry point that calls ``load_agent_config`` (REPL, print mode,
+    web, ``pico-api``, SDK), not just the CLI layer.
+
+    ``target`` accepts three shapes (see :class:`ProjectTarget`):
+      - legacy string (``agent.models`` key) → validated against ``agent.models``.
+      - ``{custom: name}`` → same validation path as the legacy form.
+      - ``{provider, model}`` → forwarded to ``AgentConfig`` via the
+        ``target_provider``/``target_model`` kwargs so provider-level
+        synthesis kicks in at ``active_model()`` time.
+    """
+    override = load_project_override()
+    if override is None or override.is_empty():
+        return
+    if override.target is not None:
+        if isinstance(override.target, ProjectTarget):
+            if override.target.custom:
+                models = agent_raw.get("models", {}) or {}
+                if override.target.custom not in models:
+                    logger.warning(
+                        "target.custom '%s' from .pico/config.yml not found in agent.models; "
+                        "will be resolved lazily at runtime.",
+                        override.target.custom,
+                    )
+                agent_raw["target"] = override.target.custom
+            elif override.target.provider and override.target.model:
+                agent_raw["target_provider"] = override.target.provider
+                agent_raw["target_model"] = override.target.model
+        else:
+            models = agent_raw.get("models", {}) or {}
+            if override.target not in models:
+                logger.warning(
+                    "target '%s' from .pico/config.yml not found in agent.models; will be resolved lazily at runtime.",
+                    override.target,
+                )
+            agent_raw["target"] = override.target
+    if override.default_datasource is not None:
+        datasources = (agent_raw.get("services", {}) or {}).get("datasources", {}) or {}
+        if override.default_datasource not in datasources:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_INVALID,
+                message_args={
+                    "field_name": "default_datasource (from .pico/config.yml)",
+                    "except_values": sorted(datasources.keys()),
+                    "your_value": override.default_datasource,
+                },
+            )
+        for db_name, db_cfg in datasources.items():
+            if isinstance(db_cfg, dict):
+                db_cfg["default"] = db_name == override.default_datasource
+    if override.project_name is not None:
+        agent_raw["project_name"] = override.project_name
+    if override.language is not None:
+        agent_raw["language"] = override.language
+    if override.reasoning_effort is not None:
+        agent_raw["target_reasoning_effort"] = override.reasoning_effort
+    if override.sandbox is not None:
+        # Project-level bash sandbox switch. A bool only toggles ``enabled``;
+        # the mode strings ``"strict"``/``"normal"`` enable AND pin the mode.
+        # ``allow_read``/``allow_write`` from the global agent.yml survive.
+        bash_raw = agent_raw.get("bash")
+        if not isinstance(bash_raw, dict):
+            bash_raw = {}
+        agent_raw["bash"] = bash_raw
+        sandbox_raw = bash_raw.get("sandbox")
+        if not isinstance(sandbox_raw, dict):
+            sandbox_raw = {}
+        bash_raw["sandbox"] = sandbox_raw
+        if isinstance(override.sandbox, str):
+            sandbox_raw["enabled"] = True
+            sandbox_raw["mode"] = override.sandbox
+        else:
+            sandbox_raw["enabled"] = override.sandbox
+    if override.bash_allow:
+        # Append project-level bash allow patterns into the permissions raw
+        # dict so they ride the normal parse/merge pipeline
+        # (AgentConfig._init_permissions_config -> build_effective_config).
+        # Tolerate malformed YAML shapes (string/list where a mapping is
+        # expected) the same way ``AgentConfig._init_permissions_config`` and
+        # the ``permission_mode`` override below do: replace with an empty
+        # container instead of crashing config loading.
+        permissions = agent_raw.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+        agent_raw["permissions"] = permissions
+        bash_commands = permissions.get("bash_commands")
+        if not isinstance(bash_commands, dict):
+            bash_commands = {}
+        permissions["bash_commands"] = bash_commands
+        allow = bash_commands.get("allow")
+        if not isinstance(allow, list):
+            allow = []
+        bash_commands["allow"] = allow
+        for pattern in override.bash_allow:
+            if pattern not in allow:
+                allow.append(pattern)
+        # Also forward the raw grant list: merged allow entries cannot beat
+        # ask rules (deny > ask > allow), so PermissionManager keeps these as
+        # an exact-match grant set that lets a project grant bypass an
+        # ask-rule hit (e.g. a plugin-declared ask persisted via the
+        # "allow (project)" prompt choice).
+        agent_raw["project_bash_allow"] = list(override.bash_allow)
+    if override.sql_allow:
+        # Unlike bash_allow, SQL grants are NOT merged into ``permissions.*``:
+        # the execute_sql gate resolves statement classes dynamically, so a
+        # static rule cannot express a per-kind grant. The raw kind list feeds
+        # PermissionManager's exact-match grant set only.
+        agent_raw["project_sql_allow"] = list(override.sql_allow)
+    # ``dashboard`` / ``scheduler`` overrides reach AgentConfig through
+    # dedicated kwargs so the project-level pin is consulted between the
+    # explicit call-site argument and the global default flag at lookup
+    # time. Validation is deferred to the consumer (``BIFuncTool`` /
+    # ``get_scheduler_config``) since the named service may be added later
+    # in the same process; failing here would block CLI startup.
+    if override.dashboard is not None:
+        agent_raw["active_dashboard"] = override.dashboard
+    if override.scheduler is not None:
+        agent_raw["active_scheduler"] = override.scheduler
+    if override.semantic is not None:
+        agent_raw["active_semantic"] = override.semantic
+    # ``plugins`` declares per-plugin activation for this project (enabled +
+    # active_profile list). Forwarded to AgentConfig as ``active_plugins``,
+    # which gates which plugins are loaded (CLI/skills/prompt/transformers) and
+    # is consulted by ``get_plugin_profile`` for the CLI default profile. The
+    # key is only written when the ``plugins:`` section is present (a present
+    # empty mapping ``{}`` deactivates every plugin), so AgentConfig can tell
+    # "section absent — activate everything" from "section present".
+    if override.plugins is not None:
+        agent_raw["active_plugins"] = override.plugins
+
+
+_PRE_INIT_OVERRIDE_KEYS = {"home", "project_root", "project_name"}
+
+
+def _apply_pre_init_overrides(agent_raw: Dict[str, Any], kwargs: Dict[str, Any]) -> set[str]:
+    """Apply path-shaping CLI overrides before AgentConfig initializes storage.
+
+    ``AgentConfig.__init__`` initializes the path manager and storage backends.
+    Applying these values later through ``override_by_args`` leaves the backend
+    bound to the YAML paths while the returned config points somewhere else.
+    """
+    applied: set[str] = set()
+    for key in _PRE_INIT_OVERRIDE_KEYS:
+        value = kwargs.get(key)
+        if value:
+            agent_raw[key] = value
+            applied.add(key)
+    return applied
+
+
+def load_agent_config(reload: bool = False, create_if_missing: bool = False, **kwargs) -> AgentConfig:
+    # Check config file in order: kwargs["config"] > conf/agent.yml > ~/.pico/conf/agent.yml
+    # Load .env file if it exists
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:
+        pass
+
+    agent_raw = dict(
+        configuration_manager(
+            config_path=kwargs.get("config", ""), reload=reload, create_if_missing=create_if_missing
+        ).data
+    )
+    _apply_project_override(agent_raw)
+    # ``--permission-mode`` CLI override: reshapes ``permissions.profile`` before
+    # AgentConfig parses it, so ``permissions_config`` / ``active_profile_name``
+    # reflect the override everywhere (REPL status bar, print mode, hooks).
+    # User rules / bash_commands still layer on top via build_effective_config.
+    permission_mode = kwargs.get("permission_mode")
+    if permission_mode:
+        permissions_raw = agent_raw.get("permissions") or {}
+        if not isinstance(permissions_raw, dict):
+            permissions_raw = {}
+        permissions_raw["profile"] = permission_mode
+        agent_raw["permissions"] = permissions_raw
+    pre_init_override_keys = _apply_pre_init_overrides(agent_raw, kwargs)
+    nodes = {}
+    if "nodes" in agent_raw:
+        nodes_raw = agent_raw["nodes"]
+        if isinstance(nodes_raw, str):
+            if nodes_raw not in NodeType.ACTION_TYPES:
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message_args={
+                        "field_name": "Node Type",
+                        "except_values": set(NodeType.ACTION_TYPES),
+                        "your_value": nodes_raw,
+                    },
+                )
+            nodes_raw = {nodes_raw: {}}
+        for node_type, cfg in nodes_raw.items():
+            if node_type not in NodeType.ACTION_TYPES:
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message_args={
+                        "field_name": "Node Type",
+                        "except_values": set(NodeType.ACTION_TYPES),
+                        "your_value": node_type,
+                    },
+                )
+            nodes[node_type] = load_node_config(node_type, cfg)
+        del agent_raw["nodes"]
+    agent_config = AgentConfig(nodes=nodes, **agent_raw)
+    if kwargs:
+        # Filter out the 'config' parameter as it's only used for loading, not for overriding
+        override_kwargs = {k: v for k, v in kwargs.items() if k != "config" and k not in pre_init_override_keys}
+
+        # Only set datasource if it's valid (exists in agent_config.datasource_configs)
+        ds_key = "datasource" if "datasource" in override_kwargs else None
+        if ds_key and override_kwargs[ds_key]:
+            if override_kwargs[ds_key] not in agent_config.datasource_configs:
+                del override_kwargs[ds_key]
+
+        if override_kwargs:
+            agent_config.override_by_args(**override_kwargs)
+    # Resolve current_datasource when an unambiguous default exists. Priority
+    # already applied upstream:
+    #   1. ``./.pico/config.yml::default_datasource`` (via _apply_project_override)
+    #   2. ``services.datasources[*].default: true`` flag in base agent.yml
+    #   3. single-entry auto-select (ServiceConfig.default_datasource)
+    if not agent_config.current_datasource and agent_config.services.datasources:
+        default_db = agent_config.services.default_datasource
+        if default_db:
+            agent_config.current_datasource = default_db
+        elif kwargs.get("action"):
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={
+                    "config_error": (
+                        "No default datasource could be resolved. Project-level "
+                        "./.pico/config.yml is missing and agent.yml has multiple "
+                        "datasources without any marked as `default: true`. Run "
+                        "`pico` in this project directory first to launch the "
+                        "init wizard (which writes ./.pico/config.yml with your "
+                        "preferred default_datasource and target), or set "
+                        "`default: true` on one entry under "
+                        "`services.datasources` in agent.yml."
+                    )
+                },
+            )
+    # Auto-select default datasource for file-based DBs if not already set
+    if agent_config.db_type in {DBType.SQLITE, DBType.DUCKDB} and not agent_config.current_datasource:
+        datasources = agent_config.services.datasources
+        if datasources:
+            first_key = next(iter(datasources))
+            agent_config.current_datasource = first_key
+
+    try:
+        from pico.utils.traceable_utils import setup_tracing
+
+        setup_tracing(agent_config.observability)
+    except Exception as e:
+        logger.warning(f"Failed to initialize tracing: {e}")
+
+    return agent_config
+
+
+def get_agent_home(config_file: str = "") -> str:
+    """Read ``agent.home`` from config without instantiating ``AgentConfig``."""
+    config_path = parse_config_path(config_file)
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except yaml.YAMLError as e:
+        logger.warning(f"Error parsing YAML file while reading agent.home: {e}")
+        return "~/.pico"
+    except OSError as e:
+        logger.warning(f"Error reading config file while reading agent.home: {e}")
+        return "~/.pico"
+
+    return raw.get("agent", {}).get("home", "~/.pico")
+
+
+def get_plugin_paths(config_file: str = "") -> List[str]:
+    """Read ``agent.plugin_paths`` from config without instantiating ``AgentConfig``.
+
+    Used by CLI plugin dispatch, which must inject configured plugin
+    directories into ``sys.path`` (path-only) BEFORE the full agent config —
+    and therefore the plugin entry-point probe — runs. Any failure resolves to
+    an empty list: dispatch falls through and the real error surfaces at
+    ``load_agent_config``.
+    """
+    try:
+        config_path = parse_config_path(config_file)
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception as e:  # noqa: BLE001 - dispatch probing must never crash
+        logger.debug(f"Error reading plugin_paths from config: {e}")
+        return []
+    agent_raw = raw.get("agent")
+    paths = agent_raw.get("plugin_paths") if isinstance(agent_raw, dict) else None
+    if not isinstance(paths, list):
+        return []
+    return [p.strip() for p in paths if isinstance(p, str) and p.strip()]

@@ -1,0 +1,3307 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+import hashlib
+import os
+import re
+from dataclasses import asdict, dataclass, field, fields
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
+
+from pico.configuration.project_config import PluginActivation
+from pico.observability.config import ObservabilityConfig
+from pico.schemas.base import BaseInput
+from pico.storage.embedding_models import init_embedding_models
+from pico.storage.storage_cfg import check_storage_config, save_storage_config
+from pico.utils.config_utils import coerce_bool
+from pico.utils.constants import DBType
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import get_logger
+from pico.utils.path_utils import get_files_from_glob_pattern
+
+if TYPE_CHECKING:
+    from pico.prompts.prompt_manager import PromptManager
+    from pico.tools.func_tool.fs_path_policy import PathAllowlist
+    from pico.utils.path_manager import DatusPathManager
+
+# Regex for validating platform/identifier names (no special chars that break paths)
+_SAFE_NAME_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
+
+# Character class accepted by the backend-side ``_safe_path_segment`` validators
+# (pico.storage.rdb.sqlite_backend / pico.storage.vector.lance_backend).  Any
+# character outside this class in a CWD-derived project name would cause
+# backend init to raise ``DatusException``, so the CWD normalizer sanitizes
+# offending characters down to ``_`` before returning.
+_PROJECT_SEGMENT_SAFE_RE = re.compile(r"[^A-Za-z0-9_.\-]")
+
+# Regex matching the full project_name character class used by both the CWD
+# normalizer and the explicit validator. Keeping these aligned ensures that an
+# auto-derived name can always round-trip through ``agent.yml`` without being
+# rejected by ``_validate_project_name``.
+_PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+# Filesystem limits for sharded directory names.
+# Common filesystems (ext4, APFS, NTFS) cap single-component names at 255 bytes.
+# We leave room for prefixes/extensions by truncating to 200 chars + md5 suffix.
+_PROJECT_NAME_MAX_LEN = 200
+
+DEFAULT_SEMANTIC_ADAPTER = "dosi"
+
+
+def _normalize_project_name(cwd: str) -> str:
+    """Sanitize a CWD path into a flat, filesystem-safe project name.
+
+    Rules:
+    - Replace every ``/`` (and backslash on Windows) with ``-`` so the
+      directory hierarchy is still legible in the produced name.
+    - Replace every remaining character outside
+      ``[A-Za-z0-9_.\\-]`` (the backend-accepted class) with ``_`` so the
+      result survives the backend-side ``_safe_path_segment`` check even for
+      CWDs containing spaces, colons, or other special characters.
+    - Strip leading ``-`` so the segment does not start with a dot-like char.
+    - When the result is empty (e.g. root ``/``), fall back to ``_root``.
+    - When the normalized name exceeds :data:`_PROJECT_NAME_MAX_LEN` characters,
+      keep the trailing ``_PROJECT_NAME_MAX_LEN - 8`` characters and append a
+      7-char md5 digest so the name stays filesystem-safe while remaining
+      mostly human-readable.
+    """
+    if not cwd:
+        return "_root"
+    name = cwd.replace("\\", "/").replace("/", "-").lstrip("-")
+    if not name:
+        return "_root"
+    name = _PROJECT_SEGMENT_SAFE_RE.sub("_", name)
+    if len(name) > _PROJECT_NAME_MAX_LEN:
+        digest = hashlib.md5(name.encode("utf-8")).hexdigest()[:7]
+        tail_len = _PROJECT_NAME_MAX_LEN - len(digest) - 1
+        name = f"{name[-tail_len:]}-{digest}"
+    return name
+
+
+def _validate_project_name(value: str) -> str:
+    """Validate an explicit ``agent.project_name`` from config.
+
+    ``project_name`` participates in filesystem paths (sessions/, data/ shards
+    and backend-chosen sub-layouts), so it must not contain path separators
+    or whitespace.  Enforces the same character class as the CWD normalizer
+    (``_PROJECT_NAME_RE``) so an auto-derived name can always round-trip
+    through ``agent.yml``. Also enforces the length cap used for the
+    CWD-derived path.
+
+    Raises:
+        DatusException: when ``value`` contains forbidden characters or is
+            longer than :data:`_PROJECT_NAME_MAX_LEN`.
+    """
+    if not _PROJECT_NAME_RE.match(value) or len(value) > _PROJECT_NAME_MAX_LEN:
+        raise DatusException(
+            code=ErrorCode.COMMON_FIELD_INVALID,
+            message=(
+                f"Invalid agent.project_name {value!r}: must match "
+                f"{_PROJECT_NAME_RE.pattern} and be at most "
+                f"{_PROJECT_NAME_MAX_LEN} characters."
+            ),
+        )
+    return value
+
+
+# Historical private alias. The implementation moved to ``pico.utils.config_utils``
+# so modules outside this package (DBFuncTool, skill_config) can share it without
+# importing a private symbol across package boundaries; the name is kept because
+# this module uses it in ~10 places.
+_coerce_bool = coerce_bool
+
+
+def _coerce_pattern_list(value: Any) -> List[str]:
+    """Coerce ``bash.allowed_patterns`` into a non-empty list of patterns.
+
+    Missing / malformed values (non-list, empty list, non-string entries only)
+    fall back to ``["*"]`` — the unrestricted default where per-call gating is
+    the permission profile's job. An explicit valid list replaces the default
+    entirely; entries are stripped and blank entries dropped.
+    """
+    if not isinstance(value, list):
+        return ["*"]
+    patterns = [entry.strip() for entry in value if isinstance(entry, str) and entry.strip()]
+    return patterns or ["*"]
+
+
+def _normalize_plugin_activations(raw: Any) -> Dict[str, "PluginActivation"]:
+    """Coerce a raw ``active_plugins`` value into ``{name: PluginActivation}``.
+
+    Accepts the value forwarded by ``_apply_project_override`` (already
+    :class:`PluginActivation` instances) as well as plain dicts / partial
+    shapes passed by API bootstraps or tests. Non-mapping inputs and malformed
+    entries are dropped so a bad value can never crash config construction.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, PluginActivation] = {}
+    for name, spec in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if isinstance(spec, PluginActivation):
+            normalized[name.strip()] = spec
+        elif isinstance(spec, dict):
+            profiles = spec.get("active_profile")
+            if isinstance(profiles, str):
+                profiles = [profiles]
+            elif isinstance(profiles, list):
+                profiles = [p for p in profiles if isinstance(p, str) and p.strip()] or None
+            else:
+                profiles = None
+            normalized[name.strip()] = PluginActivation(
+                enabled=_coerce_bool(spec.get("enabled"), True),
+                active_profile=profiles,
+            )
+        elif isinstance(spec, bool):
+            # Tolerate the shorthand ``{name: true/false}``.
+            normalized[name.strip()] = PluginActivation(enabled=spec)
+        elif isinstance(spec, str) and spec.strip():
+            # Tolerate the ``{name: profile}`` shorthand (single active profile).
+            normalized[name.strip()] = PluginActivation(enabled=True, active_profile=[spec.strip()])
+        elif isinstance(spec, list):
+            profiles = [p for p in spec if isinstance(p, str) and p.strip()] or None
+            normalized[name.strip()] = PluginActivation(enabled=True, active_profile=profiles)
+    return normalized
+
+
+def _coerce_numeric_fields(kwargs: Dict[str, Any], field_specs) -> None:
+    """In-place coerce string values to ``int`` / ``float`` per the dataclass
+    field type. YAML can yield strings for numbers when the user quotes them
+    (``token_threshold: "0.9"``); without coercion these would survive into the
+    dataclass and break comparisons downstream.
+    """
+    for f in field_specs:
+        if f.name not in kwargs:
+            continue
+        value = kwargs[f.name]
+        if not isinstance(value, str):
+            continue
+        target = f.type
+        if target is int or target == "int":
+            try:
+                kwargs[f.name] = int(value)
+            except (TypeError, ValueError):
+                pass
+        elif target is float or target == "float":
+            try:
+                kwargs[f.name] = float(value)
+            except (TypeError, ValueError):
+                pass
+
+
+@dataclass
+class MajorCompactConfig:
+    """Settings controlling the LLM-driven full-history summarization pass."""
+
+    enabled: bool = True
+    # Fraction of the model's context window above which a major compact is
+    # forced (overrides minor compact selection in the auto dispatcher).
+    token_threshold: float = 0.9
+    # Allow the LLM summary to run in the middle of a turn (before the next
+    # model call, once ``token_threshold`` is crossed). Turn-start and manual
+    # ``/compact`` are unaffected by this switch.
+    mid_turn_enabled: bool = True
+
+
+@dataclass
+class MinorCompactConfig:
+    """Settings controlling the rule-based user-turn-bounded compact pass.
+
+    Minor compact fires unconditionally once a session has more than
+    ``keep_recent_user_turns`` user-message turns: everything older than that
+    sliding window is eligible for archiving. There is no token-ratio or
+    cache-TTL gate — the user-turn boundary alone provides both the throttle
+    (a session below the threshold returns early as a no-op) and the
+    correctness boundary (the active conversation window is never touched).
+    """
+
+    enabled: bool = True
+    # Keep the original tool I/O of the most recent ``keep_recent_user_turns``
+    # user-message turns intact; anything older is eligible for archiving.
+    # Counted by ``role == 'user'`` items in the session — robust against
+    # variable tool-call cadence within a single turn.
+    keep_recent_user_turns: int = 4
+    # Tool-call arguments / output longer than this many characters are
+    # offloaded to disk during compaction.
+    archive_threshold: int = 1000
+    # Preview text length retained inline in the archive marker. Error
+    # outputs automatically get a 2× preview so the LLM can read the failure
+    # context without round-tripping to read_file.
+    archive_preview_chars: int = 1000
+    # Mid-turn archive stage: before the LLM summary is considered, archive
+    # the tool outputs of the turn in progress (older than the most recent
+    # ``keep_recent_tool_results``) once the estimated occupancy reaches
+    # ``mid_turn_token_threshold``. Every rewrite cools the provider prompt
+    # cache for one call, hence a threshold well above zero.
+    mid_turn_enabled: bool = True
+    mid_turn_token_threshold: float = 0.75
+    keep_recent_tool_results: int = 5
+
+
+@dataclass
+class CompactConfig:
+    """Top-level ``agent.compact`` config grouping major + minor settings."""
+
+    major: MajorCompactConfig = field(default_factory=MajorCompactConfig)
+    minor: MinorCompactConfig = field(default_factory=MinorCompactConfig)
+
+    @classmethod
+    def from_dict(cls, raw: Optional[Dict[str, Any]]) -> "CompactConfig":
+        if not raw or not isinstance(raw, dict):
+            return cls()
+        major_raw = raw.get("major")
+        minor_raw = raw.get("minor")
+        # ``compact.major: true`` / ``compact.minor: "yes"`` style YAML must not
+        # crash the loader — fall back to defaults when the section is not a
+        # mapping. ``or {}`` alone would still try to index a non-mapping below.
+        if not isinstance(major_raw, dict):
+            major_raw = {}
+        if not isinstance(minor_raw, dict):
+            minor_raw = {}
+        major_kwargs = {f.name: major_raw[f.name] for f in fields(MajorCompactConfig) if f.name in major_raw}
+        minor_kwargs = {f.name: minor_raw[f.name] for f in fields(MinorCompactConfig) if f.name in minor_raw}
+        for bool_key in ("enabled", "mid_turn_enabled"):
+            if bool_key in major_kwargs:
+                major_kwargs[bool_key] = _coerce_bool(major_kwargs[bool_key], True)
+            if bool_key in minor_kwargs:
+                minor_kwargs[bool_key] = _coerce_bool(minor_kwargs[bool_key], True)
+        _coerce_numeric_fields(major_kwargs, fields(MajorCompactConfig))
+        _coerce_numeric_fields(minor_kwargs, fields(MinorCompactConfig))
+        return cls(major=MajorCompactConfig(**major_kwargs), minor=MinorCompactConfig(**minor_kwargs))
+
+
+@dataclass
+class KbSearchConfig:
+    """Knowledge-base retrieval mode shared by bootstrap and runtime search."""
+
+    mode: str = "vector"
+
+    @classmethod
+    def from_dict(cls, raw: Optional[Dict[str, Any]]) -> "KbSearchConfig":
+        if not isinstance(raw, dict):
+            raw = {}
+        mode = str(raw.get("mode") or "vector").strip().lower()
+        if mode not in {"vector", "fts"}:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_INVALID,
+                message_args={
+                    "field_name": "kb.search.mode",
+                    "except_values": {"vector", "fts"},
+                    "your_value": mode,
+                },
+            )
+        return cls(mode=mode)
+
+
+@dataclass
+class DbConfig:
+    path_pattern: str = field(default="", init=True)
+    type: str = field(default="", init=True)
+    uri: str = field(default="", init=True)
+    host: str = field(default="", init=True)
+    port: str = field(default="", init=True)
+    username: str = field(default="", init=True)
+    password: str = field(default="", init=True)
+    account: str = field(default="", init=True)
+    database: str = field(default="", init=True)
+    schema: str = field(default="", init=True)
+    warehouse: str = field(default="", init=True)
+    role: str = field(default="", init=True)
+    private_key_file: str = field(default="", init=True)
+    private_key_file_pwd: str = field(default="", init=True)
+    catalog: str = field(default="", init=True)
+    default: bool = field(default=False, init=True)  # Whether this is the default database
+    extra: Optional[Dict] = field(default=None, init=True)  # Adapter-specific fields stored here
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @staticmethod
+    def filter_kwargs(cls, kwargs) -> "DbConfig":
+        valid_fields = {f.name for f in fields(cls)}
+        # Fields that are handled specially, not stored in extra
+        internal_fields = {"name"}
+        params = {}
+        extra_params = {}
+        for k, v in kwargs.items():
+            if k not in valid_fields:
+                # Store unknown fields in extra for adapter-specific config
+                # Skip internal fields that are handled separately
+                if v is not None and v != "" and k not in internal_fields:
+                    extra_params[k] = _resolve_nested_value(v)
+                continue
+            if not v:
+                params[k] = v
+            else:
+                params[k] = resolve_env(str(v))
+
+        # Merge extra_params into existing extra field
+        if extra_params:
+            existing_extra = params.get("extra") or {}
+            params["extra"] = {**existing_extra, **extra_params}
+
+        db_config = cls(**params)
+        if db_config.type in (DBType.SQLITE, DBType.DUCKDB):
+            db_config.database = file_stem_from_uri(db_config.uri)
+        return db_config
+
+
+@dataclass
+class ServicesConfig:
+    """Structured services configuration: datasources, semantic layer, BI tools, schedulers.
+
+    Each datasource is an independent entry.
+    """
+
+    datasources: Dict[str, DbConfig] = field(default_factory=dict)
+    semantic_layer: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    bi_platforms: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    schedulers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # MCP servers in the `.mcp.json` shape, keyed by server name. A host that
+    # owns these definitions (the SaaS backend builds them from its database)
+    # passes them here instead of writing a file, so credentials stay in memory
+    # and a change to one is visible to config fingerprinting.
+    mcp_servers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+    @property
+    def default_datasource(self) -> Optional[str]:
+        """Return the datasource entry marked as default, or the only one if just one exists."""
+        defaults = [name for name, cfg in self.datasources.items() if cfg.default]
+        if defaults:
+            return defaults[0]
+        if len(self.datasources) == 1:
+            return next(iter(self.datasources))
+        return None
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "ServicesConfig":
+        """Parse services config from agent.yml 'services' section."""
+        if "datasources" not in raw and "databases" in raw:
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_INVALID,
+                message=(
+                    "services.databases has been renamed to services.datasources in agent.yml. Rename the key manually."
+                ),
+            )
+        bi_platforms_raw = raw.get("bi_platforms")
+        if bi_platforms_raw is None and "bi_tools" in raw:
+            import warnings
+
+            warnings.warn(
+                "services.bi_tools is deprecated; rename to services.bi_platforms in agent.yml.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            bi_platforms_raw = raw["bi_tools"]
+        return cls(
+            datasources={},  # populated by AgentConfig._init_services_config()
+            semantic_layer=raw.get("semantic_layer", {}),
+            bi_platforms=bi_platforms_raw or {},
+            schedulers=raw.get("schedulers", {}),
+            mcp_servers=raw.get("mcp_servers") or {},
+        )
+
+
+@dataclass
+class ModelConfig:
+    type: str
+    api_key: str
+    model: str
+    base_url: Optional[str] = None
+    save_llm_trace: bool = False
+    enable_thinking: bool = False  # Legacy bool switch; True is equivalent to reasoning_effort="medium".
+    # Reasoning depth for thinking-capable models. Values: off|minimal|low|medium|high.
+    # None defers to enable_thinking; LiteLLM maps the level to each vendor's dialect.
+    reasoning_effort: Optional[str] = None
+    strict_json_schema: bool = True  # Enable strict JSON schema mode for structured output
+    default_headers: Optional[Dict[str, str]] = None
+    # Retry configuration for stream connection errors
+    max_retry: int = 3
+    retry_interval: float = 2.0  # seconds
+    # Model-specific parameters
+    temperature: Optional[float] = None  # Some models like kimi-k2.6 require temperature=1
+    top_p: Optional[float] = None  # Some models like kimi-k2.6 require top_p=0.95
+    auth_type: str = "api_key"  # "api_key" | "oauth" | "subscription"
+    use_native_api: bool = False  # Use native Anthropic client instead of LiteLLM
+    # SSL/TLS verification for this model's endpoint. Mirrors httpx/litellm `verify`:
+    #   True  -> verify against system/certifi CAs (default)
+    #   False -> disable verification (discouraged; MITM-exposed)
+    #   str   -> path to a CA bundle (PEM) to additionally trust (e.g. a private gateway CA)
+    # When set, takes priority over the SSL_VERIFY / SSL_CERT_FILE environment variables.
+    ssl_verify: Optional[Union[bool, str]] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ProviderConfig:
+    """Provider-level credentials and overrides (``agent.providers.<name>``).
+
+    Collapses the per-model ``api_key`` / ``base_url`` repetition into a
+    single entry per provider. Provider metadata (default_model, model
+    list, ``api_key_env`` fallback, ``type``) still lives in the shipped
+    ``conf/providers.yml`` catalog; this record only captures what the
+    user needs to override.
+    """
+
+    api_key: Optional[str] = None
+    base_url: Optional[str] = None
+    auth_type: str = "api_key"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class NodeConfig:
+    model: str
+    input: BaseInput | None
+
+
+@dataclass
+class BenchmarkConfig:
+    benchmark_path: str = ""  # benchmark files dir
+    question_file: str = ""  # The corresponding task file can be csv/json/json
+    question_key: str = ""  # The key corresponding to question
+    question_id_key: str = ""  # If empty, use the line number
+    datasource_key: str | None = None  # The key corresponding to Pico datasource routing name
+    catalog_key: str | None = None  # The key corresponding to SQL catalog name
+    database_key: str | None = None  # The key corresponding to SQL database name
+    schema_key: str | None = None  # The key corresponding to SQL schema name
+    ext_knowledge_key: str | None = None  # The key for the question's supplementary description (e.g. evidence)
+    use_tables_key: str | None = None  # The key corresponding to the table to be used
+
+    gold_sql_key: str | None = None  # The key corresponding to gold sql
+    # The standard SQL relative path, Can be a directory ({gold_sql_path}/{task_id}.sql) or json/csv file
+    gold_sql_path: str | None = None
+    # Optional, the key corresponding to the standard SQL relative path, can be a directory
+    # ({gold_sql_path}/{task_id}.sql) or json/csv file.
+    # If not set, gold sql will be executed to obtain the standard answer
+    gold_result_path: str | None = None
+    gold_result_key: str | None = None  # The key corresponding to gold result
+
+    @staticmethod
+    def filter_kwargs(cls, kwargs: dict) -> "BenchmarkConfig":
+        valid_fields = {f.name for f in fields(cls)}
+        unknown = set(kwargs) - valid_fields
+        if unknown:
+            logger.warning(
+                "Ignoring unknown benchmark config key(s): %s. Note: 'db_key' was split into "
+                "'datasource_key'/'database_key'/'catalog_key'/'schema_key'; update your config accordingly.",
+                ", ".join(sorted(unknown)),
+            )
+        return cls(**{k: v for k, v in kwargs.items() if k in valid_fields})
+
+    def validate(self):
+        if not self.question_key:
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_REQUIRED, message="question_key in benchmark configuration cannot be empty"
+            )
+        if not self.question_file:
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_REQUIRED, message="question_file in benchmark configuration cannot be empty"
+            )
+        if not self.question_id_key:
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_REQUIRED, message="question_id_key in benchmark configuration cannot be empty"
+            )
+
+
+@dataclass
+class DocumentConfig:
+    """Per-platform document fetch configuration.
+
+    Maps to YAML ``agent.document.{platform}`` and CLI ``platform-doc`` args.
+    """
+
+    type: str = "local"  # github / website / local
+    source: Optional[str] = None  # GitHub repo "owner/repo", URL, or local path
+    version: Optional[str] = None  # Document version (auto-detected if omitted)
+    github_ref: Optional[str] = None  # Git branch / tag / commit
+    github_token: Optional[str] = None
+    paths: List[str] = field(default_factory=lambda: ["docs", "README.md"])
+    chunk_size: int = 1024
+    max_depth: int = 2  # Max crawl depth for website source
+    include_patterns: Optional[List[str]] = None  # File/URL patterns to include
+    exclude_patterns: Optional[List[str]] = None  # File/URL patterns to exclude
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "DocumentConfig":
+        valid_fields = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in data.items() if k in valid_fields})
+
+    def merge_cli_args(self, args) -> "DocumentConfig":
+        """Return a new config with non-None CLI args overriding YAML values.
+
+        CLI attr -> DocumentConfig field mapping:
+          source_type -> type, source -> source, version -> version,
+          github_ref -> github_ref, paths -> paths,
+          chunk_size -> chunk_size, max_depth -> max_depth,
+          include_patterns -> include_patterns, exclude_patterns -> exclude_patterns
+        """
+        mapping = {
+            "source_type": "type",
+            "source": "source",
+            "version": "version",
+            "github_ref": "github_ref",
+            "github_token": "github_token",
+            "paths": "paths",
+            "chunk_size": "chunk_size",
+            "max_depth": "max_depth",
+            "include_patterns": "include_patterns",
+            "exclude_patterns": "exclude_patterns",
+        }
+        overrides = {}
+        for cli_attr, cfg_field in mapping.items():
+            cli_val = getattr(args, cli_attr, None)
+            if cli_val is not None:
+                if isinstance(cli_val, str):
+                    overrides[cfg_field] = resolve_env(cli_val)
+                else:
+                    overrides[cfg_field] = cli_val
+        data = {f.name: getattr(self, f.name) for f in fields(self)}
+        data.update(overrides)
+        return DocumentConfig(**data)
+
+
+@dataclass
+class AutocompleteConfig:
+    """Runtime knobs for the CLI ``@``-reference autocomplete.
+
+    ``background_sync_enabled`` controls whether switching / adding /
+    editing a datasource kicks off a LanceDB metadata refresh in the
+    background so ``@Table`` always reflects the latest tables.
+    ``background_sync_on_startup`` extends the behavior to REPL boot.
+    ``background_sync_include_values`` trades speed for richer completion
+    hints (sample row fetch is an order of magnitude slower).
+    """
+
+    background_sync_enabled: bool = True
+    background_sync_on_startup: bool = True
+    background_sync_include_values: bool = False
+
+    @classmethod
+    def from_dict(cls, raw: Optional[Dict[str, Any]]) -> "AutocompleteConfig":
+        if not raw:
+            return cls()
+        return cls(
+            background_sync_enabled=bool(raw.get("background_sync_enabled", True)),
+            background_sync_on_startup=bool(raw.get("background_sync_on_startup", True)),
+            background_sync_include_values=bool(raw.get("background_sync_include_values", False)),
+        )
+
+
+@dataclass
+class DatasetDbConfig:
+    """Thin BI serving-layer descriptor. The DB connection itself lives under
+    ``services.datasources.<datasource_ref>`` so connector pooling, schema
+    metadata and credentials are shared with the rest of Pico. This record
+    only carries the BI-platform-specific bits.
+
+    Fields:
+        datasource_ref: Name of a ``services.datasources`` entry that points
+            at the serving DB. Pico uses that datasource's connector to
+            both read (schema introspection) and write (transfer jobs).
+        bi_database_name: Alias under which the BI platform (Superset,
+            Grafana, ...) has the same DB registered. Used by ``gen_dashboard``
+            to resolve ``database_id`` via ``list_bi_databases()``.
+    """
+
+    datasource_ref: str
+    bi_database_name: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, raw: Dict[str, Any]) -> "DatasetDbConfig":
+        if not isinstance(raw, dict):
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_INVALID,
+                message="services.bi_platforms.<x>.dataset_db must be a mapping.",
+            )
+        legacy_keys = {"uri", "dialect", "host", "port", "database", "username", "password", "schema", "type"}
+        leaked = legacy_keys.intersection(raw)
+        if leaked:
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_INVALID,
+                message=(
+                    f"services.bi_platforms.<x>.dataset_db no longer accepts inline DB fields ({sorted(leaked)}). "
+                    "Move the connection under `services.datasources.<name>` and reference it from "
+                    "`dataset_db.datasource_ref`."
+                ),
+            )
+        ref = raw.get("datasource_ref")
+        if not ref or not isinstance(ref, str):
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_INVALID,
+                message=(
+                    "services.bi_platforms.<x>.dataset_db.datasource_ref is required: "
+                    "set it to the name of a `services.datasources` entry."
+                ),
+            )
+        bi_db = raw.get("bi_database_name")
+        if bi_db is not None and not isinstance(bi_db, str):
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_INVALID,
+                message="services.bi_platforms.<x>.dataset_db.bi_database_name must be a string.",
+            )
+        normalized_bi_db = bi_db.strip() if bi_db is not None else None
+        return cls(datasource_ref=ref.strip(), bi_database_name=normalized_bi_db or None)
+
+
+@dataclass
+class DashboardConfig:
+    # Service alias — the key under ``services.bi_platforms`` in agent.yml.
+    # Used for CLI addressing (``/<platform>.<method>``) and ``dashboard_config``
+    # dict lookup. May be an arbitrary user-chosen name (``superset_prod``,
+    # ``grafana_staging``, ...).
+    platform: str
+    api_base_url: str = ""
+    # use login or api_key
+    username: str = ""
+    password: str = ""
+    api_key: str = ""
+    extra: Optional[Dict[str, Any]] = field(default_factory=dict, init=True)
+    # BI platform's serving-layer DB. Same schema as a ``services.datasources``
+    # entry, plus optional ``bi_database_name`` naming the BI platform alias.
+    dataset_db: Optional[DatasetDbConfig] = field(default=None, init=True)
+    # The actual adapter kind this service targets — what
+    # ``datus_bi_core.adapter_registry`` looks up. Defaults to ``platform``
+    # when the user omits ``type`` (single-instance config). Set explicitly
+    # to enable multi-instance deployments where the alias differs from the
+    # adapter type (``platform=superset_prod``, ``adapter_type=superset``).
+    adapter_type: str = ""
+    # YAML ``default: true`` flag. When set, this service is the global
+    # default returned by :meth:`AgentConfig.default_dashboard_service`.
+    # At most one entry under ``services.bi_platforms`` may carry this
+    # flag; multiple defaults are rejected at config load time.
+    default: bool = False
+
+
+logger = get_logger(__name__)
+
+
+def _parse_single_file_db(db_config: Dict[str, Any], dialect: str) -> DbConfig:
+    uri = resolve_env(str(db_config["uri"]))
+    known_fields = {"uri", "name", "type", "schema", "default"}
+    extra = {
+        key: _resolve_nested_value(value)
+        for key, value in db_config.items()
+        if key not in known_fields and value is not None and value != ""
+    }
+    if "name" in db_config:
+        login_name = db_config["name"]
+        db_name = file_stem_from_uri(uri)
+    else:
+        login_name = file_stem_from_uri(uri)
+        db_name = login_name
+    if not uri.startswith(dialect):
+        uri = f"{dialect}:///{os.path.expanduser(uri)}"
+    return DbConfig(
+        type=dialect,
+        uri=uri,
+        database=db_name,
+        schema=db_config.get("schema", ""),
+        extra=extra or None,
+    )
+
+
+@dataclass
+class ValidationConfig:
+    """Per-run knobs for :class:`pico.validation.hook.ValidationHook`.
+
+    ``skill_validators_enabled`` controls Layer B (LLM-driven validator skills).
+    When False, the hook still runs Layer A (built-in code-level invariants)
+    but skips spawning any validator sub-agents — this is the user-facing cost
+    escape hatch.
+
+    ``max_retries`` caps how many times the owning ``DeliverableAgenticNode``
+    re-runs the main agent after a blocking validation report before surfacing
+    ``success=False``.
+    """
+
+    skill_validators_enabled: bool = True
+    max_retries: int = 3
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "ValidationConfig":
+        if not data:
+            return cls()
+        # YAML can produce non-mapping values for ``validation:`` (e.g. ``false``,
+        # ``[]``, or even a stray scalar) — fall back to defaults rather than
+        # crashing AgentConfig construction with a raw AttributeError.
+        if not isinstance(data, dict):
+            logger.warning(
+                "agent.validation must be a mapping; got %s. Using default ValidationConfig.",
+                type(data).__name__,
+            )
+            return cls()
+        try:
+            max_retries = int(data.get("max_retries", 3))
+        except (TypeError, ValueError):
+            max_retries = 3
+        if max_retries < 0:
+            max_retries = 0
+        return cls(
+            skill_validators_enabled=bool(data.get("skill_validators_enabled", True)),
+            max_retries=max_retries,
+        )
+
+
+@dataclass
+class AgentConfig:
+    target: str
+    models: Dict[str, ModelConfig]
+    providers: Dict[str, ProviderConfig]
+    nodes: Dict[str, NodeConfig]
+    rag_base_path: str
+    schema_linking_rate: str
+    date_parsing_language: str
+    _save_dir: str
+    _current_datasource: str
+    _project_name: str
+    _trajectory_dir: str
+    services: ServicesConfig
+    scheduler_services: Dict[str, Dict[str, Any]]
+    semantic_layer_configs: Dict[str, Dict[str, Any]]
+    compact: "CompactConfig"
+    # Free-form sidecar metadata for ``agent.models`` entries, keyed by
+    # the same name used in ``models``. Lets hosts attach extra context
+    # to a model without extending the strongly-typed ``ModelConfig``.
+    model_extras: Dict[str, Dict[str, Any]]
+    knowledge_base: Dict[str, Any]
+    observability: ObservabilityConfig
+
+    def __init__(self, nodes: Dict[str, NodeConfig], **kwargs):
+        """
+        Initialize the global config from yaml file
+        """
+        if "sql_policy" in kwargs:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    "agent.sql_policy has been removed; configure policies under agent.plugins.sql-policy instead"
+                ),
+            )
+        # Resolve home early so dependent helpers can use a stable path manager.
+        self.home = kwargs.get("home", "~/.pico")
+        # project_name must be computed before _set_path_manager so shard-aware
+        # directories (sessions/, data/) bind to the right project.  When the
+        # user explicitly sets ``agent.project_name`` in YAML we must validate
+        # it (no slashes/dots/whitespace) since it participates in filesystem
+        # paths; when not set we derive a sanitized name from the CWD.
+        raw_project_name = kwargs.get("project_name")
+        # Resolve project_root first so the auto-derived project_name tracks it
+        # instead of the launcher's CWD. Running the same project from different
+        # working directories would otherwise split sessions/data across shards
+        # while the KB stays under a single project_root/subject.
+        resolved_project_root = Path(kwargs.get("project_root") or os.getcwd()).resolve()
+        if raw_project_name:
+            self._project_name = _validate_project_name(raw_project_name)
+        else:
+            self._project_name = _normalize_project_name(str(resolved_project_root))
+        self._project_root = resolved_project_root
+        self._set_path_manager(self.home)
+
+        # Runtime override for prompt-template resolution, honored by
+        # ``get_prompt_manager()`` ahead of ``path_manager``. ``None`` means "derive
+        # the template dir from ``home``", which is what every CLI run does.
+        #
+        # Hosts whose templates do not live under ``home`` assign one here. The SaaS
+        # backend is the motivating case: its ``home`` is the per-project dir, but
+        # prompt templates are a workspace-level asset shared across the projects in
+        # that workspace, so it attaches a PromptManager anchored one level up.
+        #
+        # Deliberately an instance attribute and NOT a dataclass field — same as
+        # ``path_manager``. Declared fields land in ``dataclasses.asdict()``, which is
+        # what ``DatusService.compute_fingerprint`` hashes; a PromptManager stringifies
+        # to a memory address, so making this a field would churn the fingerprint on
+        # every rebuild and evict the cached service. See the ``model_extras``
+        # normalization below for the same constraint.
+        self.prompt_manager: Optional["PromptManager"] = None
+
+        models_raw = kwargs.get("models", {}) or {}
+        self.target = kwargs.get("target", "") or ""
+        self.models = {name: load_model_config(cfg) for name, cfg in models_raw.items()}
+        # Normalize to plain ``dict`` so ``dataclasses.asdict`` serializes
+        # cleanly into the AgentConfig fingerprint — host-side mutations
+        # are picked up on the next service-cache miss.
+        model_extras_raw = kwargs.get("model_extras") or {}
+        self.model_extras = {
+            str(name): dict(extras) if isinstance(extras, dict) else {} for name, extras in model_extras_raw.items()
+        }
+        # Provider-level credentials (new schema). Empty when the user has not
+        # migrated to the ``agent.providers`` section; legacy ``agent.models``
+        # still works via :meth:`active_model` fallback.
+        providers_raw = kwargs.get("providers", {}) or {}
+        self.providers = _load_provider_configs(providers_raw)
+        # Project-level active target forwarded by ``_apply_project_override``:
+        # when both are set, ``active_model()`` synthesizes a ``ModelConfig``
+        # from ``providers`` + the shipped ``conf/providers.yml`` catalog
+        # instead of indexing ``agent.models``.
+        self._target_provider: Optional[str] = kwargs.get("target_provider") or None
+        self._target_model: Optional[str] = kwargs.get("target_model") or None
+        # Reasoning effort override. ``target_reasoning_effort`` comes from
+        # ``./.pico/config.yml`` (project scope) and wins over the
+        # ``reasoning_effort`` top-level field in ``agent.yml`` (global
+        # default). When set, it replaces the value resolved from
+        # ``providers.yml.model_overrides`` or ``agent.models`` regardless of
+        # which dispatch path ``active_model()`` takes.
+        self._target_reasoning_effort: Optional[str] = (
+            kwargs.get("target_reasoning_effort") or kwargs.get("reasoning_effort") or None
+        )
+        # Project-level active service overrides forwarded by
+        # ``_apply_project_override`` from ``./.pico/config.yml``. ``None``
+        # means "no project override" — service resolution falls back to
+        # the explicit call-site argument, then the global ``default: true``
+        # flag, then the unique-entry shortcut. Validated lazily at the
+        # consumer ( ``BIFuncTool._resolved_platform`` /
+        # ``AgentConfig.get_scheduler_config``) so a missing service name
+        # does not block ``AgentConfig`` construction itself.
+        self._active_dashboard: Optional[str] = kwargs.get("active_dashboard") or None
+        self._active_scheduler: Optional[str] = kwargs.get("active_scheduler") or None
+        self._active_semantic: Optional[str] = kwargs.get("active_semantic") or None
+        # Project-level plugin activation forwarded by ``_apply_project_override``
+        # from ``./.pico/config.yml`` ``plugins:``. Maps a plugin name to a
+        # :class:`PluginActivation` (enabled + active_profile list).
+        # ``_plugins_section_present`` distinguishes "the ``plugins:`` key was
+        # written" (authoritative whitelist — unlisted plugins are inactive)
+        # from "no ``plugins:`` key at all" (every installed plugin active).
+        # The loader only forwards ``active_plugins`` when the section is
+        # present, so a mapping value (even empty) signals presence.
+        _active_plugins_raw = kwargs.get("active_plugins")
+        self._plugins_section_present: bool = isinstance(_active_plugins_raw, dict)
+        self._active_plugins: Dict[str, PluginActivation] = _normalize_plugin_activations(_active_plugins_raw)
+        self._runtime_db_context: Dict[str, str] = {}
+        # Shared lazily-loaded ``conf/providers.yml`` catalog (metadata only:
+        # default_model, base_url, api_key_env, type, model_overrides). Kept
+        # as ``None`` until first access so tests that stub load paths can
+        # inject their own via :meth:`set_provider_catalog`.
+        self._provider_catalog: Optional[Dict[str, Any]] = None
+        self._benchmark_config_dict = kwargs.get("benchmark", {})
+        knowledge_base_raw = kwargs.get("knowledge_base", {}) or {}
+        self.knowledge_base: Dict[str, Any] = (
+            _resolve_nested_value(knowledge_base_raw) if isinstance(knowledge_base_raw, dict) else {}
+        )
+        kb_raw = kwargs.get("kb", {}) or {}
+        if not isinstance(kb_raw, dict):
+            kb_raw = {}
+        kb_search_raw = kb_raw.get("search")
+        if not isinstance(kb_search_raw, dict) and isinstance(self.knowledge_base.get("search"), dict):
+            kb_search_raw = self.knowledge_base.get("search")
+        self.kb_search = KbSearchConfig.from_dict(_resolve_nested_value(kb_search_raw))
+        self.kb_search_mode = self.kb_search.mode
+        # ``filesystem_strict`` is a process-wide safety switch that makes
+        # ``FilesystemFuncTool`` fail-closed for EXTERNAL paths (outside the
+        # project root) instead of prompting the broker. Set via
+        # ``agent.filesystem.strict`` in YAML, ``--filesystem-strict`` on the
+        # CLI, or direct assignment from API/gateway bootstraps.
+        filesystem_raw = kwargs.get("filesystem") or {}
+        self._filesystem_strict = bool(filesystem_raw.get("strict", False))
+        # ``compile_visual_html`` gates the visual nodes' standalone-HTML
+        # compile: CLI runs produce a local file the user opens, while API and
+        # gateway surfaces render dynamically server-side and set this False in
+        # their bootstraps. Deliberately NOT a YAML key — only entry-point code
+        # knows which surface is running, and a config-file toggle would let a
+        # stray setting silently drop the CLI's dashboard/report artifacts.
+        self.compile_visual_html = True
+        # ``filesystem.allow_read`` / ``allow_write`` widen the fs tools beyond
+        # the project root with explicitly configured absolute directories (the
+        # filesystem counterpart of ``bash.sandbox.allow_*``). Needed whenever a
+        # deployment mounts a shared dir next to the workspace that the agent
+        # must still write — e.g. an Airflow DAGs folder. Lazy import for the
+        # same cycle reason as ``SandboxSettings`` below.
+        from pico.tools.func_tool.fs_path_policy import PathAllowlist
+
+        self._filesystem_allowlist: "PathAllowlist" = PathAllowlist.from_dict(filesystem_raw)
+        # ``config_mutable`` gates whether the agent may be guided to edit the
+        # loaded agent config file (e.g. ``agent.plugins`` profiles). Default
+        # ``True`` (CLI). The chat API and gateway force it to ``False`` on
+        # their per-request config clone: in multi-tenant deployments the
+        # AgentConfig may be supplied by an AuthProvider and must never be
+        # modified by the agent — skills declaring ``requires_mutable_config``
+        # are hidden/refused and the plugin prompt preamble stops naming the
+        # config file.
+        self._config_mutable = _coerce_bool(kwargs.get("config_mutable"), True)
+        # ``sql_read_only`` is the deployment-wide SQL posture. When ``True`` no
+        # entry point served by this config may run a non-read statement. All of
+        # them consult it: ``DBFuncTool``'s write paths — ``execute_sql``,
+        # ``execute_write``, ``execute_ddl`` and the cross-datasource
+        # ``transfer_query_result`` — for agent nodes as well as the MCP server's
+        # ``create_dynamic``/``create_static`` instances, plus the raw
+        # ``POST /sql/execute`` REST route. Default ``False`` preserves the CLI's
+        # write-capable behaviour.
+        #
+        # This is a hard switch, not a policy. Unlike ``agent.sql_policy`` — a
+        # pluggable rewrite/deny framework that needs a provider class — it
+        # requires no extension and cannot be satisfied by rewriting the
+        # statement. Intended for hosts that run third-party-authored agent
+        # content against platform-owned datasources.
+        #
+        # One-way: exposed as a read-only property plus
+        # ``harden_sql_read_only()``. Nothing downstream — a plugin, a tool
+        # transformer, third-party code sharing the process — can undo a
+        # yaml-level ``true``.
+        self._sql_read_only = _coerce_bool(kwargs.get("sql_read_only"), False)
+        # ``bash.enabled`` toggles whether agentic nodes instantiate the
+        # general-purpose ``BashTool``. Default ``True`` preserves the
+        # current behaviour where every node exposes ``bash``
+        # (gated by the ``bash_tools`` ASK rule in the permission profile).
+        # Set to ``False`` for hardened environments where shell execution
+        # must be unavailable regardless of profile.
+        bash_raw = kwargs.get("bash")
+        if not isinstance(bash_raw, dict):
+            bash_raw = {}
+        self._bash_tool_enabled = _coerce_bool(bash_raw.get("enabled"), True)
+        # ``bash.allowed_patterns`` optionally restricts which commands the
+        # general-purpose ``BashTool`` accepts (Claude-Code-style patterns,
+        # see ``BashTool`` docs). Default ``["*"]`` keeps the tool
+        # unrestricted at the execution layer — per-call gating stays with
+        # the permission profile. API front-ends override this at runtime
+        # (e.g. web gets ``["pico*"]``).
+        self._bash_allowed_patterns = _coerce_pattern_list(bash_raw.get("allowed_patterns"))
+        # ``bash.sandbox`` configures the OS-level sandbox (macOS sandbox-exec
+        # / Linux bubblewrap) wrapped around every BashTool command. The parsed
+        # ``SandboxSettings`` object is SHARED with every BashTool instance so
+        # ``/sandbox on|off`` mutating ``enabled`` takes effect immediately.
+        # Lazy import: pico.tools.func_tool pulls in the CLI package, which
+        # imports this module (same cycle-breaking pattern as sql_policy).
+        from pico.tools.func_tool.bash_sandbox import SandboxSettings
+
+        self._bash_sandbox = SandboxSettings.from_dict(bash_raw.get("sandbox"))
+        # ``compact`` controls the AgenticNode session summarization /
+        # archiving subsystem. Defaults preserve the legacy 90% major-compact
+        # threshold while enabling the new rule-based minor compact + on-disk
+        # archive of long tool I/O.
+        self.compact = CompactConfig.from_dict(kwargs.get("compact"))
+        self._current_datasource = ""
+        self.nodes = nodes
+        self.export_config: Dict[str, Any] = kwargs.get("export", {})
+        self.api_config: Dict[str, Any] = kwargs.get("api", {}) or {}
+        self.observability = ObservabilityConfig.from_dict(_resolve_nested_value(kwargs.get("observability")))
+        self.agentic_nodes = kwargs.get("agentic_nodes", {})
+        self.dashboard_config: Dict[str, DashboardConfig] = {}
+        self.scheduler_services = {}
+        self.scheduler_config: Dict[str, Any] = {}
+        self.semantic_layer_configs = {}
+        # ``plugins_enabled`` is the master switch for the pico-plugin
+        # system. When ``False`` no plugin functionality is active: ``pico
+        # <plugin>`` dispatch is refused, plugin-bundled skills are not
+        # discovered, and no plugin context is injected into system prompts.
+        # Intended for API/web deployments where the agent must not be guided
+        # to edit configuration files.
+        self.plugins_enabled = _coerce_bool(kwargs.get("plugins_enabled"), True)
+        # ``plugin_paths`` mounts plugin directories living OUTSIDE the managed
+        # store (``~/.pico/plugins``). Each entry is already ONE plugin's
+        # directory — the equivalent of a single ``~/.pico/plugins/{name}/``
+        # subdirectory, not a root containing several — so a shared checkout or
+        # centrally deployed plugin can be used without copying it into the
+        # home store. Merged with the managed store as a union; on a name clash
+        # the managed install wins. ``~``/``$ENV_VAR`` are expanded at
+        # activation time (``pico.plugins.store``).
+        raw_plugin_paths = kwargs.get("plugin_paths")
+        if raw_plugin_paths is not None and not isinstance(raw_plugin_paths, list):
+            logger.warning("agent.plugin_paths must be a list of directories; ignoring %r.", raw_plugin_paths)
+        self.plugin_paths: List[str] = (
+            [p.strip() for p in raw_plugin_paths if isinstance(p, str) and p.strip()]
+            if isinstance(raw_plugin_paths, list)
+            else []
+        )
+        # Make managed-store and ``agent.plugin_paths`` plugins discoverable
+        # before permissions and skills are initialized below. This must happen
+        # inside AgentConfig construction rather than only in
+        # ``load_agent_config``: multi-tenant AuthProviders construct
+        # request-scoped AgentConfig instances directly and may have no local
+        # configuration file at all.
+        try:
+            from pico.plugins import store
+
+            store.activate(
+                self.active_plugin_names(),
+                plugins_enabled=self.plugins_enabled,
+                extra_paths=self.plugin_paths,
+            )
+        except Exception as e:  # noqa: BLE001 - a bad plugin dir must never block config construction
+            logger.debug("plugin sys.path activation failed: %s", e)
+        # Plugin config: plugin name -> profile name -> profile config dict.
+        # Populated from ``agent.plugins`` by ``init_plugin_services``.
+        self.plugin_services: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # Raw project-scope bash grants (``.pico/config.yml`` bash_allow),
+        # forwarded by ``_apply_project_override``. Passed to
+        # PermissionManager as an exact-match grant set so a project grant
+        # can bypass an ask-rule hit (merged allow entries cannot).
+        raw_project_bash_allow = kwargs.get("project_bash_allow")
+        self.project_bash_allow: List[str] = (
+            [p for p in raw_project_bash_allow if isinstance(p, str)]
+            if isinstance(raw_project_bash_allow, list)
+            else []
+        )
+        # Raw project-scope SQL grants (``.pico/config.yml`` sql_allow),
+        # forwarded by ``_apply_project_override``. Exact-match statement
+        # kinds the execute_sql permission gate auto-allows for this project.
+        raw_project_sql_allow = kwargs.get("project_sql_allow")
+        self.project_sql_allow: List[str] = (
+            [k for k in raw_project_sql_allow if isinstance(k, str)] if isinstance(raw_project_sql_allow, list) else []
+        )
+
+        for name, raw_config in self.agentic_nodes.items():
+            if not _SAFE_NAME_RE.match(name):
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message=f"Invalid agentic_node name '{name}'. "
+                    f"Only alphanumeric characters, underscores, and hyphens are allowed.",
+                )
+            if not raw_config.get("system_prompt"):
+                raw_config["system_prompt"] = name
+
+        self.benchmark_configs: Dict[str, BenchmarkConfig] = {}
+        self.schema_linking_rate = kwargs.get("schema_linking_rate", "fast")
+        date_parsing_config = kwargs.get("date_parsing", {})
+        if not isinstance(date_parsing_config, dict):
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message="agent.date_parsing must be a mapping",
+            )
+        date_parsing_language = date_parsing_config.get("language", "en")
+        if date_parsing_language == "cn":
+            date_parsing_language = "zh"
+        if date_parsing_language not in {"en", "zh"}:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message="agent.date_parsing.language must be one of: en, zh",
+            )
+        self.date_parsing_language = date_parsing_language
+        # Response language for model outputs (user-facing text). ``None`` (the
+        # default) means the model picks its own language per turn; set a code
+        # like "en"/"zh" in agent.yml or via ``StreamChatInput.language`` to pin
+        # every AgenticNode to a specific output language.
+        self.language = kwargs.get("language")
+        self.db_type = ""
+
+        # Benchmark paths are now fixed at {agent.home}/benchmark/{name}
+        # Supported benchmarks: bird_dev, spider2, semantic_layer
+        # Initialize workflow configuration
+        workflow_config = kwargs.get("workflow", {})
+        self.workflow_plan = workflow_config.get("plan", "fixed")
+
+        # Process custom workflows with enhanced config support
+        self.custom_workflows = {}
+        for k, v in workflow_config.items():
+            if k != "plan":
+                # Store workflow configuration, supporting both list format and {steps: [], config: {}} format
+                self.custom_workflows[k] = v
+        # Initialize services config (datasources, semantic layer, BI tools, schedulers)
+        services_raw = kwargs.get("services") or {}
+        if not isinstance(services_raw, dict):
+            services_raw = {}
+        self.services = ServicesConfig.from_dict(services_raw)
+        self._init_services_config(services_raw.get("datasources", {}))
+        self.init_semantic_layer(self.services.semantic_layer)
+        self.init_dashboard(self.services.bi_platforms)
+        self.init_scheduler_services(self.services.schedulers)
+        self.init_plugin_services(kwargs.get("plugins", {}))
+
+        # SaaS mode: skip _init_dirs() because callers want only derived paths here,
+        # not full local directory / backend initialization.
+        self._skip_init_dirs = kwargs.get("skip_init_dirs", False)
+        if self._skip_init_dirs:
+            self.rag_base_path = str(self.path_manager.project_data_dir)
+            self._save_dir = ""
+            self._trajectory_dir = ""
+            self.benchmark_configs = {}
+            self.session_dir = kwargs.get("session_dir", str(self.path_manager.sessions_dir))
+        else:
+            self._init_dirs()
+
+        storage_config = kwargs.get("storage", {})
+        # use default embedding model if not provided
+        if storage_config:
+            if self._skip_init_dirs:
+                # SaaS mode: skip init_embedding_models() to avoid mutating global EMBEDDING_MODELS
+                self.storage_configs = {}
+            else:
+                try:
+                    self.storage_configs = init_embedding_models(
+                        storage_config, openai_configs=self.models, default_openai_config=self.active_model()
+                    )
+                except (DatusException, KeyError, ValueError) as e:
+                    logger.warning("Skipped embedding model init (no valid active model): %s", e)
+                    self.storage_configs = {}
+        else:
+            self.storage_configs = {}
+
+        from datus_storage_base.backend_config import StorageBackendConfig
+
+        from pico.storage.backend_holder import init_backends
+
+        if not self._skip_init_dirs:
+            # Initialize storage backend configuration (rdb + vector).
+            # Backends are stateless w.r.t. project; the active project is
+            # passed to every ``create_rdb_for_store`` / ``create_vector_connection``
+            # call at lookup time, so ``init_backends`` only wires backend-wide
+            # settings (data_dir, isolation).
+            backend_config = StorageBackendConfig.from_dict(storage_config)
+            self._backend_config = backend_config
+            init_backends(backend_config, data_dir=str(self.path_manager.data_dir))
+
+        # Active profile name — set by ``_init_permissions_config``. Pre-seed
+        # so downstream readers always see a valid string even if permission
+        # init raises.
+        self.active_profile_name: str = "normal"
+        self._raw_permissions: Dict[str, Any] = {}
+        # Profile that ``execution_mode="workflow"`` nodes should run under.
+        # ``None`` (default) keeps the historical forced-``dangerous`` posture
+        # for unattended flows (bootstrap, scheduler subagents, benchmarks).
+        # Print mode sets this so ``pico -p`` respects the configured /
+        # ``--permission-mode`` profile instead — see
+        # ``AgenticNode._setup_permission_manager``.
+        self.workflow_permission_profile: Optional[str] = None
+        # Initialize unified permission system
+        self.permissions_config = self._init_permissions_config(kwargs.get("permissions", {}))
+
+        # Runtime policy data is attached by API/gateway callers to a
+        # per-request AgentConfig copy. Identity and authorization stay outside
+        # the agent; active policy plugins interpret this execution context.
+        self.policy_context: Dict[str, Any] = {}
+
+        # Initialize skills configuration
+        self.skills_config = self._init_skills_config(kwargs.get("skills", {}))
+
+        # ValidationHook knobs (agent.validation.*). Read once at construction
+        # and kept stable for the life of this AgentConfig — hooks capture the
+        # value at node build time and do not hot-reload.
+        self.validation_config = ValidationConfig.from_dict(kwargs.get("validation", {}))
+
+        # Initialize channels configuration for Pico Gateway IM gateway.
+        # Keep this aligned with other config sections: channel credentials may
+        # use ${ENV_VAR} placeholders inside nested adapter-specific fields.
+        self.channels_config: Dict[str, Any] = _resolve_nested_value(kwargs.get("channels", {}))
+
+        # Platform documentation fetch configs (datasource-independent)
+        document_raw = kwargs.get("document", {}) or {}
+        # Extract tavily_api_key from document config (top-level, not a platform).
+        # Only fall back to TAVILY_API_KEY env var when the YAML key is *absent*;
+        # an explicit empty / unresolved-placeholder value disables the key
+        # rather than silently falling through to the environment.
+        _missing = object()
+        tavily_key_raw = document_raw.pop("tavily_api_key", _missing)
+        if tavily_key_raw is _missing:
+            self.tavily_api_key = os.environ.get("TAVILY_API_KEY") or None
+        elif tavily_key_raw is None:
+            self.tavily_api_key = None
+        else:
+            resolved = resolve_env(str(tavily_key_raw))
+            if not resolved or resolved.startswith("<MISSING:"):
+                self.tavily_api_key = None
+            else:
+                self.tavily_api_key = resolved
+
+        self.document_configs: Dict[str, DocumentConfig] = {}
+        for name, cfg in document_raw.items():
+            if not isinstance(cfg, dict):
+                continue
+            if not _SAFE_NAME_RE.match(name):
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message=f"Invalid document platform name '{name}'. "
+                    f"Only alphanumeric characters, underscores, and hyphens are allowed.",
+                )
+            self.document_configs[name] = DocumentConfig.from_dict(cfg)
+
+        # CLI autocomplete runtime knobs (background metadata sync). Missing
+        # section falls back to defaults so legacy agent.yml keeps working.
+        autocomplete_raw = kwargs.get("autocomplete")
+        self.autocomplete = AutocompleteConfig.from_dict(
+            autocomplete_raw if isinstance(autocomplete_raw, dict) else None
+        )
+
+    @property
+    def filesystem_strict(self) -> bool:
+        """Whether ``FilesystemFuncTool`` rejects EXTERNAL paths at the tool layer.
+
+        ``True``: fail-closed — the tool returns a "not allowed in strict mode"
+        error for any path outside the project root / whitelist. Used by the
+        API and gateway surfaces, which have no interactive broker to confirm
+        out-of-workspace access.
+
+        ``False`` (default): ``PermissionHooks`` prompts the user via the
+        broker on EXTERNAL access. Used by the CLI.
+        """
+        return self._filesystem_strict
+
+    @filesystem_strict.setter
+    def filesystem_strict(self, value: bool) -> None:
+        self._filesystem_strict = bool(value)
+
+    @property
+    def filesystem_allowlist(self) -> "PathAllowlist":
+        """Extra fs roots outside the project root (``PathAllowlist``).
+
+        Populated from ``agent.filesystem.allow_read`` / ``allow_write``. Empty
+        by default, in which case only the project root and the built-in
+        whitelist are reachable. Nodes forward it to ``FilesystemFuncTool`` and
+        ``FilesystemPolicy`` so tool and permission layers agree.
+        """
+        return self._filesystem_allowlist
+
+    @filesystem_allowlist.setter
+    def filesystem_allowlist(self, value: Union["PathAllowlist", dict, None]) -> None:
+        """Accepts a ``PathAllowlist``, an ``agent.filesystem``-shaped dict, or ``None``."""
+        from pico.tools.func_tool.fs_path_policy import PathAllowlist
+
+        if value is None:
+            self._filesystem_allowlist = PathAllowlist()
+        elif isinstance(value, PathAllowlist):
+            self._filesystem_allowlist = value
+        else:
+            self._filesystem_allowlist = PathAllowlist.from_dict(value)
+
+    @property
+    def config_mutable(self) -> bool:
+        """Whether the agent may edit the loaded agent config file.
+
+        ``True`` (default, CLI): config-editing setup skills may guide the
+        user through writing ``agent.plugins`` profiles.
+
+        ``False`` (chat API / gateway): the config is read-only — skills
+        declaring ``requires_mutable_config: true`` are hidden from
+        ``<available_skills>`` and refused on load, and plugin system-prompt
+        sections must not suggest configuration edits.
+        """
+        return self._config_mutable
+
+    @config_mutable.setter
+    def config_mutable(self, value: bool) -> None:
+        self._config_mutable = bool(value)
+
+    @property
+    def sql_read_only(self) -> bool:
+        """Whether every SQL entry point served by this config is read-only.
+
+        ``False`` (default): unchanged behaviour — writes and DDL are gated by
+        the permission profile and per-tool ``read_only`` flags only.
+
+        ``True``: :meth:`DBFuncTool.execute_sql`, the cross-datasource
+        :meth:`DBFuncTool.transfer_query_result`, and the raw
+        ``POST /sql/execute`` route all hard-reject every non-read statement,
+        regardless of profile or hooks.
+
+        Read-only by design — there is no setter. Use
+        :meth:`harden_sql_read_only` to turn it on; nothing can turn it off.
+        """
+        return self._sql_read_only
+
+    def harden_sql_read_only(self) -> None:
+        """Switch this config to the read-only SQL posture. One-way.
+
+        A method rather than a setter because the operation is not assignment:
+        it can only tighten, so ``cfg.sql_read_only = False`` would have to
+        silently do nothing. A per-request config clone may harden itself (as
+        the chat API does with ``config_mutable``), but nothing downstream — a
+        plugin, a tool transformer, third-party code sharing the process — may
+        undo a yaml-level ``true``.
+        """
+        self._sql_read_only = True
+
+    @property
+    def bash_tool_enabled(self) -> bool:
+        """Whether agentic nodes should instantiate the general-purpose ``BashTool``.
+
+        ``True`` (default): every :class:`AgenticNode` exposes
+        ``bash``; per-call gating is handled by the
+        ``bash_tools`` ASK rule in the permission profile.
+
+        ``False``: ``BashTool`` is not created and ``bash`` is
+        not advertised to the model. Use this for hardened deployments
+        where shell execution must be unavailable regardless of profile.
+        """
+        return self._bash_tool_enabled
+
+    @bash_tool_enabled.setter
+    def bash_tool_enabled(self, value: bool) -> None:
+        self._bash_tool_enabled = _coerce_bool(value, True)
+
+    @property
+    def bash_allowed_patterns(self) -> List[str]:
+        """Command patterns the general-purpose ``BashTool`` accepts.
+
+        ``["*"]`` (default): unrestricted at the execution layer — per-call
+        gating is handled by the ``bash_tools`` ASK rule in the permission
+        profile.
+
+        A restrictive list (e.g. ``["pico*"]``) turns the tool into a hard
+        whitelist enforced by ``BashTool._is_command_allowed`` regardless of
+        the active permission profile. Used by the API surface to expose a
+        pico-only bash to web clients.
+        """
+        return self._bash_allowed_patterns
+
+    @bash_allowed_patterns.setter
+    def bash_allowed_patterns(self, value: List[str]) -> None:
+        self._bash_allowed_patterns = _coerce_pattern_list(value)
+
+    @property
+    def bash_sandbox(self):
+        """OS-level sandbox settings for the general-purpose ``BashTool``.
+
+        Parsed from ``agent.bash.sandbox``. Returns the mutable
+        ``SandboxSettings`` instance shared with every ``BashTool`` —
+        ``/sandbox on|off`` flips ``enabled`` in place and the tools pick it
+        up on their next call. Default: disabled.
+        """
+        return self._bash_sandbox
+
+    @property
+    def current_datasource(self):
+        return self._current_datasource
+
+    @current_datasource.setter
+    def current_datasource(self, value):
+        """Set the current datasource name (must exist in services.datasources, or empty to clear)."""
+        if not value:
+            self._current_datasource = ""
+            self.db_type = ""
+            return
+        if value not in self.services.datasources:
+            raise DatusException(
+                code=ErrorCode.COMMON_UNSUPPORTED,
+                message_args={"field_name": "datasource", "your_value": value},
+            )
+        if value == self._current_datasource:
+            return
+        self._current_datasource = value
+        self.db_type = self.services.datasources[value].type
+
+    @property
+    def project_name(self) -> str:
+        """Immutable project identifier derived at construction time.
+
+        ``project_name`` is pinned to the ``AgentConfig`` instance: the CLI
+        runs a single project per process, and the API serves multiple
+        projects by instantiating one ``AgentConfig`` per request / tenant.
+        Neither use case requires runtime mutation, so there is no setter.
+        Callers that want to "switch projects" should construct a fresh
+        ``AgentConfig``; the storage registry's LRU cache already isolates
+        concurrent project entries by project-keyed cache entries.
+        """
+        return self._project_name
+
+    @property
+    def project_root(self) -> str:
+        """Immutable project root directory (defaults to the CWD at launch).
+
+        Pinned at construction time for the same reason as ``project_name``:
+        the CLI runs a single project per process, and SaaS callers spin up a
+        fresh ``AgentConfig`` per tenant.  Callers that want to redirect KB
+        content should construct a new ``AgentConfig`` with the desired
+        ``project_root=`` kwarg instead of mutating it at runtime.
+        """
+        return str(self._project_root)
+
+    @property
+    def max_export_lines(self) -> int:
+        return self.export_config.get("max_lines", 1000)
+
+    @property
+    def datasource_configs(self) -> Dict[str, DbConfig]:
+        """Datasource configs for DBManager consumption: one DbConfig per datasource key."""
+        return dict(self.services.datasources)
+
+    def _init_services_config(self, datasources_config: Dict[str, Any]):
+        """Parse services.datasources section into ServicesConfig.datasources."""
+        for db_name, db_config_dict in datasources_config.items():
+            if not isinstance(db_config_dict, dict):
+                continue
+            if not _SAFE_NAME_RE.match(db_name):
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message=f"Invalid datasource name '{db_name}'. "
+                    f"Only alphanumeric characters, underscores, and hyphens are allowed.",
+                )
+            db_type = db_config_dict.get("type", "")
+            is_default = db_config_dict.get("default", False)
+
+            if db_type in (DBType.SQLITE, DBType.DUCKDB):
+                if "path_pattern" in db_config_dict:
+                    path_pattern = resolve_env(str(db_config_dict["path_pattern"]))
+                    self._parse_glob_pattern(
+                        db_name, path_pattern, db_type, is_default, db_config_dict.get("database", "")
+                    )
+                elif "uri" in db_config_dict:
+                    db_config = _parse_single_file_db(db_config_dict, db_type)
+                    db_config.default = is_default
+                    self.services.datasources[db_name] = db_config
+            else:
+                db_config = DbConfig.filter_kwargs(DbConfig, db_config_dict)
+                db_config.default = is_default
+                self.services.datasources[db_name] = db_config
+
+    def _parse_glob_pattern(
+        self, base_name: str, path_pattern: str, db_type: str, is_default: bool = False, default_database: str = ""
+    ):
+        """Register ONE multi-database datasource backed by a glob ``path_pattern``.
+
+        The matched files are this datasource's databases, enumerated at runtime from the
+        pattern (see ``list_databases``). ``default_database`` optionally names the default db.
+        """
+        if not get_files_from_glob_pattern(path_pattern, db_type):
+            logger.warning(
+                f"No available database files found for '{base_name}', path_pattern: `{path_pattern}`. "
+                f"Skipping this entry. Ensure the path exists or remove it from agent.yml."
+            )
+            return
+        self.services.datasources[base_name] = DbConfig(
+            type=db_type,
+            path_pattern=path_pattern,
+            database=default_database,
+            schema="",
+            default=is_default,
+        )
+
+    def _init_permissions_config(self, permissions_raw: Dict[str, Any]):
+        """Initialize unified permission configuration.
+
+        Loads the base profile (default: ``normal``) and layers user-supplied
+        ``rules`` on top via ``PermissionConfig.merge_with`` (last-match-wins).
+        Sets ``self.active_profile_name`` so the CLI status bar and
+        ``/profile`` command can read the source of truth from one place.
+        Stashes the raw dict in ``self._raw_permissions`` so ``/profile`` can
+        rebuild the effective config on switch without re-reading YAML.
+
+        Args:
+            permissions_raw: Raw permissions config from agent.yml. May be
+                empty ({}) — treated as "no profile override, no user rules",
+                equivalent to ``{"profile": "normal", "rules": []}``.
+
+        Returns:
+            PermissionConfig instance. A profile is always applied, so the
+            return is never ``None``.
+        """
+        from pico.tools.permission.profiles import build_effective_config, get_profile
+
+        if not permissions_raw:
+            permissions_raw = {}
+        elif not isinstance(permissions_raw, dict):
+            logger.warning(
+                "Invalid permissions section in agent.yml: expected mapping, got %s. Falling back to 'normal'.",
+                type(permissions_raw).__name__,
+            )
+            permissions_raw = {}
+        # Stash a copy so /profile can rebuild effective config on switch
+        # without re-reading YAML.
+        self._raw_permissions = dict(permissions_raw)
+        requested_profile = permissions_raw.get("profile") or "normal"
+        if not isinstance(requested_profile, str):
+            logger.warning(
+                "Invalid permissions.profile in agent.yml: %r. Falling back to 'normal'.",
+                requested_profile,
+            )
+            requested_profile = "normal"
+
+        try:
+            get_profile(requested_profile)  # validate only; result used below
+            self.active_profile_name = requested_profile
+        except ValueError as e:
+            logger.warning(f"Invalid profile {requested_profile!r} in agent.yml: {e}. Falling back to 'normal'.")
+            self.active_profile_name = "normal"
+
+        # Bash rules declared by installed plugins for their own CLI
+        # namespaces (``pico <plugin> ...``), keyed by profile name. Stored
+        # so PermissionManager can re-apply them across runtime profile
+        # switches. Additive convenience only — collection failure just means
+        # extra ASK prompts, so it must never block config load.
+        self.plugin_bash_rules = {}
+        if getattr(self, "plugins_enabled", True):
+            try:
+                from pico.plugins.registry import collect_plugin_cli_permissions
+
+                self.plugin_bash_rules = collect_plugin_cli_permissions(self.active_plugin_names())
+            except Exception as e:
+                logger.warning(f"Plugin CLI permission collection failed: {e}; continuing without plugin rules")
+
+        # Remove the ``profile`` key so the helper only sees user overrides.
+        user_raw = {k: v for k, v in permissions_raw.items() if k != "profile"}
+        try:
+            return build_effective_config(
+                self.active_profile_name,
+                user_raw,
+                plugin_bash_rules=self.plugin_bash_rules.get(self.active_profile_name),
+            )
+        except Exception as e:
+            # Fail closed: malformed ``permissions.rules`` almost always means the
+            # user was trying to *tighten* an otherwise permissive profile. If
+            # the selected profile is ``dangerous`` and we silently dropped the
+            # overrides we'd hand the user an ALLOW-everything posture — the
+            # opposite of their intent. Fall back to ``normal`` (plus logged
+            # warning) so the worst-case is an over-prompt, never an under-gate.
+            logger.warning(
+                f"Invalid permissions.rules in agent.yml: {e}. "
+                f"Falling back to 'normal' profile instead of '{self.active_profile_name}' to avoid "
+                f"silently weakening the posture."
+            )
+            self.active_profile_name = "normal"
+            return get_profile("normal")
+
+    def _init_skills_config(self, skills_raw: Dict[str, Any]):
+        """Initialize skills configuration.
+
+        Args:
+            skills_raw: Raw skills config from agent.yml
+
+        Returns:
+            SkillConfig instance or None
+        """
+        if not skills_raw:
+            return None
+
+        try:
+            from pico.tools.skill_tools.skill_config import SkillConfig
+
+            return SkillConfig.from_dict(skills_raw, agent_config=self)
+        except Exception as e:
+            logger.warning(f"Failed to initialize skills config: {e}")
+            return None
+
+    def current_db_config(self, db_name: str = "") -> DbConfig:
+        """Get a datasource config by name, or the current/default one."""
+        datasources = self.services.datasources
+        if db_name and db_name in datasources:
+            return datasources[db_name]
+        if self._current_datasource and self._current_datasource in datasources:
+            return datasources[self._current_datasource]
+        if len(datasources) == 1:
+            return list(datasources.values())[0]
+        if not db_name:
+            default = self.services.default_datasource
+            if default:
+                return datasources[default]
+        raise DatusException(
+            code=ErrorCode.COMMON_UNSUPPORTED,
+            message=f"Datasource '{db_name}' not found. Available: {list(datasources.keys())}",
+        )
+
+    def current_db_configs(self) -> Dict[str, DbConfig]:
+        """Returns all datasource configs."""
+        return self.services.datasources
+
+    def set_runtime_db_context(self, runtime_db_context: Optional[Mapping[str, Any]] = None, **kwargs: Any) -> None:
+        """Pin a request/CLI scoped catalog/database/schema context for adapters."""
+        values: Dict[str, Any] = {}
+        if runtime_db_context:
+            values.update(runtime_db_context)
+        values.update({key: value for key, value in kwargs.items() if value is not None})
+
+        normalized: Dict[str, str] = {}
+        for key in (
+            "datasource",
+            "catalog",
+            "catalog_name",
+            "database",
+            "database_name",
+            "schema",
+            "db_schema",
+            "schema_name",
+        ):
+            value = values.get(key)
+            if value is None:
+                continue
+            text = value.strip() if isinstance(value, str) else str(value).strip()
+            if text:
+                normalized[key] = text
+
+        if "catalog" not in normalized and "catalog_name" in normalized:
+            normalized["catalog"] = normalized["catalog_name"]
+        if "catalog_name" not in normalized and "catalog" in normalized:
+            normalized["catalog_name"] = normalized["catalog"]
+        if "database" not in normalized and "database_name" in normalized:
+            normalized["database"] = normalized["database_name"]
+        if "database_name" not in normalized and "database" in normalized:
+            normalized["database_name"] = normalized["database"]
+        if "schema" not in normalized:
+            if "db_schema" in normalized:
+                normalized["schema"] = normalized["db_schema"]
+            elif "schema_name" in normalized:
+                normalized["schema"] = normalized["schema_name"]
+        if "db_schema" not in normalized and "schema" in normalized:
+            normalized["db_schema"] = normalized["schema"]
+        if "schema_name" not in normalized and "schema" in normalized:
+            normalized["schema_name"] = normalized["schema"]
+
+        self._runtime_db_context = normalized
+
+    def runtime_db_context(self) -> Dict[str, str]:
+        """Return the request/CLI scoped datasource context, if one is pinned."""
+        return dict(self._runtime_db_context)
+
+    def list_databases(self, datasource: str = "") -> List[str]:
+        """Config-known physical databases of a datasource.
+
+        For a glob (``path_pattern``) datasource these are the matched files (one db per file);
+        for a single-file/server datasource it's the configured ``database`` (may be empty).
+        Server-side database enumeration beyond config is done via the connector, not here.
+        """
+        ds = datasource or self._current_datasource
+        cfg = self.services.datasources.get(ds)
+        if cfg is None:
+            return []
+        if cfg.path_pattern:
+            return [p["name"] for p in get_files_from_glob_pattern(cfg.path_pattern, cfg.type)]
+        return [cfg.database] if cfg.database else []
+
+    def default_scheduler_service(self) -> Optional[str]:
+        defaults = [name for name, cfg in self.scheduler_services.items() if cfg.get("default")]
+        if len(defaults) > 1:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    "Multiple scheduler services are marked with `default: true` in "
+                    "`agent.services.schedulers`. Keep at most one default scheduler."
+                ),
+            )
+        if defaults:
+            return defaults[0]
+        if len(self.scheduler_services) == 1:
+            return next(iter(self.scheduler_services))
+        return None
+
+    def get_scheduler_config(self, service_name: Optional[str] = None) -> Dict[str, Any]:
+        if service_name:
+            if service_name not in self.scheduler_services:
+                raise DatusException(
+                    ErrorCode.COMMON_CONFIG_ERROR,
+                    message=(
+                        f"No scheduler service named `{service_name}` found. "
+                        f"Available: {list(self.scheduler_services.keys())}"
+                    ),
+                )
+            return self.scheduler_services[service_name]
+
+        # Project-level override from ``./.pico/config.yml`` wins over the
+        # global ``default: true`` flag so a project can pin a different
+        # scheduler than the workspace-wide default without rewriting
+        # agent.yml. A stale override (service deleted from agent.yml) is
+        # ignored with a warning so the user sees one clear error rather
+        # than a confusing "no scheduler configured" later.
+        active_override = self._active_scheduler
+        if active_override:
+            if active_override in self.scheduler_services:
+                return self.scheduler_services[active_override]
+            logger.warning(
+                "Project override active_scheduler=`%s` is not configured under "
+                "`agent.services.schedulers`; falling back to global default.",
+                active_override,
+            )
+
+        default_service = self.default_scheduler_service()
+        if default_service:
+            return self.scheduler_services[default_service]
+
+        if not self.scheduler_services:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message="No scheduler configured in `agent.services.schedulers`.",
+            )
+
+        raise DatusException(
+            ErrorCode.COMMON_CONFIG_ERROR,
+            message=(
+                "Multiple scheduler services are configured in `agent.services.schedulers`, "
+                "set `scheduler_service` on the scheduler node."
+            ),
+        )
+
+    def plugins_section_present(self) -> bool:
+        """True when ``./.pico/config.yml`` wrote an explicit ``plugins:`` key.
+
+        When ``False`` the section is absent and every installed plugin (and
+        all its profiles) is active. When ``True`` the section is the
+        authoritative activation whitelist.
+        """
+        return getattr(self, "_plugins_section_present", False)
+
+    def plugin_active(self, name: str) -> bool:
+        """Whether ``name`` is active for this project.
+
+        ``False`` when the global master switch ``plugins_enabled`` is off, or
+        when the ``plugins:`` section is present and ``name`` is either unlisted
+        or listed with ``enabled: false``. When the section is absent every
+        installed plugin is active.
+        """
+        if not getattr(self, "plugins_enabled", True):
+            return False
+        if not getattr(self, "_plugins_section_present", False):
+            return True
+        activation = getattr(self, "_active_plugins", {}).get(name)
+        return activation is not None and activation.enabled
+
+    def active_plugin_names(self) -> Optional[Set[str]]:
+        """Set of active plugin names, or ``None`` meaning "no filter (all)".
+
+        Returned to the plugin registry's collection functions to gate which
+        installed plugins contribute skills / prompt sections / tool
+        transformers / bash rules. ``None`` (section absent) means every plugin
+        passes; an empty set means none pass; the master switch being off also
+        yields an empty set. Uses ``getattr`` defaults so it is safe to call
+        during ``__init__`` (permission collection) before every attribute is
+        assigned.
+        """
+        if not getattr(self, "plugins_enabled", True):
+            return set()
+        if not getattr(self, "_plugins_section_present", False):
+            return None
+        return {name for name, act in getattr(self, "_active_plugins", {}).items() if act.enabled}
+
+    def active_plugin_profiles(self, plugin: str) -> Optional[List[str]]:
+        """Active profile names pinned for ``plugin``, or ``None`` for "all".
+
+        ``None`` when the section is absent or the plugin is listed without an
+        ``active_profile`` narrowing. An empty list means the plugin is not
+        active (unlisted or disabled) — callers should gate on
+        :meth:`plugin_active` first.
+        """
+        if not getattr(self, "_plugins_section_present", False):
+            return None
+        activation = getattr(self, "_active_plugins", {}).get(plugin)
+        if activation is None or not activation.enabled:
+            return []
+        return activation.active_profile
+
+    def plugin_state_signature(self) -> Dict[str, Any]:
+        """JSON-serializable snapshot of this config's plugin state.
+
+        ``DatusService.compute_fingerprint`` hashes ``dataclasses.asdict``, which
+        only sees declared fields — every plugin input lives in instance
+        attributes instead (master switch, activation whitelist,
+        ``agent.plugins`` profiles, ``plugin_paths``). Folding this snapshot into
+        the fingerprint is what makes a cached per-project ``DatusService``
+        rebuild on the next request after a plugin is enabled/disabled,
+        re-profiled, re-pinned, or remounted.
+
+        Config-only by design: the installed version in ``~/.pico/plugins`` is
+        deliberately NOT read here. Detecting an out-of-process version swap
+        would cost a filesystem scan on every request and buy nothing — the
+        rebuild reuses the same AgentConfig object, and manifests/entry points
+        stay pinned by ``registry._PLUGIN_CACHE`` and by whatever the process
+        already imported. In-process installs already handle themselves
+        (``plugin_service._refresh`` invalidates those caches); an out-of-process
+        version swap has to reach the host as a new AgentConfig — e.g. a
+        ``plugin_paths`` entry pointing at the new versioned directory, which
+        this snapshot does catch.
+
+        Built by hand rather than promoting the attributes to dataclass fields so
+        ``PluginActivation`` values are flattened and the payload stays stable
+        under ``json.dumps(..., default=str)``.
+        """
+        activation = {
+            name: {
+                "enabled": act.enabled,
+                "active_profile": list(act.active_profile) if act.active_profile is not None else None,
+            }
+            for name, act in getattr(self, "_active_plugins", {}).items()
+        }
+        return {
+            "enabled": bool(getattr(self, "plugins_enabled", True)),
+            "section_present": bool(getattr(self, "_plugins_section_present", False)),
+            "paths": list(getattr(self, "plugin_paths", None) or []),
+            "activation": activation,
+            "profiles": getattr(self, "plugin_services", None) or {},
+        }
+
+    def get_plugin_profile(self, plugin: str, profile: Optional[str] = None) -> Dict[str, Any]:
+        """Resolve the active profile config dict for ``plugin``.
+
+        Resolution order when ``profile`` is not given explicitly: the profiles
+        are first narrowed to the project's ``active_profile`` pins (when the
+        ``plugins:`` section pins any), then resolved by the profile flagged
+        ``default: true`` (more than one is an error) → the sole (narrowed)
+        profile. So pinning exactly one ``active_profile`` makes it the
+        ``pico <plugin>`` default. When the plugin has no
+        ``agent.plugins.<plugin>`` section at all, an empty dict is returned so
+        config-free plugins still run. Multiple candidates with no way to
+        disambiguate raises, asking the user to pass ``--profile``.
+        """
+        profiles = self.plugin_services.get(plugin) or {}
+
+        if profile:
+            if profile not in profiles:
+                raise DatusException(
+                    ErrorCode.COMMON_CONFIG_ERROR,
+                    message=(f"No profile named `{profile}` for plugin `{plugin}`. Configured: {sorted(profiles)}"),
+                )
+            return profiles[profile]
+
+        if not profiles:
+            return {}
+
+        # Narrow to the project's active profiles when the plugins section pins
+        # a subset; a pin that matches nothing configured degrades to "all".
+        candidates = profiles
+        pinned = self.active_plugin_profiles(plugin)
+        if pinned:
+            narrowed = {name: cfg for name, cfg in profiles.items() if name in pinned}
+            if narrowed:
+                candidates = narrowed
+            else:
+                logger.warning(
+                    "Project active_profile pin for plugin `%s` (%s) matches no configured profile "
+                    "under `agent.plugins.%s`; considering all profiles.",
+                    plugin,
+                    pinned,
+                    plugin,
+                )
+
+        defaults = [name for name, cfg in candidates.items() if isinstance(cfg, dict) and cfg.get("default")]
+        if len(defaults) > 1:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    f"Multiple profiles for plugin `{plugin}` are marked `default: true` in "
+                    f"`agent.plugins.{plugin}`. Keep at most one default profile."
+                ),
+            )
+        if defaults:
+            return candidates[defaults[0]]
+        if len(candidates) == 1:
+            return next(iter(candidates.values()))
+
+        raise DatusException(
+            ErrorCode.COMMON_CONFIG_ERROR,
+            message=(
+                f"Multiple profiles active for plugin `{plugin}` and none marked "
+                f"`default: true`; pass --profile <name>. Active: {sorted(candidates)}"
+            ),
+        )
+
+    def default_dashboard_service(self) -> Optional[str]:
+        """Return the dashboard service marked as the global default, or ``None``.
+
+        Mirrors :meth:`default_scheduler_service`: at most one entry under
+        ``services.bi_platforms`` may carry ``default: true`` (multiple
+        defaults are an explicit error so the user fixes the config rather
+        than us silently picking one). When no entry is flagged, fall
+        through to the single-entry shortcut so simple deployments still
+        Just Work without writing the flag.
+        """
+        defaults = [name for name, cfg in self.dashboard_config.items() if getattr(cfg, "default", False)]
+        if len(defaults) > 1:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    "Multiple BI services are marked with `default: true` in "
+                    "`agent.services.bi_platforms`. Keep at most one default dashboard."
+                ),
+            )
+        if defaults:
+            return defaults[0]
+        if len(self.dashboard_config) == 1:
+            return next(iter(self.dashboard_config))
+        return None
+
+    def active_dashboard(self) -> Optional[str]:
+        """Return the project-level default BI service, or ``None``.
+
+        Read by :class:`BIFuncTool._resolved_platform` between the explicit
+        ``bi_service`` argument and the global ``default: true`` flag.
+        ``None`` means "no project override — fall back to
+        ``default_dashboard_service`` or raise on ambiguity".
+        """
+        return self._active_dashboard
+
+    def active_scheduler(self) -> Optional[str]:
+        """Return the project-level default scheduler service, or ``None``.
+
+        Read by :meth:`get_scheduler_config` between the explicit
+        ``service_name`` argument and the global ``default: true`` flag.
+        """
+        return self._active_scheduler
+
+    def active_semantic(self) -> Optional[str]:
+        """Return the project-level default semantic adapter, or ``None``.
+
+        Read by :meth:`resolve_semantic_adapter` between the explicit
+        ``adapter_type`` argument and the global ``default: true`` flag.
+        """
+        return self._active_semantic
+
+    def set_active_dashboard(self, name: Optional[str], persist: bool = True) -> None:
+        """Pin (or clear) the project-level default BI service.
+
+        ``name=None`` clears the override. When ``persist`` is ``True``
+        (default), writes ``./.pico/config.yml`` so the choice survives
+        process restarts. Validation against ``services.bi_platforms`` is
+        skipped here — :meth:`active_dashboard` is consulted lazily by
+        consumers, which surface a clear "service not configured" error
+        if the override has gone stale.
+        """
+        cleaned = (name or "").strip() or None
+        self._active_dashboard = cleaned
+        if persist:
+            self._persist_project_field("dashboard", cleaned)
+
+    def set_active_scheduler(self, name: Optional[str], persist: bool = True) -> None:
+        """Pin (or clear) the project-level default scheduler service.
+
+        Mirrors :meth:`set_active_dashboard` for the scheduler section.
+        """
+        cleaned = (name or "").strip() or None
+        self._active_scheduler = cleaned
+        if persist:
+            self._persist_project_field("scheduler", cleaned)
+
+    def set_active_semantic(self, name: Optional[str], persist: bool = True) -> None:
+        """Pin (or clear) the project-level default semantic adapter.
+
+        Mirrors :meth:`set_active_dashboard` for the semantic_layer section.
+        """
+        cleaned = (name or "").strip() or None
+        self._active_semantic = cleaned
+        if persist:
+            self._persist_project_field("semantic", cleaned)
+
+    def _persist_project_field(self, field_name: str, value: Optional[str]) -> None:
+        """Update a single top-level field in ``./.pico/config.yml``.
+
+        Reuses the same project_root resolution as
+        :meth:`set_active_provider_model` so the write target matches the
+        rest of the project-override surface. ``None`` clears the field
+        from the saved YAML rather than writing an empty string.
+        """
+        from pico.configuration.project_config import (
+            ProjectOverride,
+            load_project_override,
+            save_project_override,
+        )
+
+        current = load_project_override(cwd=str(self._project_root)) or ProjectOverride()
+        setattr(current, field_name, value)
+        save_project_override(current, cwd=str(self._project_root))
+
+    def set_plugin_activation(
+        self,
+        name: str,
+        *,
+        enabled: Optional[bool] = None,
+        active_profiles: Optional[List[str]] = None,
+        clear_profiles: bool = False,
+        persist: bool = True,
+    ) -> None:
+        """Update this project's activation for plugin ``name`` in memory and YAML.
+
+        Writing any plugin activation makes ``./.pico/config.yml`` carry the
+        ``plugins:`` section, which flips activation to whitelist mode — every
+        installed plugin the section does not list becomes inactive. To keep
+        the previous "everything active" behaviour when the section was absent,
+        the first write seeds an explicit ``enabled: true`` entry for every
+        currently-installed plugin, then applies the requested change on top.
+
+        ``enabled=None`` leaves the flag unchanged; ``active_profiles`` replaces
+        the profile pins (``clear_profiles=True`` resets them to "all"). When
+        ``persist`` is ``True`` the change is written to
+        ``./.pico/config.yml``.
+        """
+        if not self._plugins_section_present:
+            # Seed the whitelist with every installed plugin so turning one
+            # entry on/off does not silently deactivate the others. Draw from
+            # BOTH entry-point discovery and the managed store: entry points
+            # may be empty on first load (a managed plugin dir not yet on
+            # sys.path), and seeding only ``name`` would flip the project into
+            # whitelist mode with a single entry, deactivating everything else.
+            installed: set = set()
+            try:
+                from pico.plugins.registry import iter_plugin_entry_points
+
+                installed.update(
+                    getattr(ep, "name", None) for ep in iter_plugin_entry_points() if getattr(ep, "name", None)
+                )
+            except Exception as exc:  # noqa: BLE001 - discovery must not block a config edit
+                logger.debug("plugin entry-point discovery for activation seed failed: %s", exc)
+            try:
+                from pico.plugins import store
+
+                installed.update(
+                    meta.get("name") for meta in store.iter_installed() if isinstance(meta.get("name"), str)
+                )
+            except Exception as exc:  # noqa: BLE001 - store scan must not block a config edit
+                logger.debug("managed-store scan for activation seed failed: %s", exc)
+            installed.discard(None)
+            installed.add(name)
+            self._active_plugins = {p: PluginActivation(enabled=True) for p in sorted(installed)}
+            self._plugins_section_present = True
+
+        activation = self._active_plugins.get(name) or PluginActivation()
+        if enabled is not None:
+            activation.enabled = bool(enabled)
+        if clear_profiles:
+            activation.active_profile = None
+        elif active_profiles is not None:
+            cleaned = [p.strip() for p in active_profiles if isinstance(p, str) and p.strip()]
+            activation.active_profile = cleaned or None
+        self._active_plugins[name] = activation
+
+        if persist:
+            self._persist_plugins()
+
+    def _persist_plugins(self) -> None:
+        """Write the in-memory plugin activation map to ``./.pico/config.yml``."""
+        from pico.configuration.project_config import (
+            ProjectOverride,
+            load_project_override,
+            save_project_override,
+        )
+
+        current = load_project_override(cwd=str(self._project_root)) or ProjectOverride()
+        current.plugins = dict(self._active_plugins)
+        save_project_override(current, cwd=str(self._project_root))
+
+    def save_plugin_profile(self, plugin: str, profile: str, config: Dict[str, Any]) -> None:
+        """Create or replace ``agent.plugins.<plugin>.<profile>`` in agent.yml.
+
+        Writes the global agent config (mirroring the ``/model`` custom-model
+        persistence) and re-parses ``self.plugin_services`` so the new profile
+        is visible in-process without a restart. Secret values should be passed
+        as ``${ENV_VAR}`` placeholders by the caller — this method stores them
+        verbatim and never expands them into the file.
+        """
+        from pico.configuration.agent_config_loader import configuration_manager
+
+        mgr = configuration_manager()
+        plugins = dict(mgr.get("plugins", {}) or {})
+        plugin_map = dict(plugins.get(plugin, {}) or {})
+        plugin_map[profile] = dict(config)
+        plugins[plugin] = plugin_map
+        if not mgr.update_item("plugins", plugins, delete_old_key=True, save=True):
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Failed to persist profile `{profile}` for plugin `{plugin}`"},
+            )
+        self.init_plugin_services(plugins)
+
+    def delete_plugin_profile(self, plugin: str, profile: str) -> bool:
+        """Remove ``agent.plugins.<plugin>.<profile>`` from agent.yml.
+
+        Returns ``False`` when the profile (or plugin) is not configured.
+        Re-parses ``self.plugin_services`` on success.
+        """
+        from pico.configuration.agent_config_loader import configuration_manager
+
+        mgr = configuration_manager()
+        plugins = dict(mgr.get("plugins", {}) or {})
+        plugin_map = dict(plugins.get(plugin, {}) or {})
+        if profile not in plugin_map:
+            return False
+        del plugin_map[profile]
+        if plugin_map:
+            plugins[plugin] = plugin_map
+        else:
+            plugins.pop(plugin, None)
+        if not mgr.update_item("plugins", plugins, delete_old_key=True, save=True):
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={
+                    "config_error": f"Failed to persist deletion of profile `{profile}` for plugin `{plugin}`"
+                },
+            )
+        self.init_plugin_services(plugins)
+        return True
+
+    def default_semantic_adapter(self) -> Optional[str]:
+        """Return the semantic adapter marked as the global default, or ``None``.
+
+        Mirrors :meth:`default_scheduler_service` /
+        :meth:`default_dashboard_service`: at most one entry under
+        ``services.semantic_layer`` may carry ``default: true``; multiple
+        defaults are rejected here so the user fixes the YAML rather than
+        having us silently pick one. Falls back to the single-entry
+        shortcut when no entry is flagged.
+        """
+        defaults = [name for name, cfg in self.semantic_layer_configs.items() if cfg.get("default")]
+        if len(defaults) > 1:
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    "Multiple semantic layers are marked with `default: true` in "
+                    "`agent.services.semantic_layer`. Keep at most one default semantic adapter."
+                ),
+            )
+        if defaults:
+            return defaults[0]
+        if len(self.semantic_layer_configs) == 1:
+            return next(iter(self.semantic_layer_configs))
+        return None
+
+    def resolve_semantic_adapter(self, adapter_type: Optional[str] = None) -> Optional[str]:
+        """Resolve the active semantic adapter name.
+
+        Order: explicit ``adapter_type`` argument -> project-level pin
+        (``./.pico/config.yml`` ``semantic:``) -> global ``default: true``
+        flag / single-entry shortcut -> built-in default fallback when
+        no semantic layer is configured. Raises when multiple semantic layers
+        are configured without a clear default.
+        """
+        normalized = str(adapter_type or "").lower().strip()
+        if normalized:
+            if not self.semantic_layer_configs or normalized in self.semantic_layer_configs:
+                return normalized
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    f"No semantic layer named `{normalized}` found in `agent.services.semantic_layer`. "
+                    f"Available: {list(self.semantic_layer_configs.keys())}"
+                ),
+            )
+
+        active_override = self._active_semantic
+        if active_override:
+            if not self.semantic_layer_configs or active_override in self.semantic_layer_configs:
+                return active_override
+            logger.warning(
+                "Project override active_semantic=`%s` is not configured under "
+                "`agent.services.semantic_layer`; falling back to global default.",
+                active_override,
+            )
+
+        if not self.semantic_layer_configs:
+            return DEFAULT_SEMANTIC_ADAPTER
+
+        default_adapter = self.default_semantic_adapter()
+        if default_adapter:
+            return default_adapter
+        raise DatusException(
+            ErrorCode.COMMON_CONFIG_ERROR,
+            message=(
+                "Multiple semantic layers are configured in `agent.services.semantic_layer`, "
+                "mark exactly one entry with `default: true`."
+            ),
+        )
+
+    def get_semantic_layer_config(self, adapter_type: Optional[str] = None) -> Dict[str, Any]:
+        resolved_adapter = self.resolve_semantic_adapter(adapter_type)
+        if not resolved_adapter or resolved_adapter not in self.semantic_layer_configs:
+            return {}
+        return dict(self.semantic_layer_configs[resolved_adapter])
+
+    def build_semantic_adapter_config(
+        self,
+        adapter_type: Optional[str] = None,
+        database_name: Optional[str] = None,
+        runtime_db_context: Optional[Mapping[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        resolved_adapter = self.resolve_semantic_adapter(adapter_type)
+        if not resolved_adapter:
+            return None
+
+        config = self.get_semantic_layer_config(resolved_adapter)
+        config.setdefault("type", resolved_adapter)
+        if resolved_adapter == "osi":
+            config.setdefault("execution_backend", "metricflow")
+        effective_runtime_db_context = (
+            runtime_db_context if runtime_db_context is not None else self.runtime_db_context()
+        )
+        runtime_datasource = _runtime_context_value(effective_runtime_db_context, "datasource")
+
+        db_name = (
+            database_name
+            or runtime_datasource
+            or config.get("datasource")
+            or self.current_datasource
+            or self.services.default_datasource
+        )
+        if db_name:
+            config["datasource"] = db_name
+            db_config_obj = self.current_db_config(db_name)
+            db_config = _merge_semantic_adapter_db_config(
+                _db_config_to_semantic_adapter_config(db_config_obj),
+                config.get("db_config"),
+            )
+            config_db_config = _apply_runtime_db_context_to_semantic_adapter_config(
+                db_config,
+                effective_runtime_db_context,
+            )
+            if config_db_config:
+                config["db_config"] = config_db_config
+
+        datasource_name = config.get("datasource", self.current_datasource)
+        config.setdefault("semantic_models_path", str(self.path_manager.semantic_model_path(datasource_name)))
+        config.setdefault("agent_home", self.home)
+        return config
+
+    @property
+    def output_dir(self) -> str:
+        return f"{self._save_dir}/{self._current_datasource}"
+
+    def get_save_run_dir(self, run_id: Optional[str] = None) -> str:
+        return str(self.save_run_dir(self._current_datasource, run_id))
+
+    def save_run_dir(self, database: str, run_id: Optional[str] = None) -> Path:
+        from pico.utils.path_manager import DatusPathManager
+
+        return DatusPathManager.resolve_run_dir(Path(self._save_dir), database, run_id)
+
+    @property
+    def trajectory_dir(self) -> str:
+        return self._trajectory_dir
+
+    def get_trajectory_run_dir(self, run_id: Optional[str] = None) -> str:
+        return str(self.trajectory_run_dir(self._current_datasource, run_id))
+
+    def trajectory_run_dir(self, database: str, run_id: Optional[str] = None) -> Path:
+        from pico.utils.path_manager import DatusPathManager
+
+        return DatusPathManager.resolve_run_dir(Path(self._trajectory_dir), database, run_id)
+
+    def __getitem__(self, key):
+        if key not in self.models:
+            raise KeyError(f"Model '{key}' not found.")
+        return self.models[key]
+
+    def _init_dirs(
+        self,
+    ):
+        """Initialize directory-derived paths from the current home."""
+        path_manager = self.path_manager
+        logger.info(f"Using pico home directory: {path_manager.datus_home}")
+        # Save directory is now fixed at {agent.home}/save
+        self._save_dir = str(path_manager.save_dir)
+        # Trajectory directory is now fixed at {agent.home}/trajectory
+        self._trajectory_dir = str(path_manager.trajectory_dir)
+
+        # Project-scoped RAG base: {home}/data/{project_name}.  Storage backends
+        # receive the parent (``path_manager.data_dir``) and handle their own
+        # project isolation; the path-based helper is kept for non-backend
+        # callers such as document storage.
+        self.rag_base_path = str(path_manager.project_data_dir)
+
+        self._init_benchmark_configs()
+        self.session_dir = str(path_manager.sessions_dir)
+
+    def _init_benchmark_configs(self):
+        self.benchmark_configs = {
+            "spider2": BenchmarkConfig(
+                benchmark_path="spider2/spider2-snow",
+                question_file="spider2-snow.jsonl",
+                question_id_key="instance_id",
+                question_key="instruction",
+                database_key="db_id",
+                ext_knowledge_key="",
+                gold_sql_path="evaluation_suite/gold/sql",
+                gold_result_path="evaluation_suite/gold/exec_result",
+            ),
+            "bird_dev": BenchmarkConfig(
+                benchmark_path="bird/dev_20240627",
+                question_file="dev.json",
+                question_id_key="question_id",
+                question_key="question",
+                database_key="db_id",
+                ext_knowledge_key="evidence",
+                gold_sql_path="dev.json",
+                gold_sql_key="SQL",
+            ),
+            "semantic_layer": BenchmarkConfig(
+                benchmark_path="semantic_layer",
+                question_file="question",
+                gold_sql_key="gold",
+            ),
+        }
+        for k, v in self._benchmark_config_dict.items():
+            if k in ("spider2", "bird_dev", "semantic_layer"):
+                logger.warning(
+                    f"The benchmark configuration for {k} is built-in and requires no additional setup. "
+                    f"Please place it within the {self.home}/benchmark directory."
+                )
+                continue
+            if not _SAFE_NAME_RE.match(k):
+                raise DatusException(
+                    ErrorCode.COMMON_FIELD_INVALID,
+                    message=f"Invalid benchmark name '{k}'. "
+                    f"Only alphanumeric characters, underscores, and hyphens are allowed.",
+                )
+            if not v.get("benchmark_path"):
+                v["benchmark_path"] = k
+            self.benchmark_configs[k] = BenchmarkConfig.filter_kwargs(BenchmarkConfig, v)
+
+    def override_by_args(self, **kwargs):
+        home_override = kwargs.get("home")
+        if home_override:
+            self.home = home_override
+            self._set_path_manager(self.home)
+            self._init_dirs()
+        # storage_path parameter has been deprecated - data path is now fixed at {home}/data
+        if "storage_path" in kwargs and kwargs["storage_path"] is not None:
+            logger.warning(
+                "The --storage_path parameter is deprecated and will be ignored. "
+                "Data path is now fixed at {agent.home}/data. "
+                "Configure agent.home in agent.yml to change the root directory."
+            )
+
+        if kwargs.get("schema_linking_rate", ""):
+            self.schema_linking_rate = kwargs["schema_linking_rate"]
+        if kwargs.get("kb_search_mode", ""):
+            self.kb_search = KbSearchConfig.from_dict({"mode": kwargs["kb_search_mode"]})
+            self.kb_search_mode = self.kb_search.mode
+        if kwargs.get("plan", ""):
+            self.workflow_plan = kwargs["plan"]
+        if kwargs.get("action", "") not in ["probe-llm", "generate-dataset", "service", "platform-doc"]:
+            db_arg = kwargs.get("datasource", "")
+            if db_arg:
+                self.current_datasource = db_arg
+            elif self.services.default_datasource:
+                self.current_datasource = self.services.default_datasource
+        runtime_db_context = {
+            "datasource": kwargs.get("datasource") or self.current_datasource,
+            "catalog": kwargs.get("catalog") or kwargs.get("catalog_name"),
+            "database": kwargs.get("database") or kwargs.get("database_name"),
+            "schema": kwargs.get("schema") or kwargs.get("db_schema") or kwargs.get("schema_name"),
+        }
+        if any(value for key, value in runtime_db_context.items() if key != "datasource"):
+            self.set_runtime_db_context(runtime_db_context)
+        if kwargs.get("benchmark", ""):
+            benchmark_platform = kwargs["benchmark"]
+            # Validate benchmark is supported (will raise exception if not)
+            self.benchmark_path(benchmark_platform)
+
+            if benchmark_platform == "spider2" and self.db_type != "snowflake":
+                raise DatusException(code=ErrorCode.COMMON_UNSUPPORTED, message="spider2 only support snowflake")
+            if benchmark_platform == "bird_dev" and self.db_type != DBType.SQLITE:
+                raise DatusException(code=ErrorCode.COMMON_UNSUPPORTED, message="bird_dev only support sqlite")
+
+        # output_dir parameter has been deprecated - save path is now fixed at {agent.home}/save
+        if "output_dir" in kwargs and kwargs["output_dir"] is not None:
+            logger.warning(
+                "The --output_dir parameter is deprecated and will be ignored. "
+                "Save path is now fixed at {agent.home}/save. "
+                "Configure agent.home in agent.yml to change the root directory."
+            )
+
+        # trajectory_dir parameter has been deprecated - trajectory path is now fixed at {agent.home}/trajectory
+        if "trajectory_dir" in kwargs and kwargs["trajectory_dir"] is not None:
+            logger.warning(
+                "The --trajectory_dir parameter is deprecated and will be ignored. "
+                "Trajectory path is now fixed at {agent.home}/trajectory. "
+                "Configure agent.home in agent.yml to change the root directory."
+            )
+        if kwargs.get("save_llm_trace", False):
+            # Update all model configs to enable tracing if command line flag is set
+            for model_config in self.models.values():
+                model_config.save_llm_trace = True
+        # --filesystem-strict / --no-filesystem-strict land here as a tri-state:
+        # ``None`` means "CLI didn't say, keep YAML value"; explicit True/False
+        # overrides whatever ``agent.filesystem.strict`` set at construction.
+        if kwargs.get("filesystem_strict") is not None:
+            self.filesystem_strict = kwargs["filesystem_strict"]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    def benchmark_path(self, name: str = "") -> str:
+        if not name:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_REQUIRED,
+                message="Benchmark name is required, please run with --benchmark <benchmark>",
+            )
+
+        # Supported benchmark names
+
+        config = self.benchmark_config(name)
+        # Return fixed path: {agent.home}/benchmark/{name}
+        if os.path.isabs(config.benchmark_path):
+            return config.benchmark_path
+
+        return str(self.path_manager.benchmark_dir / config.benchmark_path)
+
+    def _set_path_manager(self, home: str) -> None:
+        from pico.utils.path_manager import DatusPathManager, set_current_path_manager
+
+        # Like ``prompt_manager``, an instance attribute rather than a dataclass
+        # field, so it stays out of ``dataclasses.asdict()`` / the fingerprint.
+        self.path_manager: "DatusPathManager" = DatusPathManager(
+            home,
+            project_name=self._project_name,
+            project_root=self._project_root,
+        )
+        set_current_path_manager(self.path_manager)
+
+    def _current_db_config(self) -> Dict[str, DbConfig]:
+        """Backward-compat: returns all datasource configs."""
+        if not self._current_datasource and not self.services.datasources:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_REQUIRED,
+                message="Datasource is required, please run with --datasource <datasource>",
+            )
+        return self.services.datasources
+
+    def current_db_name_type(self, db_name: str) -> tuple[str, str]:
+        datasources = self.services.datasources
+        if db_name:
+            if self._current_datasource and self._current_datasource in datasources:
+                return db_name, datasources[self._current_datasource].type
+            if len(datasources) == 1:
+                cfg = list(datasources.values())[0]
+                return db_name, cfg.type
+        if self._current_datasource and self._current_datasource in datasources:
+            return self._current_datasource, datasources[self._current_datasource].type
+        if len(datasources) == 1:
+            cfg = list(datasources.values())[0]
+            return next(iter(datasources)), cfg.type
+        raise DatusException(
+            code=ErrorCode.COMMON_UNSUPPORTED,
+            message=f"Datasource '{db_name}' not found. Available: {list(datasources.keys())}",
+        )
+
+    def get_model_extra(self, model: Optional[str]) -> Dict[str, Any]:
+        """Look up ``model_extras`` for the request's ``model`` string.
+
+        Accepts ``"custom/<name>"``, bare ``"<name>"``, or empty/``None``
+        (which falls back to ``self.target``). Non-custom providers
+        return an empty dict — only ``custom`` models can carry extras.
+        Always returns a dict so callers can ``.get()`` without guarding.
+        """
+        if not self.model_extras:
+            return {}
+
+        name: Optional[str] = None
+        if model:
+            if "/" in model:
+                provider, _, key = model.partition("/")
+                if provider != "custom":
+                    return {}
+                name = key
+            else:
+                name = model
+        if not name:
+            name = self.target or None
+        if not name:
+            return {}
+        extras = self.model_extras.get(name)
+        return dict(extras) if isinstance(extras, dict) else {}
+
+    def active_model(self) -> ModelConfig:
+        """Return the currently active :class:`ModelConfig`.
+
+        Three dispatch paths, tried in order:
+
+        1. **Provider-level** (``self._target_provider`` + ``self._target_model``
+           set via ``./.pico/config.yml``) — synthesize a ``ModelConfig`` by
+           merging provider credentials from ``agent.providers`` with metadata
+           (base_url, type, model_overrides) from ``conf/providers.yml``.
+        2. **Custom / legacy** (``self.target`` points to an entry in
+           ``agent.models``) — return the pre-loaded ``ModelConfig`` verbatim.
+        3. Neither configured → raise :class:`DatusException`.
+
+        Raising instead of returning ``None`` keeps the contract aligned with
+        existing call sites that index the return value directly.
+        """
+        if self._target_provider and self._target_model:
+            return self._apply_reasoning_override(self._synthesize_model(self._target_provider, self._target_model))
+        if self.target and self.target in self.models:
+            return self._apply_reasoning_override(self.models[self.target])
+        raise DatusException(
+            code=ErrorCode.MODEL_NOT_SELECTED,
+            message=(
+                "No active LLM model configured. "
+                "Run the Pico CLI and use the /model command to set up a provider and model:\n"
+                "  1. Start CLI: pico\n"
+                "  2. Use /model to pick a provider and model"
+            ),
+        )
+
+    def model_config(self, name: str = "") -> ModelConfig:
+        if not name:
+            name = self.target
+        if name not in self.models:
+            raise ValueError(f"Model {name} not found")
+        return self.models[name]
+
+    def resolve_model_ref(self, ref: Optional[str] = None) -> ModelConfig:
+        """Resolve a stable model reference without changing the active model.
+
+        ``None``/``default`` follows the active selection, ``custom/<alias>``
+        resolves a legacy ``agent.models`` entry, and ``provider/<model>``
+        synthesizes a model from the provider catalog and configured
+        credentials.  The concrete model portion may itself contain slashes.
+        """
+        normalized = str(ref or "default").strip()
+        if not normalized or normalized == "default":
+            return self.active_model()
+        if normalized.startswith("custom/"):
+            alias = normalized.split("/", 1)[1]
+            if alias not in self.models:
+                raise ValueError(f"Custom model {alias!r} not found")
+            return self.models[alias]
+        if normalized in self.models:
+            return self.models[normalized]
+        if "/" not in normalized:
+            raise ValueError(f"Model reference {normalized!r} is neither an agent.models alias nor provider/model")
+        provider, model_name = normalized.split("/", 1)
+        providers = self.provider_catalog.get("providers", {})
+        if provider not in providers and provider not in self.providers:
+            raise ValueError(f"Unknown model provider {provider!r}")
+        if not model_name:
+            raise ValueError(f"Model reference {normalized!r} is missing the model name")
+        return self._synthesize_model(provider, model_name)
+
+    # ── Provider-level helpers ─────────────────────────────────────────────
+
+    @property
+    def provider_catalog(self) -> Dict[str, Any]:
+        """Lazily load the shipped ``conf/providers.yml`` catalog.
+
+        Uses :func:`resolve_provider_models` from
+        ``pico.cli.provider_model_catalog`` which implements remote→cache→local
+        fallback. Returns an empty mapping on any failure so callers can treat
+        ``self.provider_catalog.get(name)`` uniformly regardless of network.
+        """
+        if self._provider_catalog is None:
+            self._provider_catalog = _load_provider_catalog()
+        return self._provider_catalog
+
+    def set_provider_catalog(self, catalog: Dict[str, Any]) -> None:
+        """Inject a catalog (used by tests / MCP / custom entry points)."""
+        self._provider_catalog = catalog
+
+    def _synthesize_model(self, provider: str, model_name: str) -> ModelConfig:
+        """Build a :class:`ModelConfig` from provider overrides + catalog defaults.
+
+        Resolution order for each field (first non-empty wins):
+          - ``api_key``: ``agent.providers[provider].api_key`` (with ``${ENV}``
+            interpolation) → ``os.getenv(providers.yml[provider].api_key_env)``.
+          - ``base_url``: ``agent.providers[provider].base_url`` →
+            ``providers.yml[provider].base_url``.
+          - ``type``, ``auth_type``: ``providers.yml`` is authoritative; the
+            user override cannot change them (would require different SDK).
+          - ``temperature`` / ``top_p`` / etc.: read from
+            ``providers.yml.model_overrides[model_name]`` (e.g. ``kimi-k2.6``
+            forces temperature=1).
+        """
+        catalog = self.provider_catalog
+        providers_meta = catalog.get("providers", {}) if isinstance(catalog, dict) else {}
+        provider_meta = providers_meta.get(provider, {}) if isinstance(providers_meta, dict) else {}
+        overrides_catalog = catalog.get("model_overrides", {}) if isinstance(catalog, dict) else {}
+
+        user_cfg = self.providers.get(provider, ProviderConfig())
+        api_key = resolve_env(user_cfg.api_key or "") if user_cfg.api_key else ""
+        if api_key.startswith("<MISSING:"):
+            api_key = ""
+        if not api_key:
+            env_name = provider_meta.get("api_key_env") if isinstance(provider_meta, dict) else None
+            if env_name:
+                api_key = os.getenv(str(env_name), "") or ""
+        base_url_raw = user_cfg.base_url or (provider_meta.get("base_url") if isinstance(provider_meta, dict) else None)
+        base_url = resolve_env(str(base_url_raw)) if base_url_raw else None
+        if isinstance(base_url, str) and base_url.startswith("<MISSING:"):
+            base_url = None
+        model_type = (provider_meta.get("type") if isinstance(provider_meta, dict) else None) or provider
+        auth_type = user_cfg.auth_type
+        catalog_auth = provider_meta.get("auth_type") if isinstance(provider_meta, dict) else None
+        if catalog_auth:
+            auth_type = str(catalog_auth)
+
+        model_kwargs: Dict[str, Any] = {}
+        overrides = overrides_catalog.get(model_name, {}) if isinstance(overrides_catalog, dict) else {}
+        if isinstance(overrides, dict):
+            for key in ("temperature", "top_p", "enable_thinking", "reasoning_effort"):
+                if key in overrides:
+                    model_kwargs[key] = overrides[key]
+
+        return ModelConfig(
+            type=str(model_type),
+            api_key=api_key,
+            model=model_name,
+            base_url=str(base_url) if base_url else None,
+            auth_type=auth_type,
+            **model_kwargs,
+        )
+
+    def _apply_reasoning_override(self, config: ModelConfig) -> ModelConfig:
+        """Project-level ``reasoning_effort`` wins over catalog/agent.yml values.
+
+        Returns the same ``ModelConfig`` with ``reasoning_effort`` replaced by
+        :attr:`_target_reasoning_effort` when it is set. When the override is
+        ``"off"``, ``enable_thinking`` is also cleared so the legacy bool does
+        not reawaken reasoning via the adapter's fallback. Mutating the object
+        in place keeps the cached ``agent.models[name]`` entry coherent with
+        the active target, which matches how ``/model`` already reuses that
+        same instance across calls.
+        """
+        override = self._target_reasoning_effort
+        if override is None:
+            return config
+        config.reasoning_effort = override
+        if override == "off":
+            config.enable_thinking = False
+        return config
+
+    def set_active_reasoning_effort(self, effort: Optional[str], persist: bool = True) -> None:
+        """Switch the runtime reasoning effort level.
+
+        ``effort`` is one of ``off|minimal|low|medium|high``; ``None`` clears
+        the project override so the active model falls back to catalog
+        defaults or ``enable_thinking`` in ``agent.yml``. When ``persist`` is
+        ``True`` (default), writes the change to ``./.pico/config.yml`` so
+        the choice survives process restarts.
+        """
+        if effort is not None:
+            effort = effort.strip().lower()
+            from pico.configuration.project_config import REASONING_EFFORT_CHOICES
+
+            if effort not in REASONING_EFFORT_CHOICES:
+                raise DatusException(
+                    code=ErrorCode.COMMON_FIELD_INVALID,
+                    message=(
+                        f"Invalid reasoning_effort '{effort}'. Expected one of {sorted(REASONING_EFFORT_CHOICES)}."
+                    ),
+                )
+        self._target_reasoning_effort = effort
+        if not persist:
+            return
+        from pico.configuration.project_config import (
+            ProjectOverride,
+            load_project_override,
+            save_project_override,
+        )
+
+        current = load_project_override(cwd=str(self._project_root)) or ProjectOverride()
+        current.reasoning_effort = effort
+        save_project_override(current, cwd=str(self._project_root))
+
+    def set_active_provider_model(self, provider: str, model: str, persist: bool = True) -> None:
+        """Switch the active LLM to ``<provider>/<model>`` at runtime.
+
+        Refreshes internal target state so any subsequent ``active_model()``
+        call resolves via the provider-synthesis path. When ``persist`` is
+        ``True`` (default), writes the selection to ``./.pico/config.yml``
+        so the choice survives process restarts.
+        """
+        if not provider or not model:
+            raise DatusException(
+                code=ErrorCode.COMMON_FIELD_REQUIRED,
+                message="set_active_provider_model requires both provider and model",
+            )
+        self._target_provider = provider
+        self._target_model = model
+        if persist:
+            from pico.configuration.project_config import (
+                ProjectOverride,
+                ProjectTarget,
+                load_project_override,
+                save_project_override,
+            )
+
+            current = load_project_override(cwd=str(self._project_root)) or ProjectOverride()
+            current.target = ProjectTarget(provider=provider, model=model)
+            save_project_override(current, cwd=str(self._project_root))
+
+    def set_active_custom(self, name: str, persist: bool = True) -> None:
+        """Switch the active LLM to a legacy ``agent.models[name]`` entry.
+
+        Mirrors :meth:`set_active_provider_model` but drops into the
+        legacy custom-model dispatch path. Persists as
+        ``target: {custom: name}`` so the intent is explicit on reload.
+
+        Raises ``MODEL_NOT_CONFIGURED`` rather than a generic validation
+        error: remote front-ends pass a user-picked model into
+        ``stream_chat``, and that selection can name a connection the
+        project no longer has. They need a stable ``error_type`` to
+        recognise "your model is gone, refresh and pick another" instead of
+        matching on the message text.
+        """
+        if not name or name not in self.models:
+            raise DatusException(
+                code=ErrorCode.MODEL_NOT_CONFIGURED,
+                message_args={"model_name": name, "available_models": sorted(self.models.keys())},
+            )
+        self._target_provider = None
+        self._target_model = None
+        self.target = name
+        if persist:
+            from pico.configuration.project_config import (
+                ProjectOverride,
+                ProjectTarget,
+                load_project_override,
+                save_project_override,
+            )
+
+            current = load_project_override(cwd=str(self._project_root)) or ProjectOverride()
+            current.target = ProjectTarget(custom=name)
+            save_project_override(current, cwd=str(self._project_root))
+
+    def set_provider_config(
+        self,
+        provider: str,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        auth_type: str = "api_key",
+        persist: bool = True,
+    ) -> None:
+        """Record provider-level credentials in memory and (optionally) on disk.
+
+        The disk write targets the global ``~/.pico/conf/agent.yml`` under
+        ``agent.providers.<provider>`` so all projects share the credential.
+        The in-memory ``self.providers`` map is updated unconditionally so
+        the current session can use the new value without reloading.
+        """
+        entry = self.providers.get(provider, ProviderConfig())
+        if api_key is not None:
+            entry.api_key = api_key or None
+        if base_url is not None:
+            entry.base_url = base_url or None
+        if auth_type:
+            entry.auth_type = auth_type
+        self.providers[provider] = entry
+        if persist:
+            _persist_provider_section(provider, entry)
+
+    def set_agentic_node_override(
+        self,
+        name: str,
+        *,
+        model: Optional[str] = None,
+        max_turns: Optional[int] = None,
+        persist: bool = True,
+    ) -> None:
+        """Write ``agent.agentic_nodes.<name>.{model,max_turns}`` overrides.
+
+        The in-memory ``self.agentic_nodes[name]`` entry is patched with
+        exactly the two fields exposed by the unified agent TUI. Passing
+        ``None`` for a field *clears* that specific key (the node falls
+        back to the global default); passing a value sets it. All other
+        keys under ``agentic_nodes.<name>`` (``tools``, ``rules``,
+        ``scoped_context``, ``system_prompt``, ...) are preserved.
+
+        The on-disk write targets the loaded ``agent.yml`` via
+        :class:`ConfigurationManager`, matching the ergonomics of
+        :meth:`set_provider_config`.
+        """
+        entry = dict(self.agentic_nodes.get(name) or {})
+        if not entry.get("system_prompt"):
+            entry["system_prompt"] = name
+        if model is None:
+            entry.pop("model", None)
+        else:
+            entry["model"] = model
+        if max_turns is None:
+            entry.pop("max_turns", None)
+        else:
+            entry["max_turns"] = int(max_turns)
+        self.agentic_nodes[name] = entry
+        if persist:
+            _persist_agentic_node_override(name, entry)
+
+    def provider_available(self, provider: str) -> bool:
+        """Return True when the provider has usable credentials available.
+
+        ``api_key`` providers: either the user set an explicit key in
+        ``agent.providers`` *or* the shipped env var fallback resolves to a
+        non-empty value. ``subscription`` / ``oauth`` providers defer to
+        ``pico.auth`` helpers that inspect on-disk tokens.
+        """
+        catalog = self.provider_catalog
+        providers_meta = catalog.get("providers", {}) if isinstance(catalog, dict) else {}
+        meta = providers_meta.get(provider, {}) if isinstance(providers_meta, dict) else {}
+        auth_type = (meta.get("auth_type") if isinstance(meta, dict) else None) or self.providers.get(
+            provider, ProviderConfig()
+        ).auth_type
+
+        if auth_type == "subscription":
+            try:
+                from pico.auth.claude_credential import get_claude_subscription_token
+
+                user_cfg = self.providers.get(provider, ProviderConfig())
+                token, _ = get_claude_subscription_token(api_key_from_config=user_cfg.api_key or "")
+                return bool(token)
+            except Exception:
+                return False
+        if auth_type == "oauth":
+            try:
+                from pico.auth.oauth_manager import OAuthManager
+
+                return OAuthManager().is_authenticated()
+            except Exception:
+                return False
+
+        user_cfg = self.providers.get(provider, ProviderConfig())
+        if user_cfg.api_key:
+            resolved_api_key = resolve_env(user_cfg.api_key).strip()
+            if resolved_api_key and not resolved_api_key.startswith("<MISSING:"):
+                return True
+        env_name = meta.get("api_key_env") if isinstance(meta, dict) else None
+        if env_name and os.getenv(str(env_name), "").strip():
+            return True
+        return False
+
+    def rag_storage_path(self) -> str:
+        # rag_base_path is already sharded by project_name (``{home}/data/{project_name}``),
+        # so all isolation modes converge on the same ``datus_db`` subdirectory.
+        return os.path.join(self.rag_base_path, "datus_db")
+
+    def document_storage_path(self, platform: str) -> str:
+        """Per-platform document storage path (datasource-independent).
+
+        Returns: {home}/data/document/{platform}/
+        """
+        return os.path.join(self.rag_base_path, "document", platform)
+
+    def document_storage_base_path(self) -> str:
+        """Base document storage directory: {home}/data/document/"""
+        return os.path.join(self.rag_base_path, "document")
+
+    def _is_file_based_vector_backend(self) -> bool:
+        """Return True if the vector backend stores data in local files (e.g. LanceDB).
+
+        The ``datus_db.cfg`` embedding-config check is only meaningful for
+        file-based backends where changing the embedding model without
+        rebuilding the data would cause dimension mismatches.
+        """
+        if self._skip_init_dirs:
+            return False  # SaaS mode: backends not initialized here
+        if not hasattr(self, "_backend_config"):
+            return True  # default is lance (file-based)
+        return self._backend_config.vector.type == "lance"
+
+    def check_init_storage_config(self, storage_type: str, save_config: bool = True):
+        if not self._is_file_based_vector_backend():
+            return
+        check_storage_config(
+            storage_type,
+            None if storage_type not in self.storage_configs else self.storage_configs[storage_type].to_dict(),
+            self.rag_storage_path(),
+            save_config,
+        )
+
+    def save_storage_config(self, storage_type: str):
+        if not self._is_file_based_vector_backend():
+            return
+        save_storage_config(
+            storage_type,
+            self.rag_storage_path(),
+            config=None if storage_type not in self.storage_configs else self.storage_configs[storage_type],
+        )
+
+    def sub_agent_config(self, sub_agent_name: str) -> Dict[str, Any]:
+        from pico.configuration.scoped_context_overrides import get_override
+
+        base = self.agentic_nodes.get(sub_agent_name, {}) or {}
+        override = get_override(sub_agent_name)
+        if override is None:
+            return base
+        # Layer override on top of YAML so non-SubAgentConfig keys
+        # (model, max_turns, permissions, hooks, ...) survive.
+        base_dict = dict(base) if isinstance(base, dict) else (base.model_dump() if hasattr(base, "model_dump") else {})
+        return {**base_dict, **override.model_dump(exclude_unset=True)}
+
+    def benchmark_config(self, benchmark_platform) -> BenchmarkConfig:
+        if benchmark_platform not in self.benchmark_configs:
+            raise DatusException(
+                code=ErrorCode.COMMON_UNSUPPORTED,
+                message_args={"field_name": "benchmark", "your_value": benchmark_platform},
+            )
+        benchmark_config = self.benchmark_configs[benchmark_platform]
+        benchmark_config.validate()
+
+        return benchmark_config
+
+    def init_dashboard(self, param: Dict[str, Any]):
+        if not isinstance(param, dict):
+            return
+        self.dashboard_config = {}
+        for service_name, auth_params in param.items():
+            if not isinstance(auth_params, dict):
+                continue
+            platform = str(service_name)
+            # ``type`` is the adapter kind (``superset`` / ``grafana`` / ...).
+            # When omitted, default to the key — preserves the single-instance
+            # convention ``services.bi_platforms.superset: { api_base_url: ... }``.
+            # When provided and different from the key, the user is opting
+            # into a multi-instance deployment (alias ``superset_prod`` or
+            # similar); we keep both fields on ``DashboardConfig`` so the
+            # BIFuncTool / probe path looks up the right adapter while the
+            # CLI / dashboard_config still key by the user-chosen alias.
+            declared_type = auth_params.get("type")
+            adapter_type = str(declared_type).strip() if declared_type else platform
+            api_base_url_raw = auth_params.get("api_base_url", "")
+            username_raw = auth_params.get("username", "")
+            password_raw = auth_params.get("password", "")
+            api_key_raw = auth_params.get("api_key", "")
+            api_base_url = resolve_env(str(api_base_url_raw)) if api_base_url_raw else ""
+            username = resolve_env(str(username_raw)) if username_raw else ""
+            password = resolve_env(str(password_raw)) if password_raw else ""
+            api_key = resolve_env(str(api_key_raw)) if api_key_raw else ""
+            dataset_db_raw = _resolve_nested_value(auth_params.get("dataset_db"))
+            dataset_db: Optional[DatasetDbConfig] = None
+            if dataset_db_raw is not None:
+                if not isinstance(dataset_db_raw, dict):
+                    raise DatusException(
+                        ErrorCode.COMMON_FIELD_INVALID,
+                        message=(
+                            f"services.bi_platforms.{platform}.dataset_db must be a mapping; "
+                            f"got {type(dataset_db_raw).__name__}."
+                        ),
+                    )
+                dataset_db = DatasetDbConfig.from_dict(dataset_db_raw)
+                if dataset_db.datasource_ref not in self.services.datasources:
+                    raise DatusException(
+                        ErrorCode.COMMON_FIELD_INVALID,
+                        message=(
+                            f"services.bi_platforms.{platform}.dataset_db.datasource_ref="
+                            f"'{dataset_db.datasource_ref}' does not match any entry under "
+                            f"services.datasources. Configured datasources: "
+                            f"{sorted(self.services.datasources.keys())}."
+                        ),
+                    )
+            self.dashboard_config[platform] = DashboardConfig(
+                platform=platform,
+                api_base_url=api_base_url,
+                username=username,
+                password=password,
+                api_key=api_key,
+                extra=_resolve_nested_value(auth_params.get("extra", {})),
+                dataset_db=dataset_db,
+                adapter_type=adapter_type,
+                default=bool(auth_params.get("default", False)),
+            )
+
+    def init_scheduler_services(self, param: Dict[str, Any]):
+        if not isinstance(param, dict):
+            return
+
+        self.scheduler_services = {}
+        for service_name, raw_config in param.items():
+            if not isinstance(raw_config, dict):
+                continue
+            resolved = _resolve_nested_value(raw_config)
+            resolved.setdefault("name", service_name)
+            scheduler_type = str(resolved.get("type") or "").lower().strip()
+            if not scheduler_type:
+                raise DatusException(
+                    ErrorCode.COMMON_CONFIG_ERROR,
+                    message=(
+                        f"Scheduler service `{service_name}` must declare a scheduler `type` in "
+                        f"`agent.services.schedulers.{service_name}`."
+                    ),
+                )
+            resolved["type"] = scheduler_type
+            self.scheduler_services[service_name] = resolved
+
+        default_service = self.default_scheduler_service()
+        self.scheduler_config = self.scheduler_services.get(default_service, {}) if default_service else {}
+
+    def init_plugin_services(self, param: Dict[str, Any]):
+        """Parse ``agent.plugins`` into ``self.plugin_services``.
+
+        Shape: ``plugins.<plugin_name>.<profile_name>`` → a config dict. Each
+        profile is ``${VAR}``-expanded up front (mirroring how semantic
+        services are resolved) so a plugin receives fully-resolved
+        values. Malformed entries (non-mapping plugin or profile) are skipped
+        rather than raising — a plugin needs no config at all, and pico must
+        stay startable even when a plugin section is half-written.
+
+        When ``plugins_enabled`` is ``False`` the section is ignored entirely,
+        leaving ``plugin_services`` empty.
+        """
+        self.plugin_services = {}
+        if not self.plugins_enabled or not isinstance(param, dict):
+            return
+        for plugin_name, profiles in param.items():
+            if not isinstance(profiles, dict):
+                continue
+            resolved_profiles: Dict[str, Dict[str, Any]] = {}
+            for profile_name, raw_config in profiles.items():
+                if not isinstance(raw_config, dict):
+                    continue
+                resolved = _resolve_nested_value(raw_config)
+                resolved.setdefault("name", profile_name)
+                resolved_profiles[profile_name] = resolved
+            self.plugin_services[plugin_name] = resolved_profiles
+
+    def init_semantic_layer(self, param: Dict[str, Any]):
+        if not isinstance(param, dict):
+            raise DatusException(
+                ErrorCode.COMMON_CONFIG_ERROR,
+                message=(
+                    "`agent.services.semantic_layer` must be a mapping such as "
+                    "`semantic_layer: {dosi: {}}` or `semantic_layer: {metricflow: {}}`; "
+                    "scalar values like `semantic_layer: osi` are not supported."
+                ),
+            )
+
+        self.semantic_layer_configs = {}
+        for service_name, raw_config in param.items():
+            if not isinstance(raw_config, dict):
+                continue
+            normalized_name = str(service_name).lower().strip()
+            resolved = _resolve_nested_value(raw_config)
+            declared_type = str(resolved.get("type") or normalized_name).lower().strip()
+            if declared_type != normalized_name:
+                raise DatusException(
+                    ErrorCode.COMMON_CONFIG_ERROR,
+                    message=(
+                        f"Semantic layer `{service_name}` must use the adapter type as the key in "
+                        f"`agent.services.semantic_layer`. Got key `{service_name}` with type `{declared_type}`."
+                    ),
+                )
+            resolved["type"] = normalized_name
+            self.semantic_layer_configs[normalized_name] = resolved
+
+
+def resolve_env(value: str) -> str:
+    if not value or not isinstance(value, str):
+        return value
+
+    import re
+
+    pattern = r"\${([^}]+)}"
+
+    def replace_env(match):
+        expr = match.group(1)
+        env_var, separator, default = expr.partition(":-")
+        if separator:
+            return os.getenv(env_var, default)
+        return os.getenv(env_var, f"<MISSING:{env_var}>")
+
+    return re.sub(pattern, replace_env, value)
+
+
+def _db_config_to_semantic_adapter_config(db_config: Optional[DbConfig]) -> Optional[Dict[str, str]]:
+    if not db_config:
+        return None
+
+    raw = db_config.to_dict()
+    extra = raw.get("extra")
+    semantic_db_config = {
+        key: str(value)
+        for key, value in raw.items()
+        if value is not None and value != "" and key not in ("extra", "path_pattern", "default")
+    }
+    # Merge connector-specific `extra` fields without overwriting explicit top-level keys
+    if isinstance(extra, dict):
+        for key, value in extra.items():
+            if value is None or value == "":
+                continue
+            semantic_db_config.setdefault(key, str(value))
+    return semantic_db_config
+
+
+def _merge_semantic_adapter_db_config(
+    base_config: Optional[Dict[str, str]],
+    override_config: Any,
+) -> Optional[Dict[str, str]]:
+    if not isinstance(override_config, dict):
+        return base_config
+
+    merged = dict(base_config or {})
+    for key, value in override_config.items():
+        if value is None or value == "":
+            continue
+        merged[str(key)] = str(value)
+    return merged
+
+
+def _runtime_context_value(runtime_db_context: Optional[Mapping[str, Any]], *keys: str) -> str:
+    if not runtime_db_context:
+        return ""
+    for key in keys:
+        value = runtime_db_context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+_RUNTIME_DB_CONTEXT_ALIASES = {
+    "catalog": ("catalog", "catalog_name"),
+    "database": ("database", "database_name"),
+    "schema": ("schema", "db_schema", "schema_name"),
+}
+
+
+def _apply_runtime_db_context_to_semantic_adapter_config(
+    db_config: Optional[Dict[str, str]],
+    runtime_db_context: Optional[Mapping[str, Any]],
+) -> Optional[Dict[str, str]]:
+    result = dict(db_config or {})
+
+    for canonical_key, aliases in _RUNTIME_DB_CONTEXT_ALIASES.items():
+        value = _runtime_context_value(runtime_db_context, *aliases)
+        if value:
+            result[canonical_key] = value
+
+    return result or db_config
+
+
+def _resolve_nested_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return resolve_env(value)
+    if isinstance(value, dict):
+        return {k: _resolve_nested_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_resolve_nested_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_resolve_nested_value(item) for item in value)
+    return value
+
+
+def _load_provider_configs(raw: Dict[str, Any]) -> Dict[str, ProviderConfig]:
+    """Parse ``agent.providers`` YAML section into :class:`ProviderConfig` map."""
+    out: Dict[str, ProviderConfig] = {}
+    if not isinstance(raw, dict):
+        return out
+    for name, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            continue
+        if not _SAFE_NAME_RE.match(str(name)):
+            raise DatusException(
+                ErrorCode.COMMON_FIELD_INVALID,
+                message=f"Invalid provider name '{name}'. Only alphanumeric, underscore, hyphen allowed.",
+            )
+        api_key_raw = cfg.get("api_key")
+        base_url_raw = cfg.get("base_url")
+        out[name] = ProviderConfig(
+            api_key=str(api_key_raw) if api_key_raw is not None else None,
+            base_url=str(base_url_raw) if base_url_raw is not None else None,
+            auth_type=str(cfg.get("auth_type", "api_key")),
+        )
+    return out
+
+
+def _load_provider_catalog() -> Dict[str, Any]:
+    """Load ``conf/providers.yml`` with three-tier fallback.
+
+    Returns an empty dict on any failure. Keeping this helper module-local
+    avoids a circular import between ``agent_config`` and the CLI layer.
+    """
+    try:
+        import yaml
+
+        from pico.cli.provider_model_catalog import resolve_provider_models
+        from pico.utils.resource_utils import read_data_file_text
+
+        raw = yaml.safe_load(read_data_file_text(resource_path="conf/providers.yml", encoding="utf-8")) or {}
+        return resolve_provider_models(raw)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Failed to load conf/providers.yml: {e}")
+        return {}
+
+
+def _persist_provider_section(provider: str, entry: "ProviderConfig") -> None:
+    """Write ``agent.providers.<provider>`` back into the loaded agent.yml.
+
+    Routes through :class:`ConfigurationManager` so the existing
+    save path (atomic YAML dump, preserves other keys) is reused. The
+    entry is persisted with only the fields the user actually set,
+    matching ``save_project_override`` ergonomics.
+    """
+    try:
+        from pico.configuration.agent_config_loader import configuration_manager
+
+        cfg_mgr = configuration_manager()
+        current = cfg_mgr.get("providers", {}) or {}
+        if not isinstance(current, dict):
+            current = {}
+        payload = {}
+        if entry.api_key is not None:
+            payload["api_key"] = entry.api_key
+        if entry.base_url is not None:
+            payload["base_url"] = entry.base_url
+        if entry.auth_type and entry.auth_type != "api_key":
+            payload["auth_type"] = entry.auth_type
+        current[provider] = payload
+        cfg_mgr.update_item("providers", current, delete_old_key=False, save=True)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Failed to persist provider config `{provider}`: {e}")
+
+
+def _persist_agentic_node_override(name: str, entry: Dict[str, Any]) -> None:
+    """Write a single ``agent.agentic_nodes.<name>`` entry back into agent.yml.
+
+    The merge strategy mirrors :func:`_persist_provider_section`: read the
+    current ``agentic_nodes`` map, splice in the fresh entry (preserving
+    sibling agents), and hand the whole map back to
+    :class:`ConfigurationManager`. When ``entry`` collapses to just the
+    auto-filled ``system_prompt`` (i.e. both overrides were cleared and no
+    other keys existed), the node row is dropped entirely so the YAML
+    stays uncluttered.
+    """
+    try:
+        from pico.configuration.agent_config_loader import configuration_manager
+
+        cfg_mgr = configuration_manager()
+        current = cfg_mgr.get("agentic_nodes", {}) or {}
+        if not isinstance(current, dict):
+            current = {}
+        sanitized = {k: v for k, v in entry.items() if v is not None}
+        # If only ``system_prompt`` is left (no actual overrides / user fields),
+        # treat as "no override" and remove the entry entirely.
+        meaningful = {k: v for k, v in sanitized.items() if k != "system_prompt"}
+        if not meaningful:
+            current.pop(name, None)
+        else:
+            current[name] = sanitized
+        cfg_mgr.update_item("agentic_nodes", current, delete_old_key=True, save=True)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Failed to persist agentic_node override `{name}`: {e}")
+
+
+def load_model_config(data: dict) -> ModelConfig:
+    max_retry = data.get("max_retry")
+    retry_interval = data.get("retry_interval")
+    temperature = data.get("temperature")
+    top_p = data.get("top_p")
+
+    return ModelConfig(
+        type=data["type"],
+        base_url=resolve_env(data["base_url"]) if "base_url" in data else None,
+        api_key=resolve_env(data.get("api_key", "")),
+        model=resolve_env(data["model"]),
+        save_llm_trace=data.get("save_llm_trace", False),
+        enable_thinking=data.get("enable_thinking", False),
+        strict_json_schema=data.get("strict_json_schema", True),
+        default_headers=data.get("default_headers"),
+        max_retry=int(max_retry) if max_retry is not None else 3,
+        retry_interval=float(retry_interval) if retry_interval is not None else 2.0,
+        temperature=float(temperature) if temperature is not None else None,
+        top_p=float(top_p) if top_p is not None else None,
+        auth_type=data.get("auth_type", "api_key"),
+        use_native_api=data.get("use_native_api", False),
+        ssl_verify=_load_ssl_verify(data),
+    )
+
+
+def _load_ssl_verify(data: dict) -> Optional[Union[bool, str]]:
+    """Resolve and type-check the optional ``ssl_verify`` model field.
+
+    Fails fast on invalid types (anything other than bool / str) rather than
+    silently dropping the value, so a misconfigured endpoint surfaces at load
+    time instead of as a confusing TLS error later.
+    """
+    if "ssl_verify" not in data:
+        return None
+    value = resolve_env(data["ssl_verify"])
+    if value is None or isinstance(value, (bool, str)):
+        return value
+    raise DatusException(
+        ErrorCode.COMMON_FIELD_INVALID,
+        message_args={
+            "field_name": "ssl_verify",
+            "except_values": "bool or str (true/false or a CA bundle path)",
+            "your_value": type(value).__name__,
+        },
+    )
+
+
+def file_stem_from_uri(uri: str) -> str:
+    """
+    Extract the stem of the file name (remove extension) from the URI of DuckDB/SQLite or the normal path.
+    e.g. duckdb:///path/to/demo.duckdb -> demo
+         sqlite:////tmp/foo.db -> foo
+         /abs/path/bar.duckdb -> bar
+         foo.db -> foo
+    """
+    if not uri:
+        return ""
+    try:
+        path = uri.split(":///")[-1] if ":///" in uri else uri
+        base = os.path.basename(path)
+        stem, _ = os.path.splitext(base)
+        return stem
+    except Exception:
+        # reveal all the details
+        return uri.split("/")[-1].split(".")[0]

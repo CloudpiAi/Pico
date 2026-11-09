@@ -1,0 +1,508 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Default SQLite implementation of the three-level RDB abstraction."""
+
+import dataclasses
+import os
+import re
+import sqlite3
+import threading
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Type
+
+from datus_storage_base.rdb.base import (
+    BaseRdbBackend,
+    ColumnDef,
+    IntegrityError,
+    RdbDatabase,
+    RdbTable,
+    T,
+    TableDefinition,
+    UniqueViolationError,
+    WhereClause,
+    WhereOp,
+    _normalize_where,
+)
+
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+
+
+def _nocase_folded(name: str) -> str:
+    """Fold an identifier the way SQLite resolves one.
+
+    SQLite matches identifiers case-insensitively for ASCII but reports them back —
+    through ``PRAGMA table_info`` and ``sqlite_master.name`` — exactly as they were
+    declared. Comparing a definition's spelling against the catalog's would call a
+    column that is already there missing, and re-adding it fails outright with
+    "duplicate column name".
+
+    A-Z only, because that is the whole of SQLite's ``NOCASE``. ``str.lower()`` folds
+    wider: it maps U+212A KELVIN SIGN to ASCII ``k`` (U+006B). A legacy column named
+    U+212A would therefore answer for a definition's ASCII ``K``, the ``ALTER TABLE``
+    would be skipped, and the required column would never exist — while SQLite, which
+    folds neither, keeps the two as separate columns. The two spell identically on
+    screen, so this is stated in codepoints rather than shown.
+
+    Catalog names arrive from the live database through ``PRAGMA table_info`` and
+    ``sqlite_master`` and never pass ``_IDENTIFIER_RE``, so they cannot be assumed
+    ASCII at all.
+    """
+    return name.translate(_ASCII_FOLD)
+
+
+def _live_column_names(conn, safe_table: str) -> List[str]:
+    """Column names as the live table declares them.
+
+    ``PRAGMA table_info`` reports the declared spelling, not a folded one — callers
+    that compare must fold (``_nocase_folded``), callers that emit SQL must not.
+    """
+    return [row[1] for row in conn.execute(f"PRAGMA table_info({safe_table})").fetchall()]
+
+
+def _safe_ident(name: str) -> str:
+    """Validate and quote a SQL identifier to prevent injection."""
+    if not _IDENTIFIER_RE.fullmatch(name):
+        raise DatusException(
+            ErrorCode.STORAGE_TABLE_OPERATION_FAILED,
+            message=f"Invalid SQL identifier: {name}",
+        )
+    return name
+
+
+def _safe_path_segment(value: str, field_name: str) -> str:
+    """Validate a filesystem path segment to prevent directory traversal."""
+    if not _SEGMENT_RE.fullmatch(value):
+        raise DatusException(
+            ErrorCode.STORAGE_FAILED,
+            message=f"Invalid {field_name}: {value!r}. Only alphanumeric, underscore, dot, and hyphen are allowed.",
+        )
+    return value
+
+
+_SQLITE_TYPE_MAP: Dict[str, str] = {
+    "INTEGER": "INTEGER",
+    "TEXT": "TEXT",
+    "TIMESTAMP": "TEXT",
+    "BOOLEAN": "INTEGER",
+    "REAL": "REAL",
+    "BLOB": "BLOB",
+}
+
+
+def _sqlite_map_type(col_type: str) -> str:
+    """Map a generic column type to a SQLite-specific type."""
+    return _SQLITE_TYPE_MAP.get(col_type.upper(), col_type)
+
+
+def _sqlite_col_ddl(col: ColumnDef) -> str:
+    """Generate DDL fragment for a single column (SQLite dialect)."""
+    parts: List[str] = [col.name]
+
+    if col.primary_key and col.autoincrement:
+        parts.append("INTEGER PRIMARY KEY AUTOINCREMENT")
+    else:
+        parts.append(_sqlite_map_type(col.col_type))
+        if col.primary_key:
+            parts.append("PRIMARY KEY")
+        if col.unique:
+            parts.append("UNIQUE")
+        if not col.nullable:
+            parts.append("NOT NULL")
+        if col.default is not None:
+            if isinstance(col.default, str):
+                parts.append(f"DEFAULT '{col.default}'")
+            else:
+                parts.append(f"DEFAULT {col.default}")
+
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Level 3: Table
+# ---------------------------------------------------------------------------
+
+
+class SqliteRdbTable(RdbTable):
+    """SQLite implementation of table-level CRUD."""
+
+    def __init__(self, database: "SqliteRdbDatabase", table_name: str) -> None:
+        self._database = database
+        self._table_name = table_name
+
+    @property
+    def table_name(self) -> str:
+        return self._table_name
+
+    def insert(self, record: Any) -> int:
+        return self._database._insert(self._table_name, record)
+
+    def query(
+        self,
+        model: Type[T],
+        where: Optional[WhereClause] = None,
+        columns: Optional[List[str]] = None,
+        order_by: Optional[List[str]] = None,
+    ) -> List[T]:
+        return self._database._query(self._table_name, model, where=where, columns=columns, order_by=order_by)
+
+    def update(self, data: Dict[str, Any], where: Optional[WhereClause] = None) -> int:
+        return self._database._update(self._table_name, data, where=where)
+
+    def delete(self, where: Optional[WhereClause] = None) -> int:
+        return self._database._delete(self._table_name, where=where)
+
+    def upsert(self, record: Any, conflict_columns: List[str]) -> None:
+        return self._database._upsert(self._table_name, record, conflict_columns=conflict_columns)
+
+
+# ---------------------------------------------------------------------------
+# Level 2: Database
+# ---------------------------------------------------------------------------
+
+
+class SqliteRdbDatabase(RdbDatabase):
+    """SQLite implementation of database-level handle.
+
+    SQLite only supports PHYSICAL project isolation (per-project ``.db``
+    file under ``{data_dir}/{project}/datus_db/``).
+    """
+
+    def __init__(self, db_file: str) -> None:
+        self._db_file = db_file
+        self._local = threading.local()
+        os.makedirs(os.path.dirname(self._db_file) or ".", exist_ok=True)
+
+    # ========== Internal helpers ==========
+
+    @contextmanager
+    def _auto_conn(self) -> Iterator[sqlite3.Connection]:
+        """Yield a connection: reuse transaction conn or open a fresh auto-commit one."""
+        txn_conn = getattr(self._local, "txn_conn", None)
+        if txn_conn is not None:
+            yield txn_conn
+        else:
+            conn = self._open_connection()
+            try:
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """Open a new SQLite connection with row_factory set."""
+        try:
+            conn = sqlite3.connect(self._db_file)
+            conn.row_factory = sqlite3.Row
+            return conn
+        except sqlite3.Error as e:
+            raise DatusException(ErrorCode.STORAGE_FAILED, message=f"Database connection error: {str(e)}") from e
+
+    def _build_where(self, where: Optional[WhereClause]) -> tuple:
+        """Build WHERE clause SQL and params from WhereClause."""
+        conditions = _normalize_where(where)
+        if not conditions:
+            return "", []
+
+        parts = []
+        params = []
+        for col, op, val in conditions:
+            safe_col = _safe_ident(col)
+            if op in (WhereOp.IS_NULL, WhereOp.IS_NOT_NULL):
+                parts.append(f"{safe_col} {op.value}")
+            else:
+                parts.append(f"{safe_col} {op.value} ?")
+                params.append(val)
+
+        return " WHERE " + " AND ".join(parts), params
+
+    def _build_order_by(self, order_by: Optional[List[str]]) -> str:
+        """Build ORDER BY clause. '-col' means DESC."""
+        if not order_by:
+            return ""
+        parts = []
+        for item in order_by:
+            if item.startswith("-"):
+                parts.append(f"{_safe_ident(item[1:])} DESC")
+            else:
+                parts.append(f"{_safe_ident(item)} ASC")
+        return " ORDER BY " + ", ".join(parts)
+
+    def _generate_ddl(self, table_def: TableDefinition) -> List[str]:
+        """Generate CREATE TABLE and CREATE INDEX DDL statements for SQLite."""
+        statements: List[str] = []
+
+        col_parts = [_sqlite_col_ddl(col) for col in table_def.columns]
+        col_parts.extend(table_def.constraints)
+
+        create_table = (
+            f"CREATE TABLE IF NOT EXISTS {table_def.table_name} (\n" + ",\n".join(f"    {p}" for p in col_parts) + "\n)"
+        )
+        statements.append(create_table)
+
+        for idx in table_def.indices:
+            unique = "UNIQUE " if idx.unique else ""
+            cols = ", ".join(idx.columns)
+            statements.append(f"CREATE {unique}INDEX IF NOT EXISTS {idx.name} ON {table_def.table_name}({cols})")
+
+        return statements
+
+    # ========== RdbDatabase interface ==========
+
+    def ensure_table(self, table_def: TableDefinition) -> SqliteRdbTable:
+        ddl_statements = self._generate_ddl(table_def)
+        try:
+            with self._auto_conn() as conn:
+                # Migrate missing columns on existing tables before running DDL
+                self._migrate_missing_columns(conn, table_def)
+                # Rebuild table if inline constraints differ from the definition.
+                # Must run after _migrate_missing_columns so newly added columns
+                # are included in the data copy.
+                self._migrate_constraints(conn, table_def)
+                for stmt in ddl_statements:
+                    conn.execute(stmt)
+        except DatusException:
+            raise
+        except Exception as e:
+            ddl_text = "\n".join(ddl_statements)
+            logger.error(f"Auto-create table '{table_def.table_name}' failed: {e}")
+            raise DatusException(
+                ErrorCode.STORAGE_TABLE_OPERATION_FAILED,
+                message=f"Failed to create table '{table_def.table_name}'. Please create it manually:\n\n{ddl_text}",
+            ) from e
+        return SqliteRdbTable(self, table_def.table_name)
+
+    @staticmethod
+    def _migrate_missing_columns(conn, table_def: TableDefinition) -> None:
+        """Add columns that exist in the definition but not in the live table."""
+        safe_table = _safe_ident(table_def.table_name)
+        existing_cols = {_nocase_folded(c) for c in _live_column_names(conn, safe_table)}
+        if not existing_cols:
+            return  # table doesn't exist yet — CREATE TABLE will handle it
+        for col in table_def.columns:
+            if _nocase_folded(col.name) not in existing_cols:
+                col_ddl = _sqlite_col_ddl(col)
+                conn.execute(f"ALTER TABLE {safe_table} ADD COLUMN {col_ddl}")
+                logger.info(f"Migrated: ALTER TABLE {safe_table} ADD COLUMN {col_ddl}")
+
+    @staticmethod
+    def _migrate_constraints(conn, table_def: TableDefinition) -> None:
+        """Rebuild the table when its UNIQUE constraints differ from the definition.
+
+        SQLite does not support ALTER TABLE DROP CONSTRAINT, so fixing a stale
+        inline constraint requires a full table rebuild: create a correctly
+        constrained temp table, copy all rows, drop the old table, rename.
+
+        Only UNIQUE constraints are compared; other constraint types are ignored.
+        The rebuild is skipped when the table does not yet exist (CREATE TABLE
+        will handle it) or when all desired constraints are already present.
+        """
+        # Nothing to check if the definition declares no constraints.
+        if not table_def.constraints:
+            return
+
+        # Validate the table name before embedding it in SQL — prevents injection.
+        safe_table = _safe_ident(table_def.table_name)
+
+        # Zero columns means the table doesn't exist yet, so CREATE TABLE (run after
+        # this) will handle it. Declared spellings, because they get emitted below.
+        existing_cols = _live_column_names(conn, safe_table)
+        if not existing_cols:
+            return  # table doesn't exist yet
+
+        # Read the original CREATE TABLE statement SQLite stored when the table
+        # was first created. This is the only way to inspect inline constraints
+        # because SQLite has no information_schema or constraint catalog.
+        # COLLATE NOCASE is the SQL-side spelling of _nocase_folded; see its docstring
+        # for why the fold has to be the engine's and not Python's.
+        cursor = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name = ? COLLATE NOCASE",
+            (table_def.table_name,),
+        )
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return
+
+        # Normalize constraint strings so formatting differences don't cause false
+        # mismatches, e.g. "UNIQUE( parent_id, name )" and "UNIQUE(parent_id,name)".
+        # Folded, not uppercased: str.upper() maps U+00DF to "SS", which would make
+        # UNIQUE(<U+00DF>) and UNIQUE(SS) compare equal when SQLite holds the two
+        # columns apart — and the rebuild would then be skipped as already done.
+        def _norm(fragments):
+            return {re.sub(r"\s+", "", _nocase_folded(f)) for f in fragments}
+
+        # Extract UNIQUE constraints from the TableDefinition (what we want).
+        desired = _norm(c for c in table_def.constraints if re.match(r"\s*UNIQUE", c, re.IGNORECASE))
+        # Extract UNIQUE constraints from the stored CREATE statement (what the DB has).
+        existing = _norm(re.findall(r"UNIQUE\s*\([^)]+\)", row[0], re.IGNORECASE))
+
+        # Constraints already match — nothing to do (fresh install or already migrated).
+        if existing == desired:
+            return
+
+        logger.info(f"Rebuilding '{table_def.table_name}': constraints {existing} -> {desired}")
+
+        tmp = f"{table_def.table_name}_migration_tmp"
+        safe_tmp = _safe_ident(tmp)
+
+        # Only transfer columns that exist in both the old table and the new definition.
+        # This safely handles columns that may have been added by _migrate_missing_columns.
+        # Matched on the folded name, because a column the old table declared as "Name"
+        # is the definition's "name" — treating them as different silently drops the
+        # column, and its data, on the rebuild below. The old spelling is what gets
+        # emitted, which both tables resolve to.
+        new_col_names = {_nocase_folded(col.name) for col in table_def.columns}
+        transfer_cols = ", ".join(c for c in existing_cols if _nocase_folded(c) in new_col_names)
+
+        # Build DDL for the temp table using the new definition (correct constraints).
+        col_parts = [_sqlite_col_ddl(col) for col in table_def.columns] + list(table_def.constraints)
+        col_ddl = ",\n".join(f"    {p}" for p in col_parts)
+
+        # Four-step atomic rebuild — all inside the same transaction, so a crash
+        # between steps rolls back and leaves the original table untouched.
+        conn.execute(f"CREATE TABLE {safe_tmp} (\n{col_ddl}\n)")
+        conn.execute(f"INSERT INTO {safe_tmp} ({transfer_cols}) SELECT {transfer_cols} FROM {safe_table}")
+        conn.execute(f"DROP TABLE {safe_table}")
+        conn.execute(f"ALTER TABLE {safe_tmp} RENAME TO {safe_table}")
+        logger.info(f"Table '{table_def.table_name}' rebuilt with updated constraints")
+
+    @contextmanager
+    def transaction(self) -> Iterator[None]:
+        conn = self._open_connection()
+        self._local.txn_conn = conn
+        try:
+            yield
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            self._local.txn_conn = None
+            conn.close()
+
+    def close(self) -> None:
+        pass  # SQLite connections are opened/closed per operation
+
+    # ========== Internal CRUD (called by SqliteRdbTable) ==========
+
+    def _insert(self, table: str, record: Any) -> int:
+        data = {k: v for k, v in dataclasses.asdict(record).items() if v is not None}
+        columns = list(data.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        col_names = ", ".join(columns)
+        sql = f"INSERT INTO {table} ({col_names}) VALUES ({placeholders})"
+        try:
+            with self._auto_conn() as conn:
+                cursor = conn.execute(sql, tuple(data.values()))
+                return cursor.lastrowid
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
+                raise UniqueViolationError(str(e)) from e
+            raise IntegrityError(str(e)) from e
+
+    def _query(
+        self,
+        table: str,
+        model: Type[T],
+        where: Optional[WhereClause] = None,
+        columns: Optional[List[str]] = None,
+        order_by: Optional[List[str]] = None,
+    ) -> List[T]:
+        col_str = ", ".join(columns) if columns else "*"
+        where_sql, params = self._build_where(where)
+        order_sql = self._build_order_by(order_by)
+        sql = f"SELECT {col_str} FROM {table}{where_sql}{order_sql}"
+        with self._auto_conn() as conn:
+            cursor = conn.execute(sql, params)
+            rows = cursor.fetchall()
+            return [model(**dict(row)) for row in rows]
+
+    def _update(self, table: str, data: Dict[str, Any], where: Optional[WhereClause] = None) -> int:
+        if not data:
+            return 0
+        set_parts = [f"{col} = ?" for col in data.keys()]
+        set_sql = ", ".join(set_parts)
+        where_sql, where_params = self._build_where(where)
+        sql = f"UPDATE {table} SET {set_sql}{where_sql}"
+        params = list(data.values()) + where_params
+        try:
+            with self._auto_conn() as conn:
+                cursor = conn.execute(sql, params)
+                return cursor.rowcount
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
+                raise UniqueViolationError(str(e)) from e
+            raise IntegrityError(str(e)) from e
+
+    def _delete(self, table: str, where: Optional[WhereClause] = None) -> int:
+        where_sql, params = self._build_where(where)
+        sql = f"DELETE FROM {table}{where_sql}"
+        with self._auto_conn() as conn:
+            cursor = conn.execute(sql, params)
+            return cursor.rowcount
+
+    def _upsert(self, table: str, record: Any, conflict_columns: List[str]) -> None:
+        data = {k: v for k, v in dataclasses.asdict(record).items() if v is not None}
+        columns = list(data.keys())
+        placeholders = ", ".join(["?"] * len(columns))
+        col_names = ", ".join(columns)
+        sql = f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})"
+        try:
+            with self._auto_conn() as conn:
+                conn.execute(sql, tuple(data.values()))
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e):
+                raise UniqueViolationError(str(e)) from e
+            raise IntegrityError(str(e)) from e
+
+    @property
+    def db_file(self) -> str:
+        return self._db_file
+
+
+# ---------------------------------------------------------------------------
+# Level 1: Backend
+# ---------------------------------------------------------------------------
+
+
+class SqliteRdbBackend(BaseRdbBackend):
+    """SQLite backend — stateless producer of ``SqliteRdbDatabase`` instances.
+
+    Project isolation is PHYSICAL only: each project gets its own on-disk
+    ``.db`` file at ``{data_dir}/{project}/datus_db/{store_db_name}.db``.
+    ``project`` must be non-empty; the backend itself does not remember a
+    project, so the caller passes one on every ``connect()`` and a single
+    instance can serve many projects.
+    """
+
+    def __init__(self):
+        self._data_dir: str = ""
+
+    def initialize(self, config: Dict[str, Any]) -> None:
+        self._data_dir = config.get("data_dir", "")
+
+    def connect(self, project: str, store_db_name: str) -> SqliteRdbDatabase:
+        if not project:
+            raise DatusException(
+                ErrorCode.STORAGE_FAILED,
+                message="SqliteRdbBackend.connect() requires a non-empty project.",
+            )
+        safe_project = _safe_path_segment(project, "project")
+        safe_store = _safe_path_segment(store_db_name, "store_db_name")
+        return SqliteRdbDatabase(os.path.join(self._data_dir, safe_project, "datus_db", f"{safe_store}.db"))
+
+    def close(self) -> None:
+        pass  # SQLite connections are opened/closed per operation

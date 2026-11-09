@@ -1,0 +1,1026 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Codex model implementation using OAuth authentication and Responses API."""
+
+import base64
+import json
+import os
+import re
+import time
+import uuid
+from contextlib import nullcontext
+from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from urllib.parse import urlparse
+
+from agents import Agent, ModelSettings, Runner, SQLiteSession, Tool, WebSearchTool
+from agents.exceptions import MaxTurnsExceeded
+from agents.mcp import MCPServerStdio
+from agents.models.openai_responses import OpenAIResponsesModel
+from agents.run import RunConfig
+
+from pico.auth.oauth_config import CODEX_API_BASE_URL
+from pico.auth.oauth_manager import OAuthManager
+from pico.configuration.agent_config import ModelConfig
+from pico.models.base import LLMBaseModel
+from pico.models.mcp_result_extractors import extract_sql_contexts
+from pico.models.mcp_utils import multiple_mcp_servers
+from pico.observability.manager import get_observability_manager
+from pico.schemas.action_history import ActionHistory, ActionHistoryManager, ActionRole, ActionStatus
+from pico.schemas.tool_summary import detect_tool_failure
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import get_logger
+from pico.utils.trace_context import build_agents_run_config_kwargs, build_trace_span_attributes
+
+logger = get_logger(__name__)
+
+# Fallback values when providers.yml / OpenRouter cache do not cover a codex slug.
+_CODEX_DEFAULT_CONTEXT_LENGTH = 192000
+_CODEX_DEFAULT_MAX_TOKENS = 16384
+
+# The Responses API requires a ``name`` alongside a ``json_schema`` text format
+# and accepts only ``[a-zA-Z0-9_-]`` in it, capped at 64 characters.
+_SCHEMA_NAME_ALLOWED = re.compile(r"[^a-zA-Z0-9_-]")
+_SCHEMA_NAME_MAX_LENGTH = 64
+_SCHEMA_NAME_FALLBACK = "structured_response"
+
+
+def _json_schema_format_name(output_schema: Dict[str, Any], explicit: Optional[str] = None) -> str:
+    """Derive a Responses-API-legal ``text.format.name`` for a JSON schema.
+
+    Prefers an explicit caller-supplied name, then the schema's ``title``
+    (Pydantic's ``model_json_schema()`` always sets it to the model class
+    name), then a generic fallback. Illegal characters collapse to ``_``
+    because omitting the field — or sending an unsanitized one — makes the
+    provider reject the whole request with HTTP 400.
+    """
+    candidate = explicit or (output_schema.get("title") if isinstance(output_schema, dict) else None)
+    sanitized = _SCHEMA_NAME_ALLOWED.sub("_", str(candidate)).strip("_") if candidate else ""
+    return (sanitized or _SCHEMA_NAME_FALLBACK)[:_SCHEMA_NAME_MAX_LENGTH]
+
+
+def _agents_trace_baggage(agent_name: Optional[str]):
+    attrs = build_trace_span_attributes(operation=agent_name or "codex_agent", run_type="llm")
+    trace_name = attrs.get("pico.trace.name")
+    if not trace_name:
+        return nullcontext()
+    return get_observability_manager().trace_baggage(str(trace_name), attrs)
+
+
+async def _stream_events_with_trace_baggage(result, agent_name: Optional[str]):
+    with _agents_trace_baggage(agent_name):
+        async for event in result.stream_events():
+            yield event
+
+
+class _CodexResponsesModel(OpenAIResponsesModel):
+    """OpenAIResponsesModel subclass that fixes Codex returning output:[] in response.completed.
+
+    Codex streams correct items via response.output_item.done events but sends an empty
+    output array in response.completed. The Agents SDK builds final_response from the
+    completed event, so without this patch the session receives no items and multi-turn
+    conversation and tool chaining break.
+
+    Fix: collect items from ResponseOutputItemDoneEvent during streaming; when
+    ResponseCompletedEvent arrives with empty output, inject the collected items before
+    yielding so the SDK run loop can persist them to the session.
+    """
+
+    async def stream_response(self, *args, **kwargs):  # type: ignore[override]
+        from openai.types.responses import ResponseCompletedEvent, ResponseOutputItemDoneEvent, ResponseReasoningItem
+
+        collected: list = []
+        async for event in super().stream_response(*args, **kwargs):
+            if isinstance(event, ResponseOutputItemDoneEvent):
+                # Reasoning items are reference-only ({type, id}) and cannot be replayed
+                # when store=False — the server never persisted them. Exclude from the
+                # injected output so they are not written to the SQLite session, while
+                # still yielding the raw event for streaming display.
+                #
+                # We do NOT request/replay encrypted reasoning here: cache reuse is
+                # driven by an accepted prompt_cache_key (see _codex_model_settings),
+                # and replaying reasoning would only enlarge each resent request.
+                if not isinstance(event.item, ResponseReasoningItem):
+                    collected.append(event.item)
+            elif isinstance(event, ResponseCompletedEvent) and not event.response.output and collected:
+                patched_response = event.response.model_copy(update={"output": list(collected)})
+                event = event.model_copy(update={"response": patched_response})
+            yield event
+
+
+class CodexModel(LLMBaseModel):
+    """Access OpenAI Codex models via OAuth tokens and the Responses API.
+
+    Unlike standard OpenAI models, Codex uses:
+    - OAuth token authentication (ChatGPT subscription) instead of API keys
+    - The Responses API format (POST /responses) instead of Chat Completions
+    - A different base URL (chatgpt.com/backend-api/codex)
+    """
+
+    def __init__(self, model_config: ModelConfig, **kwargs):
+        super().__init__(model_config)
+        self.model_name = model_config.model
+        self._base_url = model_config.base_url or CODEX_API_BASE_URL
+        self.oauth_manager = OAuthManager()
+        self._config_api_key = self._resolve_config_api_key(model_config.api_key)
+        self._client = None
+        self._async_client = None
+        # Cache of conversation -> UUIDv7 prompt_cache_key. Generated once per
+        # conversation (with a real timestamp) and reused for every LLM call so
+        # the backend routes them to one cache node. See _stable_prompt_cache_key.
+        self._prompt_cache_keys: Dict[str, str] = {}
+
+    def supports_builtin_web_search(self) -> bool:
+        # OpenAI Responses API exposes a hosted ``web_search`` tool, but only the
+        # official ChatGPT Codex backend (``chatgpt.com/backend-api/codex``) honors
+        # it. A custom ``base_url`` points at a third-party relay that may not
+        # support the hosted tool, so gate on the official host and fall back to
+        # the local Tavily backend otherwise.
+        try:
+            hostname = (urlparse(self._base_url).hostname or "").lower() if self._base_url else ""
+        except Exception:
+            return False
+        return hostname == "chatgpt.com"
+
+    def supports_builtin_web_fetch(self) -> bool:
+        # OpenAI Responses has no hosted fetch tool; web_fetch uses the local backend.
+        return False
+
+    @staticmethod
+    def _resolve_config_api_key(api_key: str | None) -> str | None:
+        """Return the config api_key if it looks like a real token, else None."""
+        if not api_key or not api_key.strip():
+            return None
+        # Skip unresolved env-var placeholders like ${CODEX_OAUTH_TOKEN}
+        if api_key.startswith("${") and api_key.endswith("}"):
+            return None
+        if api_key.startswith("<MISSING:"):
+            return None
+        return api_key
+
+    def _get_access_token(self) -> str:
+        """Return a valid access token: config api_key first, then OAuthManager."""
+        if self._config_api_key:
+            return self._config_api_key
+        return self.oauth_manager.get_access_token()
+
+    def _get_client(self):
+        """Get sync OpenAI client, creating or refreshing token as needed."""
+        if self._client is None:
+            from openai import OpenAI
+
+            self._client = OpenAI(
+                api_key=self._get_access_token(),
+                base_url=self._base_url,
+            )
+        else:
+            # Ensure token is current on cached client
+            self._client.api_key = self._get_access_token()
+        return self._client
+
+    def _get_async_client(self):
+        """Get async OpenAI client, creating or refreshing token as needed."""
+        if self._async_client is None:
+            from openai import AsyncOpenAI
+
+            self._async_client = AsyncOpenAI(
+                api_key=self._get_access_token(),
+                base_url=self._base_url,
+            )
+        else:
+            # Ensure token is current on cached client
+            self._async_client.api_key = self._get_access_token()
+        return self._async_client
+
+    def _get_responses_model(self) -> _CodexResponsesModel:
+        """Create a _CodexResponsesModel for use with the Agent SDK."""
+        async_client = self._get_async_client()
+        return _CodexResponsesModel(model=self.model_name, openai_client=async_client)
+
+    def _refresh_client_token(self):
+        """Refresh the token on existing clients."""
+        token = self._get_access_token()
+        if self._client is not None:
+            self._client.api_key = token
+        if self._async_client is not None:
+            self._async_client.api_key = token
+
+    @staticmethod
+    def _generate_uuid7() -> str:
+        """Generate a real UUIDv7 (48-bit current-ms timestamp + random).
+
+        The Codex backend validates that ``prompt_cache_key`` is a genuine
+        UUIDv7 whose embedded timestamp is sane: a hash-derived "v7-shaped"
+        value (bogus timestamp) is rejected and replaced by a server UUID,
+        collapsing caching. So we mint one with the actual current time, just
+        like the official client does at thread creation.
+        """
+        unix_ms = int(time.time() * 1000)
+        b = bytearray(unix_ms.to_bytes(6, "big") + os.urandom(10))
+        b[6] = (b[6] & 0x0F) | 0x70  # version 7
+        b[8] = (b[8] & 0x3F) | 0x80  # RFC 4122 variant
+        return str(uuid.UUID(bytes=bytes(b)))
+
+    def _stable_prompt_cache_key(self, agent_name: Optional[str], session: Any) -> str:
+        """Return a conversation-stable UUIDv7 ``prompt_cache_key``.
+
+        The official Codex client uses one per-thread UUIDv7 (e.g.
+        ``019e730f-4449-77a2-...``) for every call in a turn and the backend
+        accepts it verbatim, routing the shared prefix to one cache node. We
+        mirror that: mint a real UUIDv7 once per conversation and reuse it for
+        all subsequent LLM calls (distinct per agent/session). Regenerated per
+        process — matching the official CLI, which uses a fresh thread id per
+        ``codex exec`` invocation.
+        """
+        session_id = getattr(session, "session_id", None)
+        parts = [self.model_name, agent_name or ""]
+        if session_id:
+            parts.append(str(session_id))
+        else:
+            node = getattr(self, "current_node", None)
+            if node is not None:
+                try:
+                    parts.append(node.get_node_name())
+                except Exception:  # noqa: BLE001
+                    pass
+                cfg = getattr(node, "agent_config", None)
+                if cfg is not None:
+                    parts.append(getattr(cfg, "current_datasource", "") or "")
+        seed = "|".join(parts)
+        cache = getattr(self, "_prompt_cache_keys", None)
+        if cache is None:  # tolerate test doubles bypassing __init__
+            cache = {}
+            self._prompt_cache_keys = cache
+        if seed not in cache:
+            cache[seed] = self._generate_uuid7()
+        return cache[seed]
+
+    def _chatgpt_account_id(self) -> Optional[str]:
+        """Extract the ChatGPT account id from the OAuth access-token JWT.
+
+        The official Codex client sends it as the ``chatgpt-account-id`` header;
+        the backend uses the codex identity headers to decide whether to honour
+        the client ``prompt_cache_key``.
+        """
+        try:
+            token = self._get_access_token()
+            payload = token.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            data = json.loads(base64.urlsafe_b64decode(payload))
+            auth = data.get("https://api.openai.com/auth", {}) or {}
+            return auth.get("chatgpt_account_id")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _codex_model_settings(self, agent_name: Optional[str], session: Any) -> ModelSettings:
+        """Build Codex ``ModelSettings`` that mirror the official client so the
+        backend honours our ``prompt_cache_key`` (→ high prompt-cache hit rate).
+
+        Packet analysis showed the backend only accepts a client-supplied key
+        when the request also carries the codex *identity headers*
+        (``originator``/``session_id``/``thread_id``/``chatgpt-account-id``) and
+        a real-timestamp UUIDv7 key. Without them it replaces the key with a
+        random server UUID and caching collapses. We replicate that header set
+        (via ``extra_headers``) and the ``prompt_cache_key`` (``extra_args``);
+        both reuse one stable UUIDv7 per conversation.
+        """
+        key = self._stable_prompt_cache_key(agent_name, session)
+
+        extra_headers: Dict[str, str] = {
+            "originator": "codex_exec",
+            "session_id": key,
+            "thread_id": key,
+            "x-client-request-id": key,
+        }
+        account_id = self._chatgpt_account_id()
+        if account_id:
+            extra_headers["chatgpt-account-id"] = account_id
+
+        return ModelSettings(
+            store=False,
+            include_usage=True,
+            # Mirror the OpenAI Responses path: when the hosted web_search tool
+            # runs, echo the per-call source URLs (``action.sources``) so they are
+            # available as a fallback for the richer url_citation results.
+            response_include=["web_search_call.action.sources"],
+            extra_args={"prompt_cache_key": key},
+            extra_headers=extra_headers,
+        )
+
+    @staticmethod
+    def _consume_stream_text(stream) -> str:
+        """Consume a streaming response and return the full output text.
+
+        The terminal ``response.completed`` event is preferred when it actually
+        carries text, but it is NOT trusted blindly: against a ChatGPT-account
+        Codex endpoint that event arrives with ``output_text == ""`` and
+        ``output == []`` even after the model streamed a complete answer over
+        ``response.output_text.delta``. Returning the empty terminal value there
+        discarded the whole response — callers saw an empty string, and
+        ``generate_with_json_output`` turned that into a ``JSONDecodeError``
+        (surfaced as a bogus "HTTP 400"), so every structured call against such
+        an endpoint failed. Fall back to the accumulated deltas instead.
+        """
+        collected = []
+        for event in stream:
+            event_type = getattr(event, "type", None)
+            if event_type == "response.completed":
+                response = getattr(event, "response", None)
+                final_text = getattr(response, "output_text", "") if response else ""
+                return final_text or "".join(collected)
+            elif event_type == "response.output_text.delta":
+                collected.append(getattr(event, "delta", ""))
+        return "".join(collected)
+
+    @staticmethod
+    def _convert_prompt_to_input(prompt: Any) -> list:
+        """Convert prompt to Responses API input format.
+
+        The Codex Responses API requires input as a list of message dicts
+        with 'role' and 'content' keys.
+        """
+        if isinstance(prompt, list):
+            return prompt
+        # Wrap string/other types into a user message list
+        return [{"role": "user", "content": str(prompt)}]
+
+    def generate(self, prompt: Any, enable_thinking: bool = False, **kwargs) -> str:
+        """Generate a response via the Codex Responses API.
+
+        Args:
+            prompt: Input prompt (string or messages list)
+            enable_thinking: Not supported for Codex models (ignored)
+            **kwargs: Additional parameters
+
+        Returns:
+            Generated text response
+        """
+        self._refresh_client_token()
+        input_data = self._convert_prompt_to_input(prompt)
+
+        create_kwargs = {
+            "model": self.model_name,
+            "input": input_data,
+            "store": False,
+            "stream": True,
+        }
+        instructions = kwargs.get("instructions")
+        if instructions:
+            create_kwargs["instructions"] = instructions
+
+        try:
+            stream = self._get_client().responses.create(**create_kwargs)
+            return self._consume_stream_text(stream)
+        except Exception as e:
+            from openai import AuthenticationError
+
+            if isinstance(e, AuthenticationError):
+                logger.info("Got 401, refreshing OAuth token and retrying...")
+                self.oauth_manager.refresh_tokens()
+                self._refresh_client_token()
+                try:
+                    stream = self._get_client().responses.create(**create_kwargs)
+                    return self._consume_stream_text(stream)
+                except AuthenticationError as retry_e:
+                    raise DatusException(
+                        ErrorCode.MODEL_AUTHENTICATION_ERROR,
+                        message_args={"error_detail": f"Codex auth failed after token refresh: {retry_e}"},
+                    ) from retry_e
+            raise DatusException(
+                ErrorCode.MODEL_REQUEST_FAILED,
+                message=f"Codex generate failed: {e}",
+            ) from e
+
+    def generate_with_json_output(self, prompt: Any, **kwargs) -> Dict:
+        """Generate a JSON-structured response via the Codex Responses API.
+
+        Args:
+            prompt: Input prompt (string or messages list)
+            **kwargs: May contain 'output_schema' for structured output
+
+        Returns:
+            Parsed JSON response as a dictionary
+        """
+        import json
+
+        self._refresh_client_token()
+        input_data = self._convert_prompt_to_input(prompt)
+
+        create_kwargs: Dict[str, Any] = {
+            "model": self.model_name,
+            "input": input_data,
+            "store": False,
+            "stream": True,
+        }
+
+        instructions = kwargs.get("instructions")
+        if instructions:
+            create_kwargs["instructions"] = instructions
+
+        output_schema = kwargs.get("output_schema")
+        if output_schema:
+            create_kwargs["text"] = {
+                "format": {
+                    "type": "json_schema",
+                    # Required by the Responses API: without it every
+                    # schema-mode request fails with HTTP 400
+                    # "Missing required parameter: 'text.format.name'".
+                    "name": _json_schema_format_name(output_schema, kwargs.get("output_schema_name")),
+                    "schema": output_schema,
+                }
+            }
+        else:
+            create_kwargs["text"] = {"format": {"type": "json_object"}}
+
+        try:
+            stream = self._get_client().responses.create(**create_kwargs)
+            return json.loads(self._consume_stream_text(stream))
+        except json.JSONDecodeError as e:
+            raise DatusException(
+                ErrorCode.MODEL_INVALID_RESPONSE,
+                message_args={"error_detail": f"Invalid JSON from Codex: {e}"},
+            ) from e
+        except Exception as e:
+            from openai import AuthenticationError
+
+            if isinstance(e, AuthenticationError):
+                logger.info("Got 401 in generate_with_json_output, refreshing OAuth token and retrying...")
+                self.oauth_manager.refresh_tokens()
+                self._refresh_client_token()
+                try:
+                    stream = self._get_client().responses.create(**create_kwargs)
+                    return json.loads(self._consume_stream_text(stream))
+                except AuthenticationError as retry_e:
+                    raise DatusException(
+                        ErrorCode.MODEL_AUTHENTICATION_ERROR,
+                        message_args={"error_detail": f"Codex auth failed after token refresh: {retry_e}"},
+                    ) from retry_e
+                except json.JSONDecodeError as json_e:
+                    raise DatusException(
+                        ErrorCode.MODEL_INVALID_RESPONSE,
+                        message_args={"error_detail": f"Invalid JSON from Codex after retry: {json_e}"},
+                    ) from json_e
+            raise DatusException(
+                ErrorCode.MODEL_REQUEST_FAILED,
+                message=f"Codex generate_with_json_output failed: {e}",
+            ) from e
+
+    async def generate_with_tools(
+        self,
+        prompt: Union[str, List[Dict[str, str]]],
+        tools: Optional[List[Tool]] = None,
+        mcp_servers: Optional[Dict[str, MCPServerStdio]] = None,
+        instruction: str = "",
+        output_type: type = str,
+        max_turns: int = 10,
+        session: Optional[SQLiteSession] = None,
+        **kwargs,
+    ) -> Dict:
+        """Generate response with tool support via the Codex Responses API."""
+        self._refresh_client_token()
+        responses_model = self._get_responses_model()
+
+        async with multiple_mcp_servers(mcp_servers or {}) as connected_servers:
+            agent_name = kwargs.get("agent_name", "codex_agent")
+            agent_kwargs: Dict[str, Any] = {
+                "name": agent_name,
+                "instructions": instruction,
+                "output_type": output_type,
+                "model": responses_model,
+                "model_settings": self._codex_model_settings(agent_name, session),
+            }
+            if connected_servers:
+                agent_kwargs["mcp_servers"] = list(connected_servers.values())
+            if tools:
+                agent_kwargs["tools"] = tools
+            if (kwargs.get("builtin_web_tools") or {}).get("web_search") and self.supports_builtin_web_search():
+                agent_kwargs["tools"] = [*(agent_kwargs.get("tools") or []), WebSearchTool()]
+            if kwargs.get("hooks"):
+                agent_kwargs["hooks"] = kwargs["hooks"]
+
+            agent = Agent(**agent_kwargs)
+
+            run_config_kwargs = build_agents_run_config_kwargs(agent_name=agent_kwargs["name"])
+            run_config = RunConfig(**run_config_kwargs) if run_config_kwargs else None
+
+            async def _run_streamed_to_completion(a, p):
+                """Run agent via streaming (Codex API requires stream=True) and return the result."""
+                with _agents_trace_baggage(agent_kwargs["name"]):
+                    result = Runner.run_streamed(
+                        a, input=p, max_turns=max_turns, session=session, run_config=run_config
+                    )
+                    while not result.is_complete:
+                        async for _ in result.stream_events():
+                            pass
+                return result
+
+            try:
+                result = await _run_streamed_to_completion(agent, prompt)
+            except MaxTurnsExceeded as e:
+                raise DatusException(ErrorCode.MODEL_MAX_TURNS_EXCEEDED, message_args={"max_turns": max_turns}) from e
+            except Exception as e:
+                from openai import AuthenticationError
+
+                if isinstance(e, AuthenticationError):
+                    logger.info("Got 401 in generate_with_tools, refreshing OAuth token...")
+                    self.oauth_manager.refresh_tokens()
+                    self._refresh_client_token()
+                    # Don't retry the full run — tool calls may have had side effects.
+                    # Raise a retriable error so the caller can decide.
+                    raise DatusException(
+                        ErrorCode.MODEL_AUTHENTICATION_ERROR,
+                        message_args={"error_detail": "Codex auth failed; token refreshed, please retry"},
+                    ) from e
+                raise
+
+            if session and hasattr(session, "store_run_usage"):
+                try:
+                    await session.store_run_usage(result)
+                except Exception as e:
+                    logger.warning(f"Failed to store run usage: {e}")
+
+            usage_info = self._extract_usage_info(result)
+
+            return {
+                "content": result.final_output,
+                "sql_contexts": extract_sql_contexts(result),
+                "usage": usage_info,
+                "model": self.model_name,
+                "turns_used": getattr(result, "turn_count", 0),
+            }
+
+    async def generate_with_tools_stream(
+        self,
+        prompt: Union[str, List[Dict[str, str]]],
+        tools: Optional[List[Tool]] = None,
+        mcp_servers: Optional[Dict[str, MCPServerStdio]] = None,
+        instruction: str = "",
+        output_type: type = str,
+        max_turns: int = 10,
+        session: Optional[SQLiteSession] = None,
+        action_history_manager: Optional[ActionHistoryManager] = None,
+        hooks=None,
+        interrupt_controller=None,
+        pending_input_queue=None,
+        interaction_broker=None,
+        context_rewriter=None,
+        **kwargs,
+    ) -> AsyncGenerator[ActionHistory, None]:
+        """Generate response with streaming and tool support via the Codex Responses API.
+
+        ``pending_input_queue`` and ``interaction_broker`` are named explicitly
+        rather than read out of ``**kwargs``: the base signature ends in
+        ``**kwargs``, so a provider that forgets to forward them loses mid-run
+        message insertion without any error — the queue then only drains at the
+        run boundary via the chat layer's auto-continuation.
+        """
+        if action_history_manager is None:
+            action_history_manager = ActionHistoryManager()
+
+        self._refresh_client_token()
+        responses_model = self._get_responses_model()
+
+        async with multiple_mcp_servers(mcp_servers or {}) as connected_servers:
+            agent_name = kwargs.get("agent_name", "codex_agent")
+            agent_kwargs: Dict[str, Any] = {
+                "name": agent_name,
+                "instructions": instruction,
+                "output_type": output_type,
+                "model": responses_model,
+                "model_settings": self._codex_model_settings(agent_name, session),
+            }
+            if connected_servers:
+                agent_kwargs["mcp_servers"] = list(connected_servers.values())
+            if tools:
+                agent_kwargs["tools"] = tools
+            if (kwargs.get("builtin_web_tools") or {}).get("web_search") and self.supports_builtin_web_search():
+                agent_kwargs["tools"] = [*(agent_kwargs.get("tools") or []), WebSearchTool()]
+            if hooks:
+                agent_kwargs["hooks"] = hooks
+
+            agent = Agent(**agent_kwargs)
+
+            # Carries the mid-run input filter as well as the trace kwargs, so a
+            # message typed while this run is streaming reaches the model at the
+            # next turn boundary instead of waiting for the whole run to finish.
+            run_config = self._build_run_config(
+                pending_input_queue=pending_input_queue,
+                session=session,
+                interrupt_controller=interrupt_controller,
+                interaction_broker=interaction_broker,
+                agent_name=agent_kwargs["name"],
+                context_rewriter=context_rewriter,
+            )
+            with _agents_trace_baggage(agent_kwargs["name"]):
+                result = Runner.run_streamed(
+                    agent, input=prompt, max_turns=max_turns, session=session, run_config=run_config
+                )
+
+            # Stream events and yield ActionHistory objects
+            temp_tool_calls = {}  # {call_id: {"tool_name": ..., "arguments": ...}}
+            early_assistant_yielded = False
+            thinking_stream_id: Optional[str] = None
+            thinking_accumulated = ""
+
+            try:
+                while not result.is_complete:
+                    if interrupt_controller and interrupt_controller.is_interrupted:
+                        from pico.cli.execution_state import ExecutionInterrupted
+
+                        raise ExecutionInterrupted("Interrupted by user")
+
+                    async for event in _stream_events_with_trace_baggage(result, agent_kwargs["name"]):
+                        if interrupt_controller and interrupt_controller.is_interrupted:
+                            from pico.cli.execution_state import ExecutionInterrupted
+
+                            raise ExecutionInterrupted("Interrupted by user")
+
+                        # Handle assistant text from raw response events (streaming)
+                        if hasattr(event, "type") and event.type == "raw_response_event":
+                            raw_data = getattr(event, "data", None)
+                            raw_type = getattr(raw_data, "type", None) if raw_data else None
+
+                            # Stream text delta
+                            if raw_type == "response.output_text.delta":
+                                delta_text = getattr(raw_data, "delta", None)
+                                if delta_text:
+                                    if thinking_stream_id is None:
+                                        thinking_stream_id = f"thinking_stream_{uuid.uuid4().hex[:8]}"
+                                    thinking_accumulated += delta_text
+                                    delta_action = ActionHistory(
+                                        action_id=thinking_stream_id,
+                                        role=ActionRole.ASSISTANT,
+                                        messages="",
+                                        action_type="thinking_delta",
+                                        input={},
+                                        output={"delta": delta_text, "accumulated": thinking_accumulated},
+                                        status=ActionStatus.PROCESSING,
+                                    )
+                                    yield delta_action
+                                continue
+
+                            # Content part done: emit completed thinking action
+                            if raw_type == "response.content_part.done":
+                                if thinking_accumulated.strip():
+                                    full_text = thinking_accumulated.strip()
+                                    text_split = full_text if len(full_text) <= 200 else f"{full_text[:200]}..."
+                                    action = ActionHistory(
+                                        action_id=thinking_stream_id or f"assistant_{uuid.uuid4().hex[:8]}",
+                                        role=ActionRole.ASSISTANT,
+                                        messages=f"Thinking: {text_split}",
+                                        action_type="response",
+                                        input={},
+                                        output={"raw_output": full_text, "is_thinking": len(temp_tool_calls) > 0},
+                                        status=ActionStatus.SUCCESS,
+                                    )
+                                    action_history_manager.add_action(action)
+                                    yield action
+                                    early_assistant_yielded = True
+                                thinking_stream_id = None
+                                thinking_accumulated = ""
+                                continue
+
+                            # Fallback: response.output_item.done type="message"
+                            if raw_type == "response.output_item.done":
+                                raw_item = getattr(raw_data, "item", None)
+                                if raw_item and getattr(raw_item, "type", None) == "message":
+                                    if not early_assistant_yielded:
+                                        content_list = getattr(raw_item, "content", [])
+                                        text_parts = [
+                                            getattr(p, "text", "")
+                                            for p in (content_list or [])
+                                            if getattr(p, "text", None)
+                                        ]
+                                        full_text = "\n".join(text_parts).strip()
+                                        if full_text:
+                                            action = ActionHistory(
+                                                action_id=f"assistant_{uuid.uuid4().hex[:8]}",
+                                                role=ActionRole.ASSISTANT,
+                                                messages=full_text[:200] + ("..." if len(full_text) > 200 else ""),
+                                                action_type="response",
+                                                input={},
+                                                output={"raw_output": full_text},
+                                                status=ActionStatus.SUCCESS,
+                                            )
+                                            action_history_manager.add_action(action)
+                                            yield action
+                                            early_assistant_yielded = True
+                            continue
+
+                        if not hasattr(event, "type") or event.type != "run_item_stream_event":
+                            continue
+                        if not (hasattr(event, "item") and hasattr(event.item, "type")):
+                            continue
+
+                        item_type = event.item.type
+
+                        # Handle tool call events
+                        if item_type == "tool_call_item":
+                            raw_item = getattr(event.item, "raw_item", None)
+                            if raw_item:
+                                # Normalize access: raw_item can be dict (Responses API) or object
+                                if isinstance(raw_item, dict):
+                                    tool_name = raw_item.get("name")
+                                    call_id = raw_item.get("call_id")
+                                    arguments = raw_item.get("arguments", "{}")
+                                else:
+                                    tool_name = getattr(raw_item, "name", None)
+                                    call_id = getattr(raw_item, "call_id", None)
+                                    arguments = getattr(raw_item, "arguments", "{}")
+                                is_hosted = False
+                                if not tool_name:
+                                    # Server-side hosted tools (web_search_call, …) carry no
+                                    # name/arguments; resolve a friendly label + query.
+                                    from pico.models.openai_compatible import describe_hosted_tool_item
+
+                                    hosted = describe_hosted_tool_item(raw_item)
+                                    if hosted:
+                                        tool_name, call_id, arguments = hosted
+                                        is_hosted = True
+                                    else:
+                                        tool_name = "unknown"
+                                if not call_id:
+                                    call_id = f"tool_{uuid.uuid4().hex[:8]}"
+                                args_str = str(arguments)[:80]
+
+                                temp_tool_calls[call_id] = {
+                                    "tool_name": tool_name,
+                                    "arguments": arguments,
+                                    "args_display": args_str,
+                                }
+
+                                action = ActionHistory(
+                                    action_id=call_id,
+                                    role=ActionRole.TOOL,
+                                    messages=f"Tool call: {tool_name}('{args_str}...')",
+                                    action_type=tool_name,
+                                    input={"function_name": tool_name, "arguments": arguments},
+                                    output={},
+                                    status=ActionStatus.PROCESSING,
+                                )
+                                action_history_manager.add_action(action)
+                                yield action
+
+                                # Hosted tools run server-side with no separate
+                                # output item. Emit the completion immediately —
+                                # keyed off the call's own ``action.sources`` — so
+                                # the CLI stops the in-progress spinner as soon as
+                                # the server-side search returns, instead of
+                                # leaving it pinned until stream end. The richer
+                                # ``url_citation`` titles still surface inline in
+                                # the assistant answer text.
+                                if is_hosted:
+                                    temp_tool_calls.pop(call_id, None)
+                                    from pico.schemas.web_result import extract_action_sources, hosted_action_query
+
+                                    raw_action = (
+                                        raw_item.get("action")
+                                        if isinstance(raw_item, dict)
+                                        else getattr(raw_item, "action", None)
+                                    )
+                                    hosted_done = self._build_hosted_search_completion(
+                                        call_id=call_id,
+                                        tool_name=tool_name,
+                                        arguments=arguments,
+                                        args_str=args_str,
+                                        query=str(hosted_action_query(raw_action) or ""),
+                                        sources=extract_action_sources(raw_action),
+                                    )
+                                    action_history_manager.add_action(hosted_done)
+                                    yield hosted_done
+
+                        elif item_type == "tool_call_output_item":
+                            raw_item = getattr(event.item, "raw_item", None)
+                            output_content = getattr(event.item, "output", "")
+                            if raw_item:
+                                # raw_item can be a dict (Responses API) or Pydantic model (Chat Completions)
+                                if isinstance(raw_item, dict):
+                                    call_id = raw_item.get("call_id")
+                                else:
+                                    call_id = getattr(raw_item, "call_id", None)
+                                if not call_id:
+                                    call_id = f"tool_{uuid.uuid4().hex[:8]}"
+
+                                # Match back to stored tool call for name
+                                tool_info = temp_tool_calls.pop(call_id, None)
+                                tool_name = tool_info["tool_name"] if tool_info else "unknown"
+                                args_display = tool_info["args_display"] if tool_info else ""
+                                arguments = tool_info["arguments"] if tool_info else "{}"
+
+                                # FuncToolResult(success=0) returns normally rather than
+                                # raising, so inspect the payload instead of hardcoding
+                                # SUCCESS — otherwise a rejected write renders a green ✓.
+                                tool_failed = detect_tool_failure(output_content)
+                                action = ActionHistory(
+                                    action_id=f"complete_{call_id}",
+                                    role=ActionRole.TOOL,
+                                    messages=f"Tool call: {tool_name}('{args_display}...')",
+                                    action_type=tool_name,
+                                    input={"function_name": tool_name, "arguments": arguments},
+                                    output={"success": not tool_failed, "raw_output": output_content},
+                                    status=ActionStatus.FAILED if tool_failed else ActionStatus.SUCCESS,
+                                )
+                                action_history_manager.add_action(action)
+                                yield action
+
+            except MaxTurnsExceeded as e:
+                raise DatusException(ErrorCode.MODEL_MAX_TURNS_EXCEEDED, message_args={"max_turns": max_turns}) from e
+            except Exception as e:
+                from pico.cli.execution_state import ExecutionInterrupted
+
+                if isinstance(e, ExecutionInterrupted):
+                    raise
+
+                from openai import AuthenticationError
+
+                if isinstance(e, AuthenticationError):
+                    logger.info("Got 401 in generate_with_tools_stream, refreshing OAuth token...")
+                    self.oauth_manager.refresh_tokens()
+                    self._refresh_client_token()
+                    raise DatusException(
+                        ErrorCode.MODEL_AUTHENTICATION_ERROR,
+                        message_args={"error_detail": "Codex auth failed; token refreshed, please retry"},
+                    ) from e
+                raise DatusException(
+                    ErrorCode.MODEL_REQUEST_FAILED,
+                    message=f"Codex streaming failed: {e}",
+                ) from e
+
+            # Store per-turn usage in turn_usage table
+            if session and hasattr(session, "store_run_usage"):
+                try:
+                    await session.store_run_usage(result)
+                except Exception as e:
+                    logger.warning(f"Failed to store run usage: {e}")
+
+            # Final summary after streaming completes
+            has_final_output = hasattr(result, "final_output")
+            final_output = result.final_output if has_final_output else None
+            usage_info = self._extract_usage_info(result)
+            final_action = ActionHistory(
+                action_id=f"final_{uuid.uuid4().hex[:8]}",
+                role=ActionRole.ASSISTANT,
+                messages=str(final_output)[:200] if final_output is not None else "",
+                action_type="final_response",
+                input={},
+                output={
+                    "raw_output": str(final_output) if final_output is not None else "",
+                    "sql_contexts": extract_sql_contexts(result) if has_final_output else [],
+                    "usage": usage_info,
+                },
+                status=ActionStatus.SUCCESS,
+            )
+            action_history_manager.add_action(final_action)
+            yield final_action
+
+    @staticmethod
+    def _build_hosted_search_completion(
+        call_id: str,
+        tool_name: str,
+        arguments: str,
+        args_str: str,
+        query: str,
+        sources: List[dict],
+    ) -> ActionHistory:
+        """Build the completion for a single hosted ``web_search`` call.
+
+        The hosted call item carries no results; the only per-call metadata
+        available in-stream is ``action.sources`` (URLs, no titles). We use those
+        as the canonical result and emit the completion immediately so the CLI
+        stops the in-progress spinner as soon as the server-side search returns.
+        The richer ``url_citation`` titles still surface inline in the assistant
+        answer text.
+        """
+        from pico.schemas.web_result import normalize_search_results, web_search_short_summary
+
+        canonical = normalize_search_results(query, sources or [])
+        summary = web_search_short_summary(canonical)
+        return ActionHistory(
+            action_id=f"complete_{call_id}",
+            role=ActionRole.TOOL,
+            messages=f"Tool call: {tool_name}('{args_str}...')",
+            action_type=tool_name,
+            input={"function_name": tool_name, "arguments": arguments},
+            output={
+                "success": True,
+                "raw_output": {"success": True, "result": canonical},
+                "summary": summary,
+                "status_message": summary,
+            },
+            status=ActionStatus.SUCCESS,
+        )
+
+    def _extract_usage_info(self, source) -> dict:
+        """Extract usage info from an SDK ``RunResult`` or ``Usage`` object.
+
+        Accepts both shapes so :class:`TokenUsageHook` (which gets a
+        :class:`RunContextWrapper` and passes ``context.usage``) and the
+        existing callers (which pass a completed ``result``) share the
+        same extraction pipeline. Returns ``{}`` when neither shape
+        carries a usable usage attribute.
+        """
+        usage = None
+        if hasattr(source, "context_wrapper") and hasattr(source.context_wrapper, "usage"):
+            usage = source.context_wrapper.usage
+        elif source is not None and (
+            hasattr(source, "input_tokens") or hasattr(source, "output_tokens") or hasattr(source, "total_tokens")
+        ):
+            usage = source
+        if usage is None:
+            return {}
+
+        def _int(val, default=0):
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                return default
+
+        input_tokens = _int(getattr(usage, "input_tokens", 0))
+        output_tokens = _int(getattr(usage, "output_tokens", 0))
+        total_tokens = _int(getattr(usage, "total_tokens", 0))
+
+        cached_tokens = 0
+        if hasattr(usage, "input_tokens_details") and usage.input_tokens_details:
+            cached_tokens = _int(getattr(usage.input_tokens_details, "cached_tokens", 0))
+
+        reasoning_tokens = 0
+        if hasattr(usage, "output_tokens_details") and usage.output_tokens_details:
+            reasoning_tokens = _int(getattr(usage.output_tokens_details, "reasoning_tokens", 0))
+
+        last_call_input_tokens = 0
+        try:
+            if hasattr(usage, "request_usage_entries") and usage.request_usage_entries:
+                last_call_input_tokens = _int(getattr(usage.request_usage_entries[-1], "input_tokens", 0))
+        except (IndexError, TypeError):
+            pass
+
+        cache_hit_rate = round(cached_tokens / input_tokens, 3) if input_tokens > 0 else 0
+
+        context_usage_ratio = 0
+        max_context = self.context_length()
+        if max_context:
+            context_usage_ratio = round(last_call_input_tokens / max_context, 3)
+
+        return {
+            "requests": _int(getattr(usage, "requests", 0)),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "reasoning_tokens": reasoning_tokens,
+            "cache_hit_rate": cache_hit_rate,
+            "context_usage_ratio": context_usage_ratio,
+            "last_call_input_tokens": last_call_input_tokens,
+        }
+
+    def token_count(self, prompt: str) -> int:
+        """Estimate token count using a simple heuristic."""
+        return len(prompt) // 4
+
+    def _lookup_spec(self, field: str) -> Optional[int]:
+        """Look up ``field`` in providers.yml ``model_specs``.
+
+        Codex-gateway models are real OpenAI models (gpt-5.x, o3, etc.) so
+        their specs come from the same catalog — no codex-only filter.
+
+        Lookup order:
+        1. Exact match on model_name
+        2. OpenRouter-style slug match (``*/model_name``) — catches entries
+           from the OpenRouter cache that carry a provider prefix
+        3. Longest prefix match from providers.yml
+        """
+        from pico.models.openai_compatible import _load_model_specs
+
+        specs = _load_model_specs()
+
+        exact = specs.get(self.model_name)
+        if isinstance(exact, dict) and isinstance(exact.get(field), int):
+            return exact[field]
+
+        suffix = f"/{self.model_name}"
+        for spec_model, spec in specs.items():
+            if not isinstance(spec, dict) or not isinstance(spec.get(field), int):
+                continue
+            if spec_model.endswith(suffix):
+                return spec[field]
+
+        best_key: Optional[str] = None
+        for spec_model, spec in specs.items():
+            if not isinstance(spec, dict) or not isinstance(spec.get(field), int):
+                continue
+            if self.model_name.startswith(spec_model) and (best_key is None or len(spec_model) > len(best_key)):
+                best_key = spec_model
+        if best_key is None:
+            return None
+        return specs[best_key][field]
+
+    def max_tokens(self) -> Optional[int]:
+        """Return the max output tokens for the current model."""
+        value = self._lookup_spec("max_tokens")
+        return value if value is not None else _CODEX_DEFAULT_MAX_TOKENS
+
+    def context_length(self) -> Optional[int]:
+        """Return the context length for the current model."""
+        value = self._lookup_spec("context_length")
+        return value if value is not None else _CODEX_DEFAULT_CONTEXT_LENGTH

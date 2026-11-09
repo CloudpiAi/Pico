@@ -1,0 +1,663 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Agent, workflow, and node-related commands for the Pico CLI.
+This module provides a class to handle all agent-related commands.
+"""
+
+import asyncio
+import uuid
+from typing import TYPE_CHECKING, Any, Dict
+
+from rich.prompt import Confirm
+from rich.syntax import Syntax
+
+from pico.agent.evaluate import setup_node_input, update_context_from_node
+from pico.agent.node import Node
+from pico.agent.workflow import Workflow
+from pico.cli.cli_styles import (
+    CODE_THEME,
+    print_error,
+    print_success,
+    print_warning,
+)
+from pico.configuration.node_type import NodeType
+from pico.schemas.base import BaseInput
+from pico.schemas.compare_node_models import CompareInput
+from pico.schemas.gen_sql_agentic_node_models import GenSQLNodeInput
+from pico.schemas.node_models import ExecuteSQLInput, OutputInput, SqlTask
+from pico.schemas.schema_linking_node_models import SchemaLinkingInput
+from pico.tools.output_tools import OutputTool
+from pico.utils.constants import DBType
+from pico.utils.loggings import get_logger
+from pico.utils.rich_util import dict_to_tree
+
+logger = get_logger(__name__)
+
+if TYPE_CHECKING:
+    from pico.cli.repl import DatusCLI
+
+
+class AgentCommands:
+    """Handles all agent, workflow, and node-related commands."""
+
+    def __init__(self, cli_instance: "DatusCLI", cli_context):
+        """Initialize with reference to the CLI instance and CLI context."""
+        self.cli = cli_instance
+        self.cli_context = cli_context
+        self.console = cli_instance.console
+        self.agent = cli_instance.agent
+        self.darun_is_running = False
+        self.agent_thread = None
+        self.output_tool: OutputTool | None = None
+
+    def update_agent_reference(self):
+        """Update the agent reference if it has changed in the CLI."""
+        self.agent = self.cli.agent
+
+    def create_node_input(self, node_type: str, task_text: str = None) -> BaseInput:
+        """Create input for a specific node type with console prompts."""
+        # Get or create SQL task
+        try:
+            sql_task = self._gen_sql_task(task_text or "", use_existing=True)
+            if not sql_task:
+                return None
+        except ValueError as e:
+            print_error(self.console, str(e))
+            return None
+
+        if node_type == NodeType.TYPE_SCHEMA_LINKING:
+            if not task_text:
+                task_text = sql_task.task or self.cli.prompt_input(
+                    "Enter task description for schema linking", default=""
+                )
+            top_n = self.cli.prompt_input("Enter number of tables to link", default="5")
+            matching_rate = self.cli.prompt_input(
+                "Enter matching method",
+                choices=["fast", "medium", "slow", "from_llm"],
+                default="fast",
+            )
+            return SchemaLinkingInput(
+                input_text=task_text,
+                catalog_name=sql_task.catalog_name,
+                database_name=sql_task.database,
+                schema_name=sql_task.schema,
+                database_type=sql_task.database_type,
+                top_n=int(top_n.strip()),
+                matching_rate=matching_rate.strip(),
+            )
+
+        elif node_type == NodeType.TYPE_GEN_SQL:
+            user_message = (
+                task_text
+                or sql_task.task
+                or self.cli.prompt_input("Enter task description for SQL generation", default="")
+            )
+            sql_task.task = user_message
+            return GenSQLNodeInput(
+                user_message=user_message,
+                catalog=sql_task.catalog_name,
+                database=sql_task.database_name,
+                db_schema=sql_task.schema_name,
+                schemas=self.cli_context.get_recent_tables(),
+                metrics=self.cli_context.get_recent_metrics(),
+                external_knowledge=sql_task.external_knowledge,
+                reference_date=sql_task.current_date,
+            )
+
+        elif node_type == NodeType.TYPE_FIX:
+            last_sql = self.cli_context.get_last_sql()
+            if not last_sql:
+                print_error(self.console, "No recent SQL to fix")
+                return None
+            fix_description = self.cli.prompt_input("Describe the issue to fix", default="")
+            return ExecuteSQLInput(
+                sql_query=last_sql, sql_task=sql_task, database_type=sql_task.database_type, expectation=fix_description
+            )
+
+        elif node_type == NodeType.TYPE_COMPARE:
+            expectation = self.cli.prompt_input("Enter expectation (SQL query or expected data format)", default="")
+            if not expectation.strip():
+                print_error(self.console, "Expectation cannot be empty")
+                return None
+            return CompareInput(
+                sql_context=self.cli_context.get_last_sql_context(), expectation=expectation, sql_task=sql_task
+            )
+
+        else:
+            raise ValueError(f"Unsupported node type: {node_type}")
+
+    def run_standalone_node(self, node_type: str, input_data: BaseInput, need_confirm: bool = True) -> any:
+        """Run a node standalone without workflow dependency."""
+        try:
+            # Show input confirmation if needed
+            if need_confirm:
+                self.console.print(f"\n[bold blue]About to run {node_type} node with input:[/]")
+                self.console.print(dict_to_tree(input_data.to_dict()))
+
+                if not Confirm.ask("Continue with this configuration?", default=True):
+                    print_warning(self.console, "Operation cancelled")
+                    return None
+
+            # Create node instance
+            node = Node.new_instance(
+                node_id=f"standalone_{node_type}",
+                description=f"Standalone {node_type} node",
+                node_type=node_type,
+                agent_config=self.cli.agent_config,
+                input_data=input_data,
+            )
+
+            # Run the node
+            self.console.print(f"[dim]Running {node_type} node...[/]")
+            result = asyncio.run(node.run_async())
+
+            return result
+
+        except Exception as e:
+            print_error(self.console, f"running {node_type} node: {str(e)}")
+            logger.error(f"Error in standalone node execution: {e}")
+            return None
+
+    def cmd_darun_screen(self, args: str, task: SqlTask = None):
+        """Run a natural language query through the agent."""
+        try:
+            import threading
+            import time
+
+            from pico.cli.screen import show_workflow_screen
+
+            # create a new sql task
+            sql_task = task or self._gen_sql_task(args)
+            if not sql_task:
+                return
+
+            # Reset previous runner/thread state
+            if self.agent_thread:
+                self.agent_thread.join(timeout=1)
+                if self.agent_thread.is_alive():
+                    print_warning(self.console, "Previous Agent thread is still running, attempting to terminate...")
+                    self.agent_thread._stop()
+                self.agent_thread = None
+
+            if not self.cli.check_agent_available():
+                print_error(self.console, "Agent not available")
+                return
+            runner = self.cli.workflow_runner
+
+            agent_done = threading.Event()
+            self.darun_is_running = True
+            result_holder: Dict[str, Any] = {"result": None}
+
+            def run_agent(sql_task):
+                # nonlocal result, error
+                try:
+                    result_holder["result"] = runner.run(sql_task)
+                except Exception as e:
+                    logger.error(f"Agent query error: {str(e)}")
+                finally:
+                    agent_done.set()
+
+            thread = threading.Thread(target=run_agent, kwargs={"sql_task": sql_task})
+            thread.daemon = True
+            thread.start()
+            self.agent_thread = thread
+
+            while not runner.workflow_ready:
+                if agent_done.is_set():
+                    break
+                self.console.print("[bold yellow]Waiting for workflow to be initialized...[/]")
+                time.sleep(1)
+
+            if not runner.workflow_ready or not runner.workflow:
+                print_error(self.console, "Failed to initialize workflow", prefix=False)
+                self.darun_is_running = False
+                return
+
+            # Store the new workflow
+
+            show_workflow_screen(runner.workflow, run_new_loop=False)
+
+            # If agent is still running, leave it and
+
+            if agent_done.is_set():
+                self.darun_is_running = False
+                if runner.is_complete():
+                    print_success(self.console, "Query Result:")
+                    final_result = result_holder["result"] or runner.workflow.get_final_result()
+                    self.console.print(final_result)
+                else:
+                    print_error(self.console, f"Query is not complete: {runner.workflow.status}", prefix=False)
+            else:
+                self.console.print("[bold yellow]Agent is still running...[/]")
+                # thread.join()
+                self.darun_is_running = False
+
+        except Exception as e:
+            logger.error(f"Agent query error: {str(e)}")
+            print_error(self.console, str(e))
+
+    def _gen_sql_task(self, args: str, use_existing: bool = True):
+        """Generate a SQL task from the user input, optionally reusing existing task."""
+        try:
+            # Check if we can reuse existing task
+            if use_existing and self.cli_context.current_sql_task and not args.strip():
+                return self.cli_context.current_sql_task
+
+            # 1. Create SQL Task with user input
+            self.console.print("[bold blue]Creating a new SQL task[/]")
+
+            # Generate a unique ID for the task
+            task_id = str(uuid.uuid1())[:8]
+
+            # Get database type from connector
+            database_type = self.cli.db_connector.get_type() if self.cli.db_connector else DBType.SQLITE
+
+            # Task description - required input from user
+            if args.strip():
+                task_description = args
+                # Use current_db_name from CLI context
+                database_name = self.cli_context.current_db_name or self.cli.args.db_path
+                output_dir = self.cli.agent_config.output_dir
+                current_date = ""
+            else:  # If no input, use a prompt to get the task info
+                task_id = self.cli.prompt_input("Enter task ID", default=task_id)
+
+                # Use existing task description as default if available
+                default_task = self.cli_context.current_sql_task.task if self.cli_context.current_sql_task else ""
+                task_description = self.cli.prompt_input("Enter task description", default=default_task)
+                if not task_description.strip():
+                    print_error(self.console, "Task description is required")
+                    return
+
+                # Database name - use CLI context as default
+                default_db = (
+                    self.cli_context.current_db_name
+                    or (self.cli.args.db_path if hasattr(self.cli.args, "db_path") else "")
+                    or ""
+                )
+                database_name = self.cli.prompt_input("Enter database name", default=default_db)
+                if not database_name.strip():
+                    print_error(self.console, "Database name is required")
+                    return
+
+                # Output directory - use agent config
+                output_dir = self.cli.agent_config.output_dir
+
+                # Current date - optional input for relative time expressions
+                current_date = self.cli.prompt_input("Enter current date (optional, e.g., '2025-07-01')", default="")
+
+            # Create the SQL task
+            sql_task = SqlTask(
+                id=task_id,
+                database_type=database_type,
+                task=task_description,
+                database_name=database_name,
+                output_dir=output_dir,
+                current_date=current_date if current_date.strip() else None,
+            )
+
+            # Store in CLI context
+            self.cli_context.set_current_sql_task(sql_task)
+
+            print_success(self.console, f"SQL Task created: {task_id}")
+            self.console.print(f"[dim]Database: {database_type} - {database_name}[/]")
+            return sql_task
+        except Exception as e:
+            logger.error(f"Failed to create SQL task: {str(e)}")
+            print_error(self.console, str(e))
+            return None
+
+    def cmd_dastart(self, args: str = ""):
+        """Start a new agent session with interactive SQL task creation."""
+        try:
+            # 1. Generate SQL task
+            sql_task = self._gen_sql_task(args)
+            if not sql_task:
+                return
+
+            # 2. Initialize workflow (ToDO implement load_cp)
+            workflow = Workflow(name=sql_task.id, task=sql_task, agent_config=self.cli.agent_config)
+            workflow.add_node(
+                Node.new_instance(
+                    node_id="START",
+                    description="Start node",
+                    node_type="start",
+                    input_data=sql_task.id,
+                    agent_config=self.cli.agent_config,
+                    tools=workflow.tools,
+                )
+            )
+
+            if not workflow:
+                print_error(self.console, "Failed to create workflow")
+                return
+
+            # 3. Setup basic context
+            workflow.task = sql_task
+            workflow.status = "running"
+
+            print_success(self.console, f"Started new agent session (ID: {sql_task.id})")
+            # self.console.print(f"[dim]Next node: {workflow.get_current_node().type}[/]")
+
+        except Exception as e:
+            logger.error(f"Failed to start agent session: {str(e)}")
+            print_error(self.console, str(e))
+
+    def cmd_save(self, args: str):
+        """
+        Command to save the last result to a file. Corresponds to !output/save
+        """
+        self.console.print("[bold blue]Save Output[/]")
+        last_sql = self.cli.cli_context.get_last_sql_context()
+        if not last_sql:
+            print_error(self.console, "No previous result to save.")
+            return
+
+        file_type = self.cli.prompt_input(
+            "Enter file type (json/csv/sql/all)", default="all", choices=["json", "csv", "sql", "all"]
+        )
+
+        default_save_dir = str(self.cli.agent_config.path_manager.save_dir)
+        target_dir = self.cli.prompt_input("Enter save directory (optional)", default=default_save_dir)
+        from datetime import datetime
+
+        file_name = self.cli.prompt_input("Enter file name(optional)", default=datetime.now().strftime("%Y%m%d%H%M%S"))
+        try:
+            with self.console.status("[green]Saving SQL...[/]"):
+                if not self.output_tool:
+                    self.output_tool = OutputTool(agent_config=self.cli.agent_config)
+                result = self.output_tool.execute(
+                    OutputInput(
+                        task="",
+                        database_name=self.cli.cli_context.current_db_name,
+                        task_id=file_name,
+                        gen_sql=last_sql.sql_query,
+                        sql_result=last_sql.sql_return or "",
+                        row_count=last_sql.row_count or 0,
+                        file_type=file_type,
+                        check_result=False,
+                        error=last_sql.sql_error,
+                        finished=not last_sql.sql_error,
+                        output_dir=target_dir,
+                    ),
+                    self.cli.db_connector,
+                )
+            print_success(self.console, f"SQL query saved to {result.output}")
+
+        except Exception as e:
+            print_error(self.console, f"saving file: {e}")
+
+    def _modify_input(self, input: BaseInput):
+        if isinstance(input, SchemaLinkingInput):
+            top_n = self.cli.prompt_input("Enter number of tables to link", default="5")
+            input.top_n = int(top_n.strip())
+            matching_rate = self.cli.prompt_input(
+                "Enter matching method",
+                choices=["fast", "medium", "slow", "from_llm"],
+                default="fast",
+            )
+            input.matching_rate = matching_rate.strip()
+            database_name = self.cli.prompt_input("Enter database name", default=input.database_name)
+            input.database_name = database_name.strip()
+        elif isinstance(input, ExecuteSQLInput):
+            pass
+        elif isinstance(input, OutputInput):
+            workflow = self.cli.workflow_runner.workflow
+            if workflow and workflow.context and workflow.context.sql_contexts:
+                self.console.print("[bold blue]SQL Contexts:[/]")
+                for i, sql_context in enumerate(workflow.context.sql_contexts):
+                    self.console.print(f"\n[bold]Context {i + 1}:[/]")
+                    self.console.print(sql_context.to_dict())
+
+                sql_context_id = self.cli.prompt_input(
+                    "Enter SQL context ID", default=str(len(workflow.context.sql_contexts))
+                )
+                try:
+                    context_id = int(sql_context_id.strip())
+                    if context_id < 1 or context_id > len(workflow.context.sql_contexts):
+                        print_error(self.console, "Invalid SQL context ID")
+                        return
+                    input.sql_result = workflow.context.sql_contexts[context_id - 1].sql_return
+                    input.row_count = workflow.context.sql_contexts[context_id - 1].row_count
+                except ValueError:
+                    print_error(self.console, "Invalid SQL context ID")
+                    return
+            else:
+                print_error(self.console, "No SQL context available")
+
+            # Interactive prompts for metadata (now using sql_task fields)
+            self.console.print("[bold blue]Semantic Model Metadata:[/]")
+            catalog_name = self.cli.prompt_input("Enter catalog name", default=input.sql_task.catalog_name)
+            input.sql_task.catalog_name = catalog_name.strip()
+
+            database_name = self.cli.prompt_input("Enter database name", default=input.sql_task.database_name)
+            input.sql_task.database_name = database_name.strip()
+
+            schema_name = self.cli.prompt_input("Enter schema name", default=input.sql_task.schema_name)
+            input.sql_task.schema_name = schema_name.strip()
+
+            # Subject path input
+            default_subject_path = "/".join(input.sql_task.subject_path) if input.sql_task.subject_path else ""
+            subject_path_str = self.cli.prompt_input(
+                message="Enter subject path (e.g., 'Finance/Revenue/Q1')", default=default_subject_path
+            )
+            if subject_path_str and subject_path_str.strip():
+                input.sql_task.subject_path = [c.strip() for c in subject_path_str.split("/") if c.strip()]
+            else:
+                input.sql_task.subject_path = None
+
+            prompt_version = self.cli.prompt_input("Enter prompt version", default=input.prompt_version)
+            input.prompt_version = prompt_version.strip() if prompt_version else prompt_version
+        elif isinstance(input, CompareInput):
+            # Allow user to modify expectation
+            if not input.expectation:
+                expectation = self.cli.prompt_input("Enter expectation (SQL query or expected data)", default="")
+                input.expectation = expectation.strip()
+
+    def cmd_fix(self, args: str):
+        """Fix the last SQL query."""
+        # Create input for fix node
+        input_data = self.create_node_input(NodeType.TYPE_FIX, args)
+        if not input_data:
+            return
+
+        # Run standalone node
+        result = self.run_standalone_node(NodeType.TYPE_FIX, input_data)
+
+        if result and result.success:
+            # Store fixed SQL in CLI context
+            if hasattr(result, "sql_contexts") and result.sql_contexts:
+                for sql_context in result.sql_contexts:
+                    self.cli_context.add_sql_context(sql_context)
+                    print_success(self.console, f"Fixed SQL: {sql_context.sql_query}")
+            else:
+                print_success(self.console, "SQL fix completed")
+        else:
+            print_error(self.console, "SQL fix failed", prefix=False)
+
+    def cmd_daend(self, args: str):
+        """End the current agent session."""
+        if self.cli.workflow_runner:
+            runner = self.cli.workflow_runner
+            output_file = f"{runner.workflow.task.output_dir}/{runner.workflow.name}.yaml"
+            runner.workflow.save(output_file)
+            print_success(self.console, f"Ending workflow session, save to {output_file}")
+        else:
+            print_warning(self.console, "No active workflow session to end.")
+
+    def run_node(self, node_type: str, node_args=None, need_confirm: bool = True):
+        """
+        Run a specific node type in the current workflow.
+
+        Args:
+            node_type: The type of node to run (e.g., "SCHEMA_LINKING", "GENERATE_SQL")
+            node_args: Optional arguments for the node
+
+        Returns:
+            Dict containing the result of the node execution
+        """
+        if not self.agent:
+            print_error(self.console, "Agent not available")
+            return {"success": False, "error": "Agent not available"}
+
+        if not self.cli.workflow_runner:
+            print_error(self.console, "No active workflow")
+            return {"success": False, "error": "No active workflow"}
+
+        try:
+            if not self.cli.workflow_runner.workflow_ready:
+                print_error(self.console, "Workflow not initialized")
+                return {"success": False, "error": "Workflow not initialized"}
+            workflow = self.cli.workflow_runner.workflow
+
+            # 1. Create a new node
+            node_id = f"{node_type.lower()}_{str(uuid.uuid1())[:8]}"
+            description = f"Execute {node_type} operation"
+            next_node = Node.new_instance(
+                node_id=node_id,
+                description=description,
+                node_type=node_type.lower(),
+                input_data=node_args,
+                agent_config=self.cli.agent_config,
+                tools=workflow.tools,
+            )
+
+            # 2. Setup input for the node
+            setup_result = setup_node_input(node=next_node, workflow=workflow)
+            workflow.add_node(next_node)
+
+            if not setup_result.get("success", False):
+                print_error(
+                    self.console,
+                    f"Failed to setup node input: {setup_result.get('message', 'Unknown error')}",
+                )
+                return {
+                    "success": False,
+                    "error": f"Failed to setup node input: {setup_result.get('message', 'Unknown error')}",
+                }
+
+            # Display node input for confirmation
+            self.console.print(f"[bold blue]Node Type:[/] {node_type}")
+            self.console.print("[bold blue]Node Input:[/]")
+            self.console.print(next_node.input)
+
+            # 3. Human confirmation
+            if need_confirm:
+                while True:
+                    choice = self.cli.prompt_input(
+                        "Do you want to execute this node? yes/no/edit",
+                        choices=["y", "n", "e"],
+                        default="y",
+                    )
+                    # modify the node input
+                    if choice == "e":
+                        self._modify_input(next_node.input)
+                        self.console.print("[bold blue]Modified Node Input:[/]")
+                        self.console.print(next_node.input)
+                    # execute the node
+                    elif choice == "y":
+                        break
+                    # cancel the node
+                    elif choice == "n":
+                        return
+
+            # 4. Run the node
+            print_success(self.console, f"Executing {node_type} node...")
+            next_node.run()
+            # Check if the node execution was successful
+            if next_node.status == "failed":
+                error_msg = "Unknown error"
+                if next_node.result and hasattr(next_node.result, "error") and next_node.result.error:
+                    error_msg = next_node.result.error
+                elif hasattr(next_node.result, "get") and next_node.result.get("error"):
+                    error_msg = next_node.result.get("error")
+                elif hasattr(next_node, "error") and next_node.error:
+                    error_msg = next_node.error
+                print_error(self.console, f"Node execution failed: {error_msg}")
+                return {"success": False, "error": f"Node execution failed: {error_msg}"}
+
+            # 5. Display the result
+            print_success(self.console, "Node Result:")
+
+            # Check if result is from a SQL-producing task for SQL syntax highlighting
+            if next_node.type in [NodeType.TYPE_GEN_SQL, NodeType.TYPE_FIX]:
+                # Get result dict and extract SQL query
+                result_dict = next_node.result.__dict__ if hasattr(next_node.result, "__dict__") else next_node.result
+                sql_query = result_dict.get("sql_query") or result_dict.get("sql")
+                # Display SQL separately without tree structure for easy copying
+                if sql_query:
+                    # Display title separately
+                    self.console.print("[green]📋 SQL Query[/]")
+
+                    # Display SQL without panel border
+                    sql_syntax = Syntax(sql_query, "sql", theme=CODE_THEME, line_numbers=False, word_wrap=True)
+                    self.console.print(sql_syntax)
+
+                    # Create a copy of result_dict without SQL for tree display
+                    other_info = {k: v for k, v in result_dict.items() if k not in {"sql_query", "sql"}}
+
+                    # Display other information in tree structure
+                    if other_info:
+                        result_tree = dict_to_tree(other_info, console=self.console)
+                        self.console.print(result_tree)
+                else:
+                    # Fallback to normal tree display
+                    logger.warning(f"normal result_dict: {result_dict}")
+                    result_tree = dict_to_tree(result_dict, console=self.console)
+                    self.console.print(result_tree)
+            else:
+                # Use normal print for results without sql_query
+                self.console.print(dict_to_tree(next_node.result.to_dict(), console=self.console))
+            logger.info(f"Node result: {next_node.result}")
+            workflow.advance_to_next_node()  # ToDo: this should be modified for status
+
+            # 6. Update workflow context
+            update_result = update_context_from_node(node=next_node, workflow=workflow)
+
+            if not update_result.get("success", False):
+                print_warning(
+                    self.console,
+                    f"Failed to update workflow context: {update_result.get('message', 'Unknown error')}",
+                )
+            else:
+                print_success(self.console, "Context updated successfully")
+
+            # Save relevant results to CLI history
+            if hasattr(next_node.result, "sql_query"):
+                self.cli.last_sql = next_node.result.sql_query
+
+            if hasattr(next_node.result, "sql_return"):
+                self.cli.last_result = next_node.result.sql_return
+
+            return {"success": True, "node": next_node, "result": next_node.result}
+
+        except Exception as e:
+            logger.error(f"Node execution error: {str(e)}")
+            print_error(self.console, str(e))
+            return {"success": False, "error": str(e)}
+
+    def cmd_compare(self, args: str):
+        """Compare SQL with expectations - interactive analysis."""
+        # Create input for compare node
+        input_data = self.create_node_input(NodeType.TYPE_COMPARE, args)
+        if not input_data:
+            return
+
+        # Run standalone node
+        result = self.run_standalone_node(NodeType.TYPE_COMPARE, input_data)
+
+        if result and result.success:
+            print_success(self.console, "SQL comparison completed")
+            # Display comparison result if available
+            if hasattr(result, "comparison_result") and result.comparison_result:
+                self.console.print(f"[blue]Comparison result:[/] {result.comparison_result}")
+        else:
+            print_error(self.console, "SQL comparison failed", prefix=False)
+
+    def cmd_compare_stream(self, args: str):
+        """Compare SQL with streaming output and action history."""
+        # For now, redirect to normal compare - streaming can be added later
+        self.cmd_compare(args)

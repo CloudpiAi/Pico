@@ -1,0 +1,33 @@
+"""API routes for direct tool dispatch."""
+
+from typing import Annotated, Dict, Optional
+
+from fastapi import APIRouter, Body, Path
+
+from pico.api.deps import ServiceDep, SubAgentDep
+from pico.api.models.base_models import Result
+from pico.tools.func_tool.base import FuncToolResult
+
+router = APIRouter(prefix="/api/v1/tools", tags=["tools"])
+
+
+@router.post(
+    "/{tool_name}",
+    response_model=Result[FuncToolResult],
+    summary="Execute Tool",
+    description="Execute a tool by name with parameters passed in the request body.",
+)
+def execute_tool(
+    tool_name: Annotated[str, Path(description="Name of the tool to execute")],
+    svc: ServiceDep,
+    sub_agent: SubAgentDep,
+    params: Annotated[Optional[Dict], Body()] = None,
+) -> Result[FuncToolResult]:
+    """Execute a tool by name, scoped to the request's sub-agent if it has one.
+
+    ``SubAgentDep`` has already rejected a name that matches no configured
+    sub-agent, so this only ever sees a real scope or ``None``.
+    """
+    if params is None:
+        params = {}
+    return svc.tool_for(sub_agent).execute(tool_name, params)

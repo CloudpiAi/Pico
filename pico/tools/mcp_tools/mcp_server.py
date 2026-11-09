@@ -1,0 +1,109 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+from pathlib import Path
+
+from agents.mcp import MCPServerStdio, MCPServerStdioParams
+
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+class SilentMCPServerStdio(MCPServerStdio):
+    """MCP server wrapper that redirects stderr to suppress logs.
+
+    Uses shell wrapping with explicit environment variable passing to ensure:
+    1. stderr is redirected to /dev/null (suppresses all console output)
+    2. Environment variables are correctly passed to the subprocess
+    """
+
+    def __init__(self, params: MCPServerStdioParams, **kwargs):
+        # Get command, args, and env
+        if hasattr(params, "command"):
+            original_command = params.command
+            original_args = params.args or []
+            env = params.env or {}
+        else:
+            original_command = params["command"]
+            original_args = params["args"] or []
+            env = params.get("env") or {}
+
+        import shlex
+        import sys
+
+        if sys.platform == "win32":
+            # Windows: Use cmd with stderr redirection
+            redirect_cmd = "cmd"
+            # Pico patch P8: with no env the prefix is empty and the line used to start with
+            # "&&", which cmd rejects, so a stdio server without env never started on Windows.
+            # Quoted so the value does not keep the space before "&&".
+            env_sets = [f'set "{k}={v}"' for k, v in env.items()]
+            args_str = " ".join(original_args)
+            command_line = f"{original_command} {args_str} 2>nul"
+            redirect_args = ["/c", " && ".join([*env_sets, command_line])]
+        else:
+            # Unix/Linux/macOS: Use sh with explicit env exports
+            redirect_cmd = "sh"
+
+            # Filter out shell-specific and system internal variables that cause issues
+            # Keep user-configured variables (API keys, DB credentials, etc.) and essential system variables
+            excluded_prefixes = (
+                "BASH_",
+                "ZSH_",
+                "_",
+                "__CF",
+                "COMMAND_MODE",
+                "SSH_CLIENT",
+                "SSH_CONNECTION",
+                "SSH_TTY",
+            )
+            excluded_vars = ("SHLVL", "SHELLOPTS", "PS1", "PS2", "PS3", "PS4", "OLDPWD")
+
+            filtered_env = {k: v for k, v in env.items() if not (k.startswith(excluded_prefixes) or k in excluded_vars)}
+
+            # Build environment variable exports
+            env_exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in filtered_env.items())
+
+            # Quote command and args properly
+            cmd_str = shlex.quote(original_command)
+            args_str = " ".join(shlex.quote(str(arg)) for arg in original_args)
+
+            # Combine: export vars, run command, redirect stderr
+            full_cmd = f"{env_exports} {cmd_str} {args_str} 2>/dev/null"
+            redirect_args = ["-c", full_cmd]
+
+        # Update params
+        if hasattr(params, "command"):
+            params.command = redirect_cmd
+            params.args = redirect_args
+            params.env = None  # Already included in the shell command
+        else:
+            params["command"] = redirect_cmd
+            params["args"] = redirect_args
+            params["env"] = None
+
+        super().__init__(params, **kwargs)
+
+
+def find_mcp_directory(mcp_name: str) -> str:
+    """Find the MCP directory, whether in development or installed package"""
+
+    relative_path = f"mcp/{mcp_name}"
+    if Path(relative_path).exists():
+        logger.info(f"Found MCP directory in development: {Path(relative_path).resolve()}")
+        return relative_path
+
+    import sys
+
+    for path in sys.path:
+        if "site-packages" in path:
+            datus_mcp_path = Path(path) / "mcp" / mcp_name
+            if datus_mcp_path.exists():
+                logger.info(f"Found MCP directory via sys.path: {datus_mcp_path}")
+                return str(datus_mcp_path)
+
+    raise FileNotFoundError(
+        f"MCP directory '{mcp_name}' not found in development mcp directory or installed pico-mcp package"
+    )

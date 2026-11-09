@@ -11,8 +11,7 @@ We welcome contributions in these areas:
 - **Deployment configs** — Better Docker Compose setups, Kubernetes manifests, or deployment patterns
 - **Bug reports** — Issues with setup, policies, or docs (open a GitHub issue)
 - **Feature ideas** — Suggestions for new capabilities (start with a GitHub discussion or issue)
-
-We do **not** accept changes to the agent source code in this repository — the agent runs inside the Docker image (`cloudpi1/cloudpi:*`), which has its own repository.
+- **Agent source code** — Fixes and improvements to the agent (`pico_finops_agent/`, `loader/`, `plugins/focus/`); for larger changes, and for changes to the Pico framework in `pico/`, open an issue first
 
 ## Before you start
 
@@ -44,6 +43,13 @@ If you're creating or updating policies in `policies/aws/`:
 5. **Update the setup guide** if the policy changes what customers must do
 
 Use the `/validate-iam-policy` Claude Code skill for a thorough review.
+
+### Agent source code changes
+
+1. **Add or update tests** — The agent's tests are in `tests/fork/`; see the README for how to run them
+2. **Run the tests** — All of `tests/fork` must pass
+3. **Build the image** — Run `docker compose build` if you changed the agent, the Dockerfile or the dependencies
+4. **Update the docs** — `.env.example` and the setup guide when a setting or a setup step changes
 
 ### Docker Compose or deployment config changes
 

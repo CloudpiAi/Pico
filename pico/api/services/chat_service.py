@@ -1,0 +1,363 @@
+"""
+Stateless chat service — thin proxy over ChatTaskManager.
+
+Each request assembles configuration and delegates to ChatTaskManager
+for the actual agentic loop execution. Session management methods
+read from disk each time (no in-memory state).
+"""
+
+import uuid
+from typing import Any, AsyncGenerator, Dict, List, Optional
+
+from pico.agent.node.chat_agentic_node import ChatAgenticNode
+from pico.api.models.base_models import Result
+from pico.api.models.cli_models import (
+    AtContextData,
+    ChatHistoryData,
+    ChatSessionData,
+    ChatSessionItemInfo,
+    CompactSessionData,
+    CompactSessionInput,
+    IMessageContent,
+    SSEErrorData,
+    SSEEvent,
+    SSEMessagePayload,
+    StreamChatInput,
+)
+from pico.api.services.action_sse_converter import action_to_sse_event
+from pico.api.services.chat_task_manager import (
+    _is_visible_assistant_response,
+    _remember_assistant_message,
+    _should_include_final_response,
+    _should_skip_duplicate_assistant_message,
+)
+from pico.configuration.agent_config import AgentConfig
+from pico.models.session_manager import SessionManager, session_matches_agent
+from pico.schemas.action_history import ActionRole, ActionStatus
+from pico.utils.config_utils import coerce_positive_int
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import get_logger
+from pico.utils.time_utils import now_utc_iso
+
+logger = get_logger(__name__)
+
+# Session-list pagination bounds. Overridable via the ``api`` section of
+# agent.yml (``api.default_session_page_size`` / ``api.max_session_page_size``),
+# mirroring ``api.max_prefetch_tables``. Both are finite so that the default
+# request path — clients that omit ``limit`` entirely — stays bounded.
+_DEFAULT_SESSION_PAGE_SIZE = 50
+_DEFAULT_MAX_SESSION_PAGE_SIZE = 200
+
+
+class ChatService:
+    """Thin service that delegates chat execution to ChatTaskManager.
+
+    Owned by DatusService. Session management methods read from disk.
+    """
+
+    def __init__(self, agent_config: AgentConfig, task_manager=None, project_id: Optional[str] = None) -> None:
+        self.agent_config = agent_config
+        self._task_manager = task_manager
+
+        # Session directory: {home}/sessions — must match agent's path_manager.sessions_dir
+        self._session_dir = self.agent_config.session_dir
+
+    # ------------------------------------------------------------------
+    # Streaming chat (thin proxy)
+    # ------------------------------------------------------------------
+
+    async def stream_chat(
+        self,
+        request: StreamChatInput,
+        sub_agent_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        policy_context: Optional[Dict[str, Any]] = None,
+    ) -> AsyncGenerator[SSEEvent, None]:
+        """Start a background chat task and yield SSE events."""
+        task_manager = self._task_manager
+        try:
+            task = await task_manager.start_chat(
+                self.agent_config,
+                request,
+                sub_agent_id=sub_agent_id,
+                user_id=user_id,
+                policy_context=policy_context,
+            )
+        except (ValueError, DatusException) as e:
+            error_code = e.code.name if isinstance(e, DatusException) else ErrorCode.COMMON_VALIDATION_FAILED.name
+            yield SSEEvent(
+                id=1,
+                event="error",
+                data=SSEErrorData(error=str(e), error_type=error_code, session_id=request.session_id),
+                timestamp=now_utc_iso(),
+            )
+            return
+        async for event in task_manager.consume_events(task):
+            yield event
+
+    # ------------------------------------------------------------------
+    # Session management (stateless — reads from disk each time)
+    # ------------------------------------------------------------------
+
+    def session_exists(self, session_id: str, user_id: Optional[str] = None) -> bool:
+        """Check if a session exists on disk."""
+        session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+        return session_mgr.session_exists(session_id)
+
+    def list_sessions(
+        self,
+        user_id: Optional[str] = None,
+        subagent_id: Optional[str] = None,
+        offset: int = 0,
+        limit: Optional[int] = None,
+    ) -> Result[ChatSessionData]:
+        """List chat sessions from disk, optionally filtered by agent.
+
+        When ``subagent_id`` is ``None`` every session for *user_id* is
+        returned. When set, only sessions whose id prefix encodes that agent
+        are returned; the sentinel ``"chat"`` selects the default chat agent
+        (including legacy prefix-less sessions).
+
+        ``offset``/``limit`` are applied *before* the per-session enrichment
+        below: only the requested page pays the per-file ``get_session_info``
+        cost (an individual sqlite open), so cost no longer scales with the
+        user's total lifetime session count. Ordering ids by file mtime here
+        (via ``sort_by_modified``, a cheap ``stat`` pass) is a proxy for the
+        final ``last_updated``-based sort applied to the enriched page below;
+        the two can disagree at page boundaries in rare cases, which is an
+        accepted tradeoff for avoiding an eager full-directory sqlite scan.
+
+        The page size is always finite. ``limit=None`` (the caller omitted it)
+        means "server default", not "unbounded" — otherwise the default request
+        path would still open every session file and re-trigger the very
+        timeouts pagination was added to prevent. An explicitly requested
+        ``limit`` is clamped down to ``api.max_session_page_size`` rather than
+        rejected, so an over-large page still returns a valid first page, and a
+        non-positive one falls back to the default; ``total_count`` reports the
+        unpaginated total for callers to page through. Both bounds come from
+        the ``api`` section of agent.yml.
+
+        Note that only the *sqlite enrichment* is page-bounded. Listing the
+        directory and stat-ing each file for the mtime sort still costs one
+        ``stat`` per session, so that pass scales with the total; it is orders
+        of magnitude cheaper than the per-file sqlite open it replaces.
+        """
+        try:
+            api_config = getattr(self.agent_config, "api_config", {}) or {}
+            max_page_size = coerce_positive_int(api_config.get("max_session_page_size"), _DEFAULT_MAX_SESSION_PAGE_SIZE)
+            default_page_size = min(
+                coerce_positive_int(api_config.get("default_session_page_size"), _DEFAULT_SESSION_PAGE_SIZE),
+                max_page_size,
+            )
+            # A non-positive ``limit`` is treated as unspecified rather than
+            # passed through: the route pins ``ge=1``, but a direct caller
+            # passing -1 would otherwise slice ``all_ids[offset:-1]`` and
+            # enrich nearly every session — the exact cost this bounds.
+            page_size = min(coerce_positive_int(limit, default_page_size), max_page_size)
+            # Likewise the route pins ``ge=0``; clamp again for non-HTTP callers,
+            # since a negative offset would silently slice from the tail.
+            offset = max(offset, 0)
+
+            session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+            all_ids = session_mgr.list_sessions(sort_by_modified=True)
+            if subagent_id is not None:
+                all_ids = [sid for sid in all_ids if session_matches_agent(sid, subagent_id)]
+
+            total_count = len(all_ids)
+            page_ids = all_ids[offset : offset + page_size]
+
+            sessions = []
+            for sid in page_ids:
+                try:
+                    info = session_mgr.get_session_info(sid)
+                    if not info.get("exists", False):
+                        continue
+                    created_at = info.get("created_at") or ""
+                    last_updated = info.get("updated_at") or info.get("file_modified_iso") or created_at
+                    sessions.append(
+                        ChatSessionItemInfo(
+                            user_query=info.get("first_user_message"),
+                            session_id=sid,
+                            created_at=created_at,
+                            last_updated=last_updated,
+                            total_turns=info.get("message_count", 0),
+                            token_count=info.get("total_tokens", 0),
+                            last_sql_queries=[],
+                            is_active=False,
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to read session {sid}: {e}")
+
+            sessions.sort(key=lambda x: x.last_updated or x.created_at, reverse=True)
+            return Result[ChatSessionData](
+                success=True,
+                data=ChatSessionData(
+                    sessions=sessions,
+                    total_count=total_count,
+                ),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to list sessions: {e}")
+            return Result[ChatSessionData](success=False, errorCode="SESSION_LIST_ERROR", errorMessage=str(e))
+
+    def delete_session(self, session_id: str, user_id: Optional[str] = None) -> Result[ChatSessionData]:
+        """Delete a session from disk."""
+        try:
+            session_mgr = SessionManager(session_dir=self._session_dir, scope=user_id)
+            if session_mgr.session_exists(session_id):
+                session_mgr.delete_session(session_id)
+
+            return Result[ChatSessionData](
+                success=True,
+                data=ChatSessionData(
+                    session_id=session_id,
+                    created_at="",
+                    last_updated=now_utc_iso(),
+                    total_turns=0,
+                    token_count=0,
+                    last_sql_queries=[],
+                    is_active=False,
+                ),
+            )
+        except Exception as e:
+            logger.error(f"Failed to delete session {session_id}: {e}")
+            return Result[ChatSessionData](success=False, errorCode="SESSION_DELETE_ERROR", errorMessage=str(e))
+
+    async def compact_session(
+        self, request: CompactSessionInput, user_id: Optional[str] = None
+    ) -> Result[CompactSessionData]:
+        """Compact a session by loading it into a temporary node and running compaction."""
+        session_id = request.session_id
+        try:
+            # Create a temporary ChatAgenticNode to load the session
+            node = ChatAgenticNode(
+                node_id=session_id,
+                description="Temporary node for compaction",
+                node_type="chat",
+                input_data=None,
+                agent_config=self.agent_config,
+                tools=None,
+                scope=user_id,
+                session_id=session_id,
+            )
+
+            # Load the existing SQLite session so _session is populated
+            node._get_or_create_session()
+
+            # The public ``compact`` API replaces the legacy ``_manual_compact``
+            # entrypoint. Pass ``mode="major"`` because the API surface is the
+            # equivalent of an explicit ``/compact`` invocation — it always
+            # wants the LLM summarization path, never the rule-based minor
+            # archive pass (which runs autonomously inside the agent loop).
+            result = await node.compact(mode="major", reason="api_request")
+
+            if not result.get("success", False):
+                return Result[CompactSessionData](
+                    success=True,
+                    data=CompactSessionData(session_id=session_id, success=False, error="Compact failed"),
+                )
+
+            return Result[CompactSessionData](
+                success=True,
+                data=CompactSessionData(session_id=session_id, success=True),
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to compact session {session_id}: {e}")
+            return Result[CompactSessionData](success=False, errorCode="SESSION_COMPACT_ERROR", errorMessage=str(e))
+
+    def get_history(self, session_id: str, user_id: Optional[str] = None) -> Result[ChatHistoryData]:
+        """Get chat history messages for a session."""
+        try:
+            # Use SessionManager to get messages from SQLite
+            session_manager = SessionManager(session_dir=self._session_dir, scope=user_id)
+            raw_messages = session_manager.get_session_messages(session_id)
+
+            if not raw_messages:
+                return Result[ChatHistoryData](success=True, data=ChatHistoryData())
+
+            sse_messages: List[SSEMessagePayload] = []
+            event_id = 0
+            logger.info(f"Retrieved {len(raw_messages)} messages for session {session_id}")
+
+            for idx, msg in enumerate(raw_messages):
+                role = msg.get("role", "")
+                if role == "user":
+                    content = msg.get("content", "")
+                    if content:
+                        at_ctx_raw = msg.get("at_context")
+                        at_context = None
+                        if isinstance(at_ctx_raw, dict):
+                            at_context = AtContextData(
+                                table_paths=at_ctx_raw.get("table_paths") or [],
+                                metric_paths=at_ctx_raw.get("metric_paths") or [],
+                                sql_paths=at_ctx_raw.get("sql_paths") or [],
+                                knowledge_paths=at_ctx_raw.get("knowledge_paths") or [],
+                            )
+                        # A manual-execution record renders as readable Markdown
+                        # so the raw sentinel never reaches web clients.
+                        from pico.cli.manual_exec import exec_to_markdown
+
+                        content = exec_to_markdown(content)
+                        sse_messages.append(
+                            SSEMessagePayload(
+                                message_id=str(uuid.uuid4()),
+                                role="user",
+                                content=[IMessageContent(type="markdown", payload={"content": content})],
+                                at_context=at_context,
+                            )
+                        )
+                        event_id += 1
+                elif role == "assistant":
+                    if "actions" in msg:
+                        messages = msg["actions"]
+                        assistant_response_seen = False
+                        tool_result_seen = False
+                        # Maps fingerprint -> owning message_id; the helpers below
+                        # need the owner to tell a legitimate UPDATE from a repeat.
+                        seen_assistant_message_fingerprints: dict[str, str] = {}
+                        for action in messages:
+                            include_final_response = _should_include_final_response(action, assistant_response_seen)
+                            sse_event = action_to_sse_event(
+                                action,
+                                event_id,
+                                str(uuid.uuid4()),
+                                include_user_message=True,
+                                include_final_response=include_final_response,
+                            )
+                            if sse_event:
+                                if _should_skip_duplicate_assistant_message(
+                                    action,
+                                    sse_event,
+                                    seen_assistant_message_fingerprints,
+                                ):
+                                    continue
+                                sse_messages.append(sse_event.data.payload)
+                                event_id += 1
+                                _remember_assistant_message(sse_event, seen_assistant_message_fingerprints)
+                                if _is_visible_assistant_response(action, sse_event, tool_result_seen=tool_result_seen):
+                                    assistant_response_seen = True
+                                if action.role == ActionRole.TOOL and action.status != ActionStatus.PROCESSING:
+                                    tool_result_seen = True
+                    elif msg.get("content"):
+                        sse_messages.append(
+                            SSEMessagePayload(
+                                message_id=str(uuid.uuid4()),
+                                role="assistant",
+                                content=[IMessageContent(type="markdown", payload={"content": msg["content"]})],
+                            )
+                        )
+                        event_id += 1
+
+            logger.info(f"Retrieved {len(sse_messages)} messages for session {session_id}")
+            return Result[ChatHistoryData](success=True, data=ChatHistoryData(messages=sse_messages))
+
+        except Exception as e:
+            logger.error(f"Failed to get history for session {session_id}: {e}")
+            return Result[ChatHistoryData](
+                success=False,
+                errorCode="SESSION_HISTORY_ERROR",
+                errorMessage=f"Failed to get session history: {str(e)}",
+            )

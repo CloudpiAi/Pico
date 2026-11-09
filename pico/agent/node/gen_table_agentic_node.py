@@ -1,0 +1,62 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+GenTableAgenticNode implementation for wide table generation.
+
+This node creates database tables via CTAS (from JOIN SQL) or CREATE TABLE
+(from natural-language descriptions). Most of the plumbing lives in the
+shared :class:`DeliverableAgenticNode` base; this subclass only declares the
+tool set (the unified ``execute_sql`` tool via the standard DB tools) and the
+permission profile category map.
+"""
+
+from typing import ClassVar, Optional
+
+from pico.agent.node.deliverable_node import DeliverableAgenticNode
+from pico.configuration.node_type import NodeType
+from pico.tools.func_tool import DBFuncTool
+from pico.utils.exceptions import DatusException, ErrorCode
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+class GenTableAgenticNode(DeliverableAgenticNode):
+    """Wide table generation subagent.
+
+    Registers the standard DB tools, including the unified ``execute_sql`` tool
+    so the LLM can CREATE TABLE / CTAS. Post-write validation is driven by
+    :class:`ValidationHook` in the base class.
+    """
+
+    NODE_NAME: ClassVar[str] = "gen_table"
+    NODE_TYPE: ClassVar[str] = NodeType.TYPE_GEN_TABLE
+    DEFAULT_SKILLS: ClassVar[Optional[str]] = "gen-table"
+    PROMPT_TEMPLATE: ClassVar[str] = "gen_table_system"
+    ACTION_TYPE: ClassVar[str] = "gen_table_response"
+    DEFAULT_MAX_TURNS: ClassVar[int] = 50
+
+    def _setup_domain_tools(self) -> None:
+        """Standard DB tools, including the unified ``execute_sql`` tool. No transfer.
+
+        Statement-type permission gating (read auto-allow, write/DDL ask) is
+        handled by ``PermissionHooks._handle_sql_permission``.
+        """
+        try:
+            self.db_func_tool = DBFuncTool(
+                # Same anchor the filesystem tools use, so a path the model got
+                # from glob resolves identically in load_file_as_table.
+                filesystem_root=self._resolve_workspace_root(),
+                agent_config=self.agent_config,
+                sub_agent_name=self._configured_node_name,
+            )
+            self.tools.extend(self.db_func_tool.available_tools())
+            logger.debug("Added database tools (execute_sql) from DBFuncTool")
+        except Exception as e:
+            logger.exception("Failed to setup database tools")
+            raise DatusException(
+                code=ErrorCode.COMMON_CONFIG_ERROR,
+                message_args={"config_error": f"Failed to setup database tools for {self.NODE_NAME}: {e}"},
+            ) from e

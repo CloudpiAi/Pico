@@ -1,0 +1,887 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""Shared base for the two visual-artifact subagents.
+
+``GenVisualReportAgenticNode`` (pre-baked JSON results, optional CLI HTML
+compile) and ``GenVisualDashboardAgenticNode`` (Jinja2 SQL templates,
+live runtime queries) share roughly 75 % of their code: tool setup,
+prompt rendering, the LLM streaming loop, the result-action wiring, and
+the post-run validation extraction. This module hosts the common
+machinery so each concrete node only needs to declare:
+
+* the artifact kind / directory / id regex (``ARTIFACT_*`` class vars),
+* the filesystem-tool subclass that enforces artifact write protection,
+* the artifact tools subclass that exposes ``start_new_*`` / ``save_*`` /
+  ``validate_render``,
+* the per-tool-call ``save_query[_template]`` action type that counts as
+  a "query saved",
+* the fallback prompt template name,
+* the result :class:`pydantic.BaseModel` (``GenVisual*NodeResult``),
+* (optionally) a post-validate hook — used by the report node to compile
+  a standalone HTML and open it in the user's browser; dashboard mode
+  doesn't have an equivalent path.
+
+Anything that's *byte-identical* between the two node files lives here.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import uuid
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, AsyncGenerator, ClassVar, Dict, Generic, List, Literal, Optional, Type, TypeVar
+
+from pydantic import BaseModel
+
+from pico.agent.node.agentic_node import AgenticNode
+from pico.agent.node.visual_artifact._visual_artifact_finalize import (
+    finalize_stage_text,
+    narrative_outputs_present,
+    run_finalize_analysis,
+)
+from pico.configuration.agent_config import AgentConfig
+from pico.schemas.action_history import ActionHistory, ActionRole, ActionStatus
+from pico.utils.language_utils import build_fallback_directive
+
+if TYPE_CHECKING:
+    from pico.agent.node.stream_run_context import StreamRunContext
+from pico.tools.func_tool import ContextSearchTools, DBFuncTool, FilesystemFuncTool
+from pico.tools.func_tool._visual_artifact_helpers import (
+    extract_artifact_result_field,
+    extract_artifact_result_list,
+)
+from pico.tools.func_tool.semantic_tools import SemanticTools
+from pico.utils.loggings import get_logger
+
+logger = get_logger(__name__)
+
+
+# Generic over the concrete pydantic input/result models so subclasses
+# can type-narrow without bypassing the base contract.
+InputT = TypeVar("InputT", bound=BaseModel)
+ResultT = TypeVar("ResultT", bound=BaseModel)
+
+
+class BaseVisualArtifactAgenticNode(AgenticNode, Generic[InputT, ResultT]):
+    """Common framework for visual-artifact subagents (report / dashboard).
+
+    Subclasses declare the artifact-specific class variables below, plus
+    a small set of hook methods that customize the parts that genuinely
+    differ between report and dashboard mode.
+    """
+
+    # ── Artifact-specific class variables (subclass MUST override) ─────────
+
+    #: ``"report"`` | ``"dashboard"`` — used for error messages and the
+    #: fallback prompt-context key (``report_slug`` / ``dashboard_slug``).
+    ARTIFACT_KIND: ClassVar[str] = ""
+
+    #: Top-level workspace directory, e.g. ``"reports"`` or ``"dashboards"``.
+    ARTIFACT_ROOT_DIR_NAME: ClassVar[str] = ""
+
+    #: Concrete :class:`FilesystemFuncTool` subclass (e.g.
+    #: ``ReportFilesystemFuncTool``) that locks out direct writes to
+    #: protected artifact paths.
+    FILESYSTEM_TOOL_CLS: ClassVar[Type[FilesystemFuncTool]] = FilesystemFuncTool
+
+    #: ``"save_query"`` or ``"save_query_template"`` — the action type
+    #: that ``execute_stream`` counts to populate the result's
+    #: ``query_count`` / ``template_count`` field.
+    QUERY_SAVE_ACTION_TYPE: ClassVar[str] = ""
+
+    #: Template name used as the fallback when the prompt registry can't
+    #: find ``<node_name>_system`` (e.g. when a custom subagent renames
+    #: the node but didn't ship a template).
+    FALLBACK_TEMPLATE_NAME: ClassVar[str] = ""
+
+    #: Default tools when ``agent.yml`` doesn't override ``tools:``.
+    #: ``context_search_tools.*`` expands at setup-time into whichever search
+    #: helpers the active project actually supports — ``list_subject_tree`` is
+    #: always present, while ``search_metrics`` / ``get_metrics`` /
+    #: ``search_reference_sql`` / etc. only surface when the corresponding
+    #: store has indexed content. Without the wildcard, the prompt advertises
+    #: metric-discovery tools the LLM can't actually call, so the model
+    #: silently falls back to deriving SQL from raw table DDL.
+    DEFAULT_TOOLS: ClassVar[str] = "semantic_tools.*, db_tools.*, context_search_tools.*"
+
+    #: No sub-agent delegation. The visual-artifact nodes own the full semantic
+    #: layer (``list_metrics`` / ``query_metrics``) plus db + context-search
+    #: tools, so there is nothing to gain from delegating. Crucially, ``explore``
+    #: (the base ``AgenticNode`` default) lacks the semantic-layer tools, so a
+    #: ``task(type="explore")`` metric-discovery detour silently degrades into
+    #: raw-table exploration — exactly the metrics-first regression we want to
+    #: prevent. Disabling the ``task`` tool here keeps metric derivation in-node.
+    DEFAULT_SUBAGENTS: ClassVar[str] = ""
+
+    # ── Construction ──────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        node_id: str,
+        description: str,
+        node_type: str,
+        input_data: Optional[InputT] = None,
+        agent_config: Optional[AgentConfig] = None,
+        tools: Optional[list] = None,
+        node_name: Optional[str] = None,
+        execution_mode: Literal["interactive", "workflow"] = "interactive",
+        scope: Optional[str] = None,
+        is_subagent: bool = False,
+        session_id: Optional[str] = None,
+    ):
+        self.execution_mode = execution_mode
+        self.configured_node_name = node_name
+
+        self.max_turns = 80
+        if agent_config and hasattr(agent_config, "agentic_nodes") and node_name in agent_config.agentic_nodes:
+            cfg = agent_config.agentic_nodes[node_name]
+            if isinstance(cfg, dict):
+                self.max_turns = cfg.get("max_turns", 80)
+
+        # Tool attributes must exist before the parent constructor calls
+        # ``_get_system_prompt`` indirectly via skill setup.
+        self.db_func_tool: Optional[DBFuncTool] = None
+        self.semantic_tools: Optional[SemanticTools] = None
+        self.context_search_tools: Optional[ContextSearchTools] = None
+        self.filesystem_func_tool: Optional[FilesystemFuncTool] = None
+        # ``artifact_tools`` is the bag of artifact-specific tools (e.g.
+        # ``ReportArtifactTools`` / ``DashboardArtifactTools``); the
+        # subclass instantiates it in ``_make_artifact_tools``.
+        self.artifact_tools: Optional[Any] = None
+        self._active_artifact_slug: Optional[str] = None
+        # Captures the root cause when ``_setup_db_tools`` fails so
+        # ``_prepare_artifacts`` can surface it instead of the generic
+        # "db_tools not configured" message.
+        self._db_tool_setup_error: Optional[BaseException] = None
+
+        super().__init__(
+            node_id=node_id,
+            description=description,
+            node_type=node_type,
+            input_data=input_data,
+            agent_config=agent_config,
+            tools=tools or [],
+            mcp_servers={},
+            scope=scope,
+            is_subagent=is_subagent,
+            session_id=session_id,
+        )
+
+        self.setup_tools()
+
+        if self.execution_mode == "interactive":
+            self._setup_ask_user_tool()
+
+        logger.debug(
+            "%s tools: %d - %s",
+            type(self).__name__,
+            len(self.tools),
+            [t.name for t in self.tools],
+        )
+
+    # ── Tool setup ────────────────────────────────────────────────────────
+
+    def setup_tools(self) -> None:
+        if not self.agent_config:
+            return
+
+        self.tools = []
+        config_value = self.node_config.get("tools") or self.DEFAULT_TOOLS
+        for pattern in (p.strip() for p in config_value.split(",") if p.strip()):
+            self._setup_tool_pattern(pattern)
+
+        # Always provide the hardened filesystem tool — the node needs it
+        # for authoring render/*.jsx (write_file / edit_file / delete_file)
+        # and for general exploration.
+        if not self.filesystem_func_tool:
+            self._setup_filesystem_tools()
+
+        self._setup_sub_agent_task_tool()
+        if self.sub_agent_task_tool:
+            self.tools.extend(self.sub_agent_task_tool.available_tools())
+
+        logger.info("setup_tools done: %d tools - %s", len(self.tools), [t.name for t in self.tools])
+
+    def _make_filesystem_tool(self, **kwargs):  # type: ignore[override]
+        """Swap in the artifact-specific filesystem tool class.
+
+        Identical resolution rules to :meth:`AgenticNode._make_filesystem_tool`,
+        but constructs ``self.FILESYSTEM_TOOL_CLS`` so write-protection
+        for the artifact directory is in effect.
+        """
+        root_path = kwargs.pop("root_path", None) or self._resolve_workspace_root()
+        datus_home = kwargs.pop("datus_home", None)
+        if datus_home is None and self.agent_config is not None:
+            path_manager = getattr(self.agent_config, "path_manager", None)
+            if path_manager is not None:
+                try:
+                    datus_home = str(path_manager.datus_home)
+                except Exception:
+                    datus_home = None
+        strict = kwargs.pop("strict", None)
+        if strict is None:
+            strict = self._resolve_filesystem_strict()
+        current_node = kwargs.pop("current_node", None) or self.get_node_name()
+        return self.FILESYSTEM_TOOL_CLS(
+            root_path=root_path,
+            current_node=current_node,
+            datus_home=datus_home,
+            strict=strict,
+            **kwargs,
+        )
+
+    def _setup_tool_pattern(self, pattern: str) -> None:
+        try:
+            if pattern.endswith(".*"):
+                base = pattern[:-2]
+                if base == "semantic_tools":
+                    self._setup_semantic_tools()
+                elif base == "db_tools":
+                    self._setup_db_tools()
+                elif base == "context_search_tools":
+                    self._setup_context_search_tools()
+                elif base == "filesystem_tools":
+                    self._setup_filesystem_tools()
+                else:
+                    logger.warning("Unknown tool type: %s", base)
+                return
+
+            if pattern == "semantic_tools":
+                self._setup_semantic_tools()
+            elif pattern == "db_tools":
+                self._setup_db_tools()
+            elif pattern == "context_search_tools":
+                self._setup_context_search_tools()
+            elif pattern == "filesystem_tools":
+                self._setup_filesystem_tools()
+            elif "." in pattern:
+                tool_type, method_name = pattern.split(".", 1)
+                self._setup_specific_tool_method(tool_type, method_name)
+            else:
+                logger.warning("Unknown tool pattern: %s", pattern)
+        except Exception as exc:
+            logger.error("Failed to setup tool pattern %r: %s", pattern, exc)
+
+    def _setup_db_tools(self) -> None:
+        try:
+            self.db_func_tool = DBFuncTool(
+                # Same anchor the filesystem tools use, so a path the model got
+                # from glob resolves identically in load_file_as_table.
+                filesystem_root=self._resolve_workspace_root(),
+                agent_config=self.agent_config,
+                sub_agent_name=self.node_config.get("system_prompt"),
+            )
+            self.tools.extend(self.db_func_tool.available_tools())
+        except Exception as exc:
+            logger.error("Failed to setup db tools: %s", exc, exc_info=True)
+            self._db_tool_setup_error = exc
+
+    def _setup_semantic_tools(self) -> None:
+        try:
+            from pico.agent.node.semantic_authoring import resolve_semantic_adapter_type
+
+            adapter_type = resolve_semantic_adapter_type(self.agent_config)
+            self.semantic_tools = SemanticTools(
+                agent_config=self.agent_config,
+                sub_agent_name=self.node_config.get("system_prompt"),
+                adapter_type=adapter_type,
+                runtime_db_context_provider=self._semantic_runtime_db_context,
+            )
+            self.tools.extend(self.semantic_tools.available_tools())
+        except Exception as exc:
+            logger.error("Failed to setup semantic tools: %s", exc)
+
+    def _setup_context_search_tools(self) -> None:
+        try:
+            self.context_search_tools = ContextSearchTools(
+                self.agent_config, sub_agent_name=self.node_config.get("system_prompt")
+            )
+            self.tools.extend(self.context_search_tools.available_tools())
+        except Exception as exc:
+            logger.error("Failed to setup context search tools: %s", exc)
+
+    def _setup_filesystem_tools(self) -> None:
+        try:
+            self.filesystem_func_tool = self._make_filesystem_tool()
+            self.tools.extend(self.filesystem_func_tool.available_tools())
+        except Exception as exc:
+            logger.error("Failed to setup filesystem tools: %s", exc)
+
+    def _setup_specific_tool_method(self, tool_type: str, method_name: str) -> None:
+        try:
+            if tool_type == "semantic_tools":
+                if not self.semantic_tools:
+                    from pico.agent.node.semantic_authoring import resolve_semantic_adapter_type
+
+                    self.semantic_tools = SemanticTools(
+                        agent_config=self.agent_config,
+                        sub_agent_name=self.node_config.get("system_prompt"),
+                        adapter_type=resolve_semantic_adapter_type(self.agent_config),
+                        runtime_db_context_provider=self._semantic_runtime_db_context,
+                    )
+                tool_instance = self.semantic_tools
+            elif tool_type == "db_tools":
+                if not self.db_func_tool:
+                    self.db_func_tool = DBFuncTool(
+                        # Same anchor the filesystem tools use, so a path the model got
+                        # from glob resolves identically in load_file_as_table.
+                        filesystem_root=self._resolve_workspace_root(),
+                        agent_config=self.agent_config,
+                        sub_agent_name=self.node_config.get("system_prompt"),
+                    )
+                tool_instance = self.db_func_tool
+            elif tool_type == "context_search_tools":
+                if not self.context_search_tools:
+                    self.context_search_tools = ContextSearchTools(
+                        self.agent_config, sub_agent_name=self.node_config.get("system_prompt")
+                    )
+                tool_instance = self.context_search_tools
+            elif tool_type == "filesystem_tools":
+                if not self.filesystem_func_tool:
+                    self.filesystem_func_tool = self._make_filesystem_tool()
+                tool_instance = self.filesystem_func_tool
+            else:
+                logger.warning("Unknown tool type: %s", tool_type)
+                return
+
+            if hasattr(tool_instance, method_name):
+                from pico.tools.func_tool import trans_to_function_tool
+
+                self.tools.append(trans_to_function_tool(getattr(tool_instance, method_name)))
+            else:
+                logger.warning("Method %r not found in %s", method_name, tool_type)
+        except Exception as exc:
+            logger.error("Failed to setup %s.%s: %s", tool_type, method_name, exc)
+
+    # ── Prompt + message wiring ───────────────────────────────────────────
+
+    def _artifact_slug_prompt_key(self) -> str:
+        """Prompt-context key for the active artifact slug.
+
+        Default: ``"<kind>_slug"`` (i.e. ``report_slug`` or
+        ``dashboard_slug``) — matches what the system prompt templates
+        expect.
+        """
+        return f"{self.ARTIFACT_KIND}_slug"
+
+    def _get_system_prompt(
+        self,
+        prompt_version: Optional[str] = None,
+    ) -> str:
+        context: Dict[str, Any] = {
+            "has_semantic_tools": bool(self.semantic_tools),
+            "has_db_tools": bool(self.db_func_tool),
+            "has_context_search_tools": bool(self.context_search_tools),
+            "has_ask_user_tool": self.ask_user_tool is not None,
+            "has_task_tool": bool(self.sub_agent_task_tool),
+            "agent_config": self.agent_config,
+            self._artifact_slug_prompt_key(): self._active_artifact_slug,
+            "rules": self.node_config.get("rules", []),
+            "agent_description": self.node_config.get("agent_description", ""),
+        }
+
+        if self.agent_config:
+            from pico.utils.node_utils import build_datasource_prompt_context
+
+            context.update(build_datasource_prompt_context(self.agent_config))
+            context["db_name"] = context.get("datasource")
+
+        version = None if prompt_version in (None, "") else str(prompt_version)
+        system_prompt_name = self.node_config.get("system_prompt") or self.get_node_name()
+        template_name = f"{system_prompt_name}_system"
+
+        from pico.prompts.prompt_manager import get_prompt_manager
+
+        pm = get_prompt_manager(agent_config=self.agent_config)
+        try:
+            base_prompt = pm.render_template(template_name=template_name, version=version, **context)
+        except FileNotFoundError:
+            logger.warning(
+                "Template %r missing, falling back to %s",
+                system_prompt_name,
+                self.FALLBACK_TEMPLATE_NAME,
+            )
+            base_prompt = pm.render_template(template_name=self.FALLBACK_TEMPLATE_NAME, version=version, **context)
+
+        return self._finalize_system_prompt(base_prompt)
+
+    def _build_enhanced_message(self, user_input: InputT) -> str:
+        """Enrich the user message with catalog/db/schema + @-referenced context.
+
+        Visual-artifact nodes keep a focused override (they don't run the base
+        plan-mode flow); @Table/@Metric/@Sql/@Knowledge references are rendered
+        through the shared :meth:`AgenticNode._render_at_context_parts`.
+        """
+        from pico.utils.message_utils import build_structured_content
+
+        parts: List[str] = []
+        catalog = getattr(user_input, "catalog", None)
+        database = getattr(user_input, "database", None)
+        db_schema = getattr(user_input, "db_schema", None)
+        user_message = getattr(user_input, "user_message", "")
+
+        if catalog:
+            parts.append(f"Catalog: {catalog}")
+        if database:
+            parts.append(f"Database context: {database}")
+        if db_schema:
+            parts.append(f"Schema: {db_schema}")
+
+        parts.extend(self._render_at_context_parts(user_input))
+
+        if parts:
+            return build_structured_content("\n".join(parts), user_message)
+        return user_message
+
+    # ── Finalize stage ────────────────────────────────────────────────────
+
+    def _artifact_dir(self, artifact_slug: str) -> Path:
+        """Absolute on-disk directory for ``artifact_slug``."""
+        return Path(self.agent_config.project_root).resolve() / self.ARTIFACT_ROOT_DIR_NAME / artifact_slug
+
+    def _finalize_language_directive(self) -> Optional[str]:
+        """The configured response-language section, or ``None`` when unpinned.
+
+        finalize is an independent LLM call with no system prompt, so the
+        directive every agentic node gets injected has to travel into the
+        finalize prompt explicitly. Reuses the same rendered template rather
+        than a second copy of the wording.
+
+        ``_inject_response_language`` now falls back to a minimal directive of
+        its own on a render failure, so the branch below is belt-and-braces: an
+        empty return here would read as "no language pinned" and hand finalize
+        the infer-from-the-user's-prompts branch — wrong whenever the operator
+        pinned a language the user does not write in.
+        """
+        language_raw = getattr(self.agent_config, "language", None)
+        if not language_raw or not str(language_raw).strip():
+            return None
+        directive = self._inject_response_language("").strip()
+        if directive:
+            return directive
+        return build_fallback_directive(str(language_raw).strip())
+
+    def _run_finalize(
+        self,
+        artifact_slug: str,
+        actions: List[ActionHistory],
+        on_progress: Optional[Any] = None,
+        skip_narrative: bool = False,
+    ) -> Dict[str, Any]:
+        """Run the finalize analysis stage for the just-completed artifact.
+
+        Wraps :func:`run_finalize_analysis` so the orchestrator can stay
+        UI-agnostic (no node-specific paths in the helper module).
+        Failures are logged and returned as a dict; never re-raised.
+
+        ``on_progress`` is a callable ``int -> None`` invoked at each
+        stage boundary (1=insights LLM, 2=intent curation, 3=schema bake)
+        so the streaming hook can surface stage transitions to the user
+        without waiting for the artifact SSE event 10-15 s later.
+
+        ``skip_narrative`` skips the two LLM stages (insights /
+        suggested_questions + intent curation) for render-only edits where
+        the data is unchanged; the deterministic aggregations still run.
+        """
+        try:
+            artifact_dir = self._artifact_dir(artifact_slug)
+            queries_dir = artifact_dir / "queries"
+            analysis_dir = artifact_dir / "analysis"
+            return run_finalize_analysis(
+                model=self.model,
+                artifact_kind=self.ARTIFACT_KIND,
+                artifact_dir=artifact_dir,
+                queries_dir=queries_dir,
+                analysis_dir=analysis_dir,
+                actions=actions,
+                skip_narrative=skip_narrative,
+                language_directive=self._finalize_language_directive(),
+                # ``db_func_tool`` is wired by ``setup_tools`` early in
+                # the run. Passing it through enables the finalize-time
+                # ``key_tables_schema.json`` bake (describe_table snapshot
+                # per manifest.key_tables entry). The bake is best-effort
+                # so finalize still runs when this is None (e.g. node was
+                # configured without db tools — unusual but supported).
+                db_func_tool=self.db_func_tool,
+                on_progress=on_progress,
+            )
+        except Exception as exc:
+            logger.warning("Finalize stage crashed for %s/%s: %s", self.ARTIFACT_KIND, artifact_slug, exc)
+            return {"ok": False, "warnings": [], "error": f"finalize crashed: {exc}"}
+
+    # ── Artifact tools wiring ─────────────────────────────────────────────
+
+    def _make_artifact_tools(self, user_input: InputT) -> Any:
+        """Build the artifact-specific tools instance (subclass implements).
+
+        The tools instance must expose ``available_tools()`` returning the
+        list of bound function-tools to add to ``self.tools``; the active
+        artifact slug (after ``start_new_*`` / ``bind_existing_*``) must
+        live on an attribute the subclass knows how to read (it is fetched
+        via :meth:`_read_artifact_slug_from_tools`).
+
+        ``user_input`` is passed through so subclasses can forward the
+        raw ``user_message`` to the tools instance — the analysis-artifact
+        layer needs it verbatim to seed ``analysis/intent.md`` on
+        ``start_new_*`` / ``bind_existing_*``.
+        """
+        raise NotImplementedError
+
+    def _read_artifact_slug_from_tools(self) -> Optional[str]:
+        """Return the active artifact slug off the artifact tools instance.
+
+        Subclasses know the attribute name (``report_slug`` /
+        ``dashboard_slug``). Default looks for either, in priority order,
+        so a minimal subclass can rely on naming convention.
+        """
+        if self.artifact_tools is None:
+            return None
+        for attr in (f"{self.ARTIFACT_KIND}_slug", "artifact_slug"):
+            value = getattr(self.artifact_tools, attr, None)
+            if value:
+                return value
+        return None
+
+    def _read_artifact_manifest(self, artifact_slug: Optional[str]) -> Dict[str, Any]:
+        """Return the parsed manifest.json for ``artifact_slug`` or an empty dict.
+
+        Used to surface ``name`` / ``description`` / ``created_at`` in the
+        node result so the SSE artifact card can be rendered without a
+        follow-up call to ``/api/v1/report/detail``. Missing or unreadable
+        manifests are treated as soft-failures because the run may have
+        crashed before binding (mode is then ``None`` too).
+        """
+        if not artifact_slug:
+            return {}
+        project_root = getattr(self.agent_config, "project_root", None) if self.agent_config else None
+        if not project_root:
+            return {}
+        manifest_path = Path(project_root) / self.ARTIFACT_ROOT_DIR_NAME / artifact_slug / "manifest.json"
+        if not manifest_path.is_file():
+            return {}
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.debug("Failed to read %s manifest %s: %s", self.ARTIFACT_KIND, manifest_path, exc)
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _prepare_artifacts(self, user_input: InputT) -> None:
+        """Wire artifact tools into ``self.tools`` and reset the active slug.
+
+        The LLM decides between ``start_new_<kind>`` (create) and
+        ``bind_existing_<kind>`` (edit) at execution time; we just make
+        both tools available. ``_active_artifact_slug`` stays ``None``
+        until the LLM commits to one or the other.
+        """
+        if not self.agent_config or not getattr(self.agent_config, "project_root", None):
+            raise ValueError(f"agent_config.project_root is required for gen_visual_{self.ARTIFACT_KIND}")
+        if not self.db_func_tool:
+            # save_query[_template] needs a connector; fail loud rather
+            # than silently produce a no-op tool.
+            root_cause = self._db_tool_setup_error
+            if root_cause is not None:
+                raise ValueError(
+                    f"gen_visual_{self.ARTIFACT_KIND} requires db_tools to be configured "
+                    "(DEFAULT_TOOLS includes db_tools.*); DBFuncTool initialization failed: "
+                    f"{type(root_cause).__name__}: {root_cause}"
+                ) from root_cause
+            raise ValueError(
+                f"gen_visual_{self.ARTIFACT_KIND} requires db_tools to be configured "
+                "(DEFAULT_TOOLS includes db_tools.*)."
+            )
+
+        self._active_artifact_slug = None
+        self.artifact_tools = self._make_artifact_tools(user_input)
+        # Repeated ``execute_stream`` calls on the same node instance
+        # would otherwise stack stale tool wrappers bound to the previous
+        # artifact tools instance, which could resolve calls against an
+        # outdated artifact id. Replace any prior registration by name
+        # before extending with the freshly-built tools.
+        new_tools = self.artifact_tools.available_tools()
+        replaced_names = {getattr(t, "name", None) for t in new_tools}
+        self.tools = [t for t in self.tools if getattr(t, "name", None) not in replaced_names]
+        self.tools.extend(new_tools)
+
+    # ── Result construction (subclass overrides) ──────────────────────────
+
+    def _finalize_artifact_success(
+        self,
+        *,
+        user_input: InputT,
+        response_content: str,
+        artifact_slug: Optional[str],
+        app_jsx_rel_path: Optional[str],
+        render_file_count: int,
+        query_actions: List[ActionHistory],
+        tokens_used: int,
+        all_actions: List[ActionHistory],
+        tool_calls: List[ActionHistory],
+    ) -> ResultT:
+        """Construct the per-run result object (typed per artifact kind).
+
+        Renamed from ``_build_success_result`` so it does not clash with the
+        ``AgenticNode._build_success_result(ctx)`` template hook. Subclasses
+        (gen_visual_dashboard, gen_visual_report) implement this and let the
+        ``_build_success_result(ctx)`` adapter below assemble the kwargs.
+        """
+        raise NotImplementedError
+
+    def _finalize_artifact_error(self, exc: BaseException) -> ResultT:
+        """Construct the result returned when ``execute_stream`` raises.
+
+        Renamed from ``_build_error_result`` so it does not clash with the
+        ``AgenticNode._build_error_result(exc, ctx)`` adapter.
+        """
+        raise NotImplementedError
+
+    def _post_validate_hook(self, artifact_slug: str, result: ResultT) -> Optional[ActionHistory]:
+        """Run artifact-specific work after a successful ``validate_render``.
+
+        The report subagent uses this to compile a standalone HTML, open it
+        in the browser, and return a stream message naming the compiled
+        file's absolute path; dashboard mode has nothing to do here.
+        Returning an :class:`ActionHistory` makes ``_stream_post_build``
+        emit it into the action stream; ``None`` (the default) emits nothing.
+        """
+        return None
+
+    def _binding_tool_action_types(self) -> set:
+        """Tool action types that bind an artifact for this run."""
+        return {f"start_new_{self.ARTIFACT_KIND}", f"bind_existing_{self.ARTIFACT_KIND}"}
+
+    def _build_attempt_action_types(self) -> set:
+        """Tool action types that prove the run actually started building.
+
+        Binding alone doesn't: the system prompt requires a bind on turn 1
+        even for meta-discussion, so a consultative turn ("is this chart
+        worth keeping?") binds, reads, and answers in prose. Only a write
+        into the artifact tree — or a validate attempt — means the model
+        was mid-build and owes a successful ``validate_render``.
+        """
+        return {"write_file", "edit_file", "delete_file", self.QUERY_SAVE_ACTION_TYPE, "validate_render"}
+
+    def _missing_binding_error(self) -> str:
+        kind = self.ARTIFACT_KIND
+        return (
+            f"Run finished without binding a {kind}. The LLM must call either "
+            f"start_new_{kind}(...) or bind_existing_{kind}(...) before producing "
+            "the artifact."
+        )
+
+    def _incomplete_render_error(self) -> str:
+        return (
+            "validate_render never returned success — the "
+            f"{self.ARTIFACT_KIND} artifact is incomplete. "
+            "The LLM must write_file the render/*.jsx components and then "
+            "call validate_render() to finalize."
+        )
+
+    def _final_summary_message(self, artifact_slug: Optional[str], app_jsx_rel_path: Optional[str]) -> str:
+        if app_jsx_rel_path:
+            return (
+                f"Visual {self.ARTIFACT_KIND} generated: {self.ARTIFACT_ROOT_DIR_NAME}/{artifact_slug}/render/app.jsx"
+            )
+        return f"Visual {self.ARTIFACT_KIND} run finished without a validated render/ tree."
+
+    # ── Helpers re-exposed as static methods (legacy API preserved) ──────
+
+    @staticmethod
+    def _extract_artifact_result_field(action: ActionHistory, field: str) -> Optional[str]:
+        return extract_artifact_result_field(action, field)
+
+    @staticmethod
+    def _extract_artifact_result_list(action: ActionHistory, field: str) -> Optional[List[Any]]:
+        return extract_artifact_result_list(action, field)
+
+    @staticmethod
+    def _find_artifact_tool_call(actions: List[ActionHistory], tool_name: str) -> Optional[ActionHistory]:
+        for a in reversed(actions):
+            if a.action_type == tool_name:
+                return a
+        return None
+
+    # ── Template hooks ─────────────────────────────────────────────────────
+
+    async def _before_stream(self, ctx: "StreamRunContext") -> None:
+        # One manager can span several runs (the backend's mid-run-insert
+        # continuation loop reuses it), so record where this run starts:
+        # classification below must not see a previous pass's actions.
+        ctx.extras["artifact_run_action_start"] = ctx.action_history_manager.checkpoint()
+        # Bind artifact tools for this run (regenerates artifact id every call).
+        self._prepare_artifacts(ctx.user_input)
+
+    def _build_success_result(self, ctx: "StreamRunContext") -> ResultT:
+        all_actions = ctx.action_history_manager.get_actions()
+        tool_calls = [a for a in all_actions if a.role == ActionRole.TOOL and a.status == ActionStatus.SUCCESS]
+        tokens_used = self._extract_total_tokens(all_actions)
+
+        query_actions = [a for a in tool_calls if a.action_type == self.QUERY_SAVE_ACTION_TYPE]
+        app_jsx_rel_path: Optional[str] = None
+        render_file_count = 0
+        for tc in reversed(tool_calls):
+            if tc.action_type != "validate_render":
+                continue
+            candidate = extract_artifact_result_field(tc, "app_jsx_path")
+            if candidate:
+                app_jsx_rel_path = candidate
+                render_files = extract_artifact_result_list(tc, "render_files")
+                render_file_count = len(render_files) if render_files else 0
+                break
+
+        # The LLM picked the active artifact slug by calling
+        # start_new_<kind> / bind_existing_<kind>; the tools instance owns it.
+        picked = self._read_artifact_slug_from_tools()
+        if picked:
+            self._active_artifact_slug = picked
+
+        response_content = ctx.response_content
+        if not isinstance(response_content, str):
+            response_content = str(response_content) if response_content else ""
+
+        result = self._finalize_artifact_success(
+            user_input=ctx.user_input,
+            response_content=response_content,
+            artifact_slug=self._active_artifact_slug,
+            app_jsx_rel_path=app_jsx_rel_path,
+            render_file_count=render_file_count,
+            query_actions=query_actions,
+            tokens_used=tokens_used,
+            all_actions=all_actions,
+            tool_calls=tool_calls,
+        )
+
+        if app_jsx_rel_path is None:
+            # No render produced. Separate a genuine "forgot to render" failure
+            # from a legitimate informational turn: a run that never wrote into
+            # the artifact tree and answered the user in prose ("what changes
+            # did I make?", "is this chart worth keeping?") is a valid response
+            # — end normally instead of forcing an artifact error. Binding is
+            # not the discriminator: Hard rule 1 of the system prompt makes the
+            # model bind before any answer, consultative turns included.
+            run_start = int(ctx.extras.get("artifact_run_action_start") or 0)
+            build_attempted = any(a.action_type in self._build_attempt_action_types() for a in all_actions[run_start:])
+            informational_answer = not build_attempted and bool(response_content.strip())
+            if informational_answer:
+                if hasattr(result, "success"):
+                    result.success = True  # type: ignore[attr-defined]
+            else:
+                error_msg = (
+                    self._missing_binding_error()
+                    if self._active_artifact_slug is None
+                    else self._incomplete_render_error()
+                )
+                if hasattr(result, "error"):
+                    result.error = error_msg  # type: ignore[attr-defined]
+                # When the render is incomplete, success must reflect that so the
+                # template's final action emits SUCCESS=False status.
+                if hasattr(result, "success"):
+                    result.success = False  # type: ignore[attr-defined]
+
+        # Stash artifact summary so ``_final_summary_for_action`` (used by the
+        # base template's final action emit) can render the right message.
+        # Finalize itself runs inside :meth:`_stream_post_build` so the
+        # per-stage progress messages can be streamed back to the chat panel
+        # while the LLM + describe_table work is in flight.
+        ctx.extras["artifact_app_jsx_rel_path"] = app_jsx_rel_path
+        ctx.extras["artifact_slug"] = self._active_artifact_slug
+        ctx.extras["artifact_all_actions"] = all_actions
+        # save_query[_template] is the only path that mutates queries/ during a
+        # run, so "no query saved this run" ⟺ underlying data unchanged (a
+        # render-only edit like a chart-type swap). Insights / suggested
+        # questions stay valid in that case — let finalize skip its LLM stage.
+        ctx.extras["artifact_data_changed"] = len(query_actions) > 0
+        return result
+
+    def _build_error_result(self, exc: BaseException, ctx: "StreamRunContext") -> ResultT:
+        # Visual-artifact subclasses pre-existed the unified base error helper
+        # and own a richer error shape (manifest snapshot, artifact mode).
+        # Refresh the bound artifact slug from the tools so manifest/artifact
+        # metadata is not lost when the LLM bound an artifact before the
+        # run failed (success path does the same refresh in _build_success_result).
+        picked = self._read_artifact_slug_from_tools()
+        if picked:
+            self._active_artifact_slug = picked
+        return self._finalize_artifact_error(exc)
+
+    async def _stream_post_build(self, ctx: "StreamRunContext", result: ResultT) -> AsyncGenerator[ActionHistory, None]:
+        """Run finalize + post-validate hook with per-stage progress streaming.
+
+        The previous design ran finalize synchronously inside
+        ``_build_success_result``, which froze the SSE stream for the
+        full 10-15 s of post-validate LLM work. Splitting it into a
+        streaming hook lets us emit a ``finalize_progress`` action at
+        each stage boundary so the chat bubble's text swaps stage-to-
+        stage while the heavy work runs on a worker thread.
+
+        All progress actions share a single ``action_id`` so the SSE
+        converter emits CREATE_MESSAGE for the first and UPDATE_MESSAGE
+        for stages 2 / 3 — the user sees one bubble whose contents
+        change three times.
+        """
+        slug = self._active_artifact_slug
+        app_jsx_rel_path = ctx.extras.get("artifact_app_jsx_rel_path")
+        all_actions = ctx.extras.get("artifact_all_actions") or []
+
+        if not slug or not app_jsx_rel_path:
+            return
+
+        # Render-only edit (no query saved this run): skip the finalize LLM
+        # stage and its per-stage progress bubbles — the only work left is the
+        # deterministic schema/key_tables refresh, which needs no narration.
+        # Only legitimate when a prior finalize left narrative files to reuse;
+        # otherwise (first generation whose queries landed in an earlier turn)
+        # skipping would strand the artifact without chips.
+        skip_narrative = not ctx.extras.get("artifact_data_changed", True) and narrative_outputs_present(
+            self._artifact_dir(slug) / "analysis", artifact_kind=self.ARTIFACT_KIND
+        )
+
+        progress_queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+        sentinel = object()
+
+        def _on_progress(stage: int) -> None:
+            # Called from the worker thread; hop back onto the event loop
+            # before touching the asyncio.Queue.
+            loop.call_soon_threadsafe(progress_queue.put_nowait, stage)
+
+        progress_cb = None if skip_narrative else _on_progress
+
+        async def _run_finalize_off_thread() -> Dict[str, Any]:
+            try:
+                return await asyncio.to_thread(self._run_finalize, slug, all_actions, progress_cb, skip_narrative)
+            finally:
+                loop.call_soon_threadsafe(progress_queue.put_nowait, sentinel)
+
+        finalize_task = asyncio.create_task(_run_finalize_off_thread())
+
+        progress_action_id = str(uuid.uuid4())
+        while True:
+            item = await progress_queue.get()
+            if item is sentinel:
+                break
+            stage = int(item) if isinstance(item, int) else 0
+            text = finalize_stage_text(stage, getattr(self.agent_config, "language", None))
+            if not text:
+                continue
+            yield ActionHistory(
+                action_id=progress_action_id,
+                role=ActionRole.ASSISTANT,
+                action_type="finalize_progress",
+                messages="",
+                input={"stage": stage},
+                output={"stage": stage, "text": text},
+                status=ActionStatus.SUCCESS,
+            )
+
+        finalize_summary = await finalize_task
+        if hasattr(result, "finalize_warnings") and finalize_summary.get("warnings"):
+            result.finalize_warnings = finalize_summary["warnings"]  # type: ignore[attr-defined]
+        if hasattr(result, "finalize_error") and finalize_summary.get("error"):
+            result.finalize_error = finalize_summary["error"]  # type: ignore[attr-defined]
+        post_action = self._post_validate_hook(slug, result)
+        if post_action is not None:
+            yield post_action

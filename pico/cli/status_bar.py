@@ -1,0 +1,384 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Status bar provider for the Pico CLI prompt.
+
+Renders a single-line status bar above the input prompt that carries the
+Pico brand, current agent, model, cumulative session tokens, and context
+usage. All token counters are expressed in KiB units where 1K = 1024 tokens.
+"""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, List, Tuple
+
+from pico.cli._render_utils import format_io_tokens
+from pico.cli._render_utils import humanize_tokens as _humanize_tokens
+from pico.utils.loggings import get_logger
+
+if TYPE_CHECKING:
+    from pico.cli.repl import DatusCLI
+
+logger = get_logger(__name__)
+
+# Half-period of the running-indicator blink in seconds. The DatusApp
+# periodic invalidate runs at the same cadence so one full cycle (on → off →
+# on) takes ~1s on the terminal.
+_RUNNING_BLINK_HALF_PERIOD = 0.5
+
+
+def _running_blink_symbol(now: float | None = None) -> str:
+    """Return the current blink glyph for the ``running`` indicator.
+
+    Toggles between a filled and hollow dot every ``_RUNNING_BLINK_HALF_PERIOD``
+    seconds based on :func:`time.monotonic`, so successive calls inside the
+    same frame render the same glyph. ``now`` is exposed for deterministic
+    testing.
+    """
+    t = time.monotonic() if now is None else now
+    return "●" if int(t / _RUNNING_BLINK_HALF_PERIOD) % 2 == 0 else "○"
+
+
+@dataclass
+class StatusBarState:
+    """Snapshot of status bar data rendered before each prompt."""
+
+    agent: str = "chat"
+    model: str = "-"
+    connector: str = ""
+    cumulative_tokens: int = 0
+    cached_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    context_used: int = 0
+    context_total: int = 0
+    plan_mode: bool = False
+    agent_running: bool = False
+    profile: str = "normal"
+    schema_sync_running: bool = False
+
+    def context_display(self) -> str:
+        if self.context_total > 0:
+            pct = self.context_used / self.context_total * 100
+            return f"{_humanize_tokens(self.context_used)}/{_humanize_tokens(self.context_total)} {pct:.0f}%"
+        return "0K/0K 0%"
+
+    def tokens_display(self) -> str:
+        """Cumulative session tokens split as ``↑{input}({cached}) ↓{output}``."""
+        return format_io_tokens(self.input_tokens, self.output_tokens, self.cached_tokens)
+
+    def format_plain(self) -> str:
+        """Render the status bar as a plain string (used for tests and logs)."""
+        segments = ["Pico"]
+        if self.plan_mode:
+            segments.append("PLAN")
+        segments.append(self.agent)
+        if self.connector:
+            segments.append(self.connector)
+        if self.schema_sync_running:
+            segments.append("⟳ sync")
+        segments.append(self.profile)
+        segments.extend(
+            [
+                self.model,
+                self.tokens_display(),
+                self.context_display(),
+            ]
+        )
+        return " " + " │ ".join(segments) + " "
+
+    def to_formatted_tokens(self) -> List[Tuple[str, str]]:
+        """Return prompt_toolkit formatted text tokens with styled segments."""
+        sep: Tuple[str, str] = ("class:status-bar.sep", " │ ")
+        pad: Tuple[str, str] = ("class:status-bar", " ")
+
+        # Activity dot sits to the left of the brand. Solid when idle,
+        # pulsing between filled and hollow while the agent is running so
+        # users can spot the busy state at a glance. The running variant
+        # uses ``status-bar.running`` so CSS stays consistent with the old
+        # trailing indicator; the idle variant falls back to a neutral
+        # ``status-bar.dot`` tone.
+        if self.agent_running:
+            dot_token: Tuple[str, str] = ("class:status-bar.running", _running_blink_symbol())
+        else:
+            dot_token = ("class:status-bar.dot", "●")
+
+        tokens: List[Tuple[str, str]] = [
+            pad,
+            dot_token,
+            ("class:status-bar", " "),
+            ("class:status-bar.brand", "Pico"),
+        ]
+        if self.plan_mode:
+            tokens.extend([sep, ("class:status-bar.plan", "PLAN")])
+        tokens.extend([sep, ("class:status-bar.agent", self.agent)])
+        if self.connector:
+            tokens.extend([sep, ("class:status-bar.connector", self.connector)])
+        if self.schema_sync_running:
+            # Lightweight inline indicator for the background metadata RAG
+            # refresh kicked off after /datasource switches. Appears only
+            # while the bg task is in-flight and disappears on completion.
+            tokens.extend([sep, ("class:status-bar.sync", "⟳ sync")])
+        # Profile segment. Variant class (``status-bar.profile.auto`` /
+        # ``.dangerous``) lets repl.py render risky profiles with bold/red
+        # while leaving normal neutral.
+        profile_class = (
+            f"class:status-bar.profile.{self.profile}"
+            if self.profile in ("auto", "dangerous")
+            else "class:status-bar.profile"
+        )
+        tokens.extend([sep, (profile_class, self.profile)])
+        tokens.extend(
+            [
+                sep,
+                ("class:status-bar.model", self.model),
+                sep,
+                ("class:status-bar.tokens", self.tokens_display()),
+                sep,
+                ("class:status-bar.ctx", self.context_display()),
+            ]
+        )
+        tokens.append(pad)
+        return tokens
+
+
+class StatusBarProvider:
+    """Collects status bar data from the live CLI state with defensive fallbacks."""
+
+    def __init__(self, cli: "DatusCLI"):
+        self._cli = cli
+
+    def current_state(self) -> StatusBarState:
+        input_tokens, output_tokens, cached, total = self._resolve_session_totals()
+        tui_app = getattr(self._cli, "tui_app", None)
+        agent_running = False
+        if tui_app is not None:
+            try:
+                agent_running = tui_app.agent_running.is_set()
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"status_bar: failed to read agent_running: {e}")
+        bg_sync = getattr(self._cli, "bg_sync", None)
+        schema_sync_running = False
+        if bg_sync is not None:
+            try:
+                schema_sync_running = bool(bg_sync.is_running())
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"status_bar: failed to read bg_sync state: {e}")
+        return StatusBarState(
+            agent=self._resolve_agent(),
+            model=self._resolve_model(),
+            connector=self._resolve_connector(),
+            cumulative_tokens=total,
+            cached_tokens=cached,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            context_used=self._resolve_context_used(),
+            context_total=self._resolve_context_total(),
+            plan_mode=self._resolve_plan_mode(),
+            agent_running=agent_running,
+            profile=self._resolve_profile(),
+            schema_sync_running=schema_sync_running,
+        )
+
+    def _resolve_plan_mode(self) -> bool:
+        """Reflect plan-mode in real time, merging node and REPL signals.
+
+        Two sources can flip plan-mode mid-session:
+
+        1. ``confirm_plan`` (LLM tool call) calls ``node.deactivate_plan_mode()``
+           **synchronously while the turn is still running** — the REPL-side
+           ``self._cli.plan_mode_active`` toggle isn't synced back until the
+           turn ends (see ``repl._execute_chat_command``). Reading
+           ``node.plan_mode_active`` first lets the status bar's next paint
+           reflect the change within the timer tick instead of lagging a turn.
+
+        2. ``Shift+Tab`` flips ``self._cli.plan_mode_active`` between turns.
+           When no agent turn is in flight, the REPL toggle is the user's
+           authoritative intent — even if a previous ``confirm_plan`` left
+           ``node.plan_file_path`` allocated (it is intentionally preserved
+           to reuse the same markdown file on re-entry). The active turn is
+           detected via ``tui_app.agent_running``, which is cleared after
+           ``execute_chat_command`` (and its REPL toggle sync) completes.
+        """
+        node = self._current_node()
+        node_active = bool(getattr(node, "plan_mode_active", False)) if node is not None else False
+        if node_active:
+            return True
+        cli_toggle = bool(getattr(self._cli, "plan_mode_active", False))
+        if not cli_toggle:
+            return False
+        # cli toggle is on but the node disagrees. Trust the node mid-turn
+        # — a ``confirm_plan`` may have just flipped it off while the REPL
+        # toggle is still awaiting end-of-turn sync. Outside of a turn the
+        # toggle wins, so re-activating plan mode after a previous
+        # ``confirm_plan`` immediately re-lights the PLAN segment.
+        tui_app = getattr(self._cli, "tui_app", None)
+        if tui_app is not None:
+            try:
+                if tui_app.agent_running.is_set():
+                    return False
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"status_bar: failed to read agent_running for plan mode: {e}")
+        return True
+
+    def _resolve_profile(self) -> str:
+        """Return the active profile name from the CLI, defaulting to ``normal``.
+
+        The CLI owns the mutable ``active_profile`` string (initialized from
+        ``agent_config.active_profile_name`` and mutated by ``/permission``).
+        If the attribute is not yet wired (tests, early init, non-REPL paths),
+        fall back to ``normal`` rather than raising.
+        """
+        return getattr(self._cli, "active_profile", None) or "normal"
+
+    def _current_node(self):
+        chat_commands = getattr(self._cli, "chat_commands", None)
+        return getattr(chat_commands, "current_node", None) if chat_commands else None
+
+    def _resolve_agent(self) -> str:
+        chat_commands = getattr(self._cli, "chat_commands", None)
+        subagent = getattr(chat_commands, "current_subagent_name", None) if chat_commands else None
+        if subagent:
+            return subagent
+        default = getattr(self._cli, "default_agent", "") or ""
+        return default or "chat"
+
+    def _resolve_model(self) -> str:
+        node = self._current_node()
+        try:
+            if node is not None and getattr(node, "model", None) is not None:
+                model_cfg = getattr(node.model, "model_config", None)
+                name = getattr(model_cfg, "model", None)
+                if name:
+                    return self._format_model_label(str(name))
+        except Exception as e:
+            logger.debug(f"status_bar: failed to read model from node: {e}")
+        try:
+            agent_config = getattr(self._cli, "agent_config", None)
+            if agent_config is not None:
+                return self._format_model_label(str(agent_config.active_model().model))
+        except Exception as e:
+            logger.debug(f"status_bar: failed to read active model from config: {e}")
+        return "-"
+
+    def _format_model_label(self, model_name: str) -> str:
+        agent_config = getattr(self._cli, "agent_config", None)
+        if agent_config is None:
+            return model_name
+        provider = getattr(agent_config, "_target_provider", None)
+        if provider:
+            return f"{provider}/{model_name}"
+        return model_name
+
+    def _resolve_connector(self) -> str:
+        """Return the current connector as ``"<db_type>: <db_name>"``.
+
+        Falls back to the bare db name when dialect is unavailable, or an
+        empty string when no database is connected.
+        """
+        db_name = ""
+        try:
+            ctx = getattr(self._cli, "cli_context", None)
+            if ctx is not None:
+                db_name = getattr(ctx, "current_db_name", None) or ""
+        except Exception as e:
+            logger.debug(f"status_bar: failed to read db name: {e}")
+
+        db_type = ""
+        # Prefer the configured datasource type so dialect-sharing connectors
+        # (e.g. Greenplum reusing the PostgreSQL connector) still surface the
+        # user-facing type rather than the underlying dialect.
+        try:
+            agent_config = getattr(self._cli, "agent_config", None)
+            if agent_config is not None:
+                configured = getattr(agent_config, "db_type", None)
+                if configured:
+                    db_type = str(configured).lower()
+        except Exception as e:
+            logger.debug(f"status_bar: failed to read agent_config.db_type: {e}")
+
+        if not db_type:
+            try:
+                connector = getattr(self._cli, "db_connector", None)
+                if connector is not None:
+                    dialect = getattr(connector, "dialect", None)
+                    if dialect:
+                        # For Enum values (e.g. DBType.SQLITE), str(...) yields
+                        # "DBType.SQLITE" on Python 3.11+; prefer .value so we get
+                        # the canonical lowercase name ("sqlite").
+                        raw = getattr(dialect, "value", dialect)
+                        db_type = str(raw).lower()
+            except Exception as e:
+                logger.debug(f"status_bar: failed to read db dialect: {e}")
+
+        if not db_name:
+            return ""
+        if db_type:
+            return f"{db_type}: {db_name}"
+        return str(db_name)
+
+    def _resolve_session_totals(self) -> Tuple[int, int, int, int]:
+        """Return ``(input_tokens, output_tokens, cached_tokens, total_tokens)``.
+
+        ``cached_tokens`` is the cached portion of the input; ``total_tokens``
+        is kept for the cumulative segment / API parity.
+        """
+        node = self._current_node()
+        if node is None:
+            return 0, 0, 0, 0
+        session_id = getattr(node, "session_id", None)
+        if not session_id:
+            return 0, 0, 0, 0
+        try:
+            session_manager = node.session_manager
+        except Exception as e:
+            logger.debug(f"status_bar: session_manager unavailable: {e}")
+            return 0, 0, 0, 0
+        if session_manager is None:
+            return 0, 0, 0, 0
+        try:
+            usage = session_manager.get_detailed_usage(session_id)
+            total = usage.get("total", {}) if isinstance(usage, dict) else {}
+            return (
+                int(total.get("input_tokens", 0) or 0),
+                int(total.get("output_tokens", 0) or 0),
+                int(total.get("cached_tokens", 0) or 0),
+                int(total.get("total_tokens", 0) or 0),
+            )
+        except Exception as e:
+            logger.debug(f"status_bar: get_detailed_usage failed: {e}")
+            return 0, 0, 0, 0
+
+    def _resolve_context_used(self) -> int:
+        node = self._current_node()
+        if node is None:
+            return 0
+        from pico.storage.session_state import read_context_state
+
+        return read_context_state(node).last_call_input_tokens
+
+    def _resolve_context_total(self) -> int:
+        node = self._current_node()
+        if node is not None:
+            length = getattr(node, "context_length", None)
+            if length:
+                try:
+                    return int(length)
+                except (TypeError, ValueError):
+                    pass
+            # Fallback: in-memory snapshot from ``TokenUsageHook`` carries
+            # the model's max context so the ratio stays meaningful even
+            # before the node populates ``context_length`` on first call.
+            running = getattr(node, "running_turn_usage", None)
+            if running is not None:
+                try:
+                    fallback = int(getattr(running, "context_length", 0) or 0)
+                    if fallback > 0:
+                        return fallback
+                except (TypeError, ValueError):
+                    pass
+        return 0

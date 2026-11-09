@@ -1,0 +1,20 @@
+workflow:
+
+  fixed:
+    - schema_linking
+    - gen_sql
+    - execute_sql
+    - output
+
+  empty: []
+
+  # Agentic workflow using ChatAgenticNode
+  chat_agentic:
+    - chat
+    - execute_sql
+    - output
+
+  gen_sql_agentic:
+    - gen_sql
+    - execute_sql
+    - output

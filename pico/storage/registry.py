@@ -1,0 +1,281 @@
+# Copyright 2025-present DatusAI, Inc.
+# Licensed under the Apache License, Version 2.0.
+# See http://www.apache.org/licenses/LICENSE-2.0 for details.
+
+"""
+Storage registry with per-project LRU cache.
+
+Each (factory, project, datasource_id) tuple gets its own storage wrapper.
+The underlying VectorDatabase connection remains project-scoped: each project
+gets its own directory under ``{data_dir}/{project}/``.
+"""
+
+from __future__ import annotations
+
+import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, Optional
+
+from datus_storage_base.backend_config import StorageBackendConfig
+
+from pico.storage.base import BaseEmbeddingStore
+from pico.storage.embedding_models import get_embedding_model
+from pico.utils.loggings import get_logger
+
+if TYPE_CHECKING:
+    from pico.storage.subject_tree.store import SubjectTreeStore
+
+logger = get_logger(__name__)
+
+_registry_lock = threading.Lock()
+
+# Factory registry: maps factory name → factory callable for lru_cache lookup
+_factory_registry: Dict[str, Callable[..., BaseEmbeddingStore]] = {}
+
+# Deployment-level config injected once via configure_storage_defaults().
+_storage_defaults: Dict[str, Any] = {}
+
+# Per-context override for ``table_prefix`` only.
+#
+# WHY: a process may have to serve two table sets at once. Pico-backend can host
+# the Studio surface (``tb_*``) and the publication surface (``pub_tb_*``) in one
+# process, and which one a request reads is a property OF THE REQUEST, not of the
+# deployment — so it cannot come from ``_storage_defaults``, which is a module
+# global written once at startup.
+#
+# A ContextVar rather than a thread-local: the callers are asyncio tasks, and
+# each task inherits a copy of the context at creation, so a value set for one
+# request cannot leak into a concurrently running one.
+#
+# Only ``table_prefix``. The rest of the defaults (``extra_fields``,
+# ``scope_indices``) genuinely are deployment-level, and making them overridable
+# would invite per-request schema divergence.
+_table_prefix_override: ContextVar[Optional[str]] = ContextVar("datus_table_prefix_override", default=None)
+
+
+@contextmanager
+def table_prefix_scope(table_prefix: str) -> Iterator[None]:
+    """Read and write the ``table_prefix`` table set inside this block.
+
+    Nests and restores, so a caller that wraps a whole request cannot be undone
+    by an inner block. Prefer this over ``configure_storage_defaults`` for
+    anything request-scoped: that one mutates a module global, which in a
+    serving process races every concurrent request (and poisons the store cache
+    — see ``_get_storage_cached``).
+
+    Example::
+
+        with table_prefix_scope("pub_tb_"):
+            store = get_storage(MetricStore, "default", project=pid)
+    """
+    token = _table_prefix_override.set(table_prefix)
+    try:
+        yield
+    finally:
+        _table_prefix_override.reset(token)
+
+
+def current_table_prefix() -> str:
+    """The prefix in force here — the context override, else the global default."""
+    return get_storage_defaults().get("table_prefix", "")
+
+
+def configure_storage_defaults(
+    **kwargs: Any,
+) -> None:
+    """Set deployment-level defaults applied to every new storage instance.
+
+    Call once at application startup (e.g. in SaaS backend lifespan).
+    Subsequent calls overwrite previous defaults.
+
+    Args:
+        **kwargs: Forwarded to ``BaseEmbeddingStore.__init__``:
+            ``table_prefix``, ``extra_fields``.
+
+    Example::
+
+        configure_storage_defaults(
+            table_prefix="tb_",
+        )
+    """
+    _storage_defaults.clear()
+    _storage_defaults.update(kwargs)
+
+
+def get_storage_defaults() -> Dict[str, Any]:
+    """Return the defaults in force here (read-only copy).
+
+    The deployment-level dict, with ``table_prefix`` replaced by the context
+    override when one is in force. Every reader of the defaults goes through
+    this function, which is what makes the override reach places that take no
+    parameter for it — notably ``SubjectTreeStore.__init__``, which calls this
+    itself and has no ``table_prefix`` argument.
+    """
+    defaults = dict(_storage_defaults)
+    override = _table_prefix_override.get()
+    if override is not None:
+        defaults["table_prefix"] = override
+    return defaults
+
+
+@lru_cache(maxsize=256)
+def _get_storage_cached(
+    factory_name: str,
+    embedding_model_conf_name: str,
+    project: str,
+    datasource_id: str,
+    table_prefix: str,
+) -> BaseEmbeddingStore:
+    """LRU-cached storage creation, keyed by (factory, embedding model, project, datasource, prefix).
+
+    ⚠️ ``table_prefix`` IS PART OF THE KEY, and that is the whole reason this
+    signature has a parameter it never reads for anything but the key.
+
+    A store snapshots the prefix into its table names at construction time. With
+    the prefix out of the key, an instance built while the process pointed at one
+    table set stays cached under a key that says nothing about it — so a process
+    serving two table sets would answer from whichever one happened to construct
+    first, until it restarted. Keying on it makes the two sets two entries.
+    """
+    from pico.storage.backend_holder import create_vector_connection
+    from pico.storage.subject_tree.store import BaseSubjectEmbeddingStore
+
+    with _registry_lock:
+        factory = _factory_registry[factory_name]
+    # Through the accessor, not ``_storage_defaults`` directly, so a context
+    # override reaches this instance as well as the nested stores that read it
+    # themselves. It resolves to the same value as the ``table_prefix`` in the
+    # key: both come from ``get_storage_defaults()`` in this same call stack, and
+    # therefore this same context. The parameter is here to key the cache, and
+    # is deliberately NOT re-assigned into kwargs — doing so handed the factory
+    # a ``table_prefix=""`` it never used to receive when no defaults were set.
+    kwargs = get_storage_defaults()
+    kwargs["db"] = create_vector_connection(project)
+
+    # Subject-aware stores need ``project`` so their constructor can build the
+    # SubjectTreeStore without falling back to an empty ContextVar-scoped
+    # path_manager (which fails outside chat task threads).
+    if isinstance(factory, type) and issubclass(factory, BaseSubjectEmbeddingStore):
+        kwargs["project"] = project
+        kwargs["datasource_id"] = datasource_id
+
+    store = factory(get_embedding_model(embedding_model_conf_name), **kwargs)
+    return store
+
+
+def get_storage(
+    factory: Callable[..., BaseEmbeddingStore],
+    embedding_model_conf_name: str,
+    project: str,
+    datasource_id: str = "",
+) -> BaseEmbeddingStore:
+    """Return a storage instance scoped to *project* and datasource wrapper.
+
+    Project isolation is PHYSICAL: each project gets a per-project directory
+    under ``{data_dir}/{project}/``. ``project`` must be non-empty and is
+    forwarded to the backend ``connect()`` call. ``datasource_id`` only scopes
+    the returned wrapper; it is not part of the backend namespace.
+
+    Uses an LRU cache (maxsize=128) so that inactive projects are evicted.
+    Global defaults set via ``configure_storage_defaults()`` are
+    automatically forwarded to the factory constructor.
+    """
+    with _registry_lock:
+        _factory_registry[factory.__name__] = factory
+    return _get_storage_cached(
+        factory.__name__,
+        embedding_model_conf_name,
+        project,
+        datasource_id or "",
+        current_table_prefix(),
+    )
+
+
+@lru_cache(maxsize=256)
+def _get_subject_tree_cached(project: str, datasource_id: str, table_prefix: str) -> "SubjectTreeStore":
+    """LRU-cached SubjectTreeStore creation, keyed by the prefix too.
+
+    ``SubjectTreeStore.__init__`` reads ``get_storage_defaults()`` itself and
+    takes no prefix argument, so the value it picks up is whatever the context
+    said at construction time — same trap as ``_get_storage_cached``, same fix.
+    """
+    from pico.storage.subject_tree.store import SubjectTreeStore
+
+    return SubjectTreeStore(project=project, datasource_id=datasource_id)
+
+
+def get_subject_tree_store(project: str, datasource_id: str = "") -> "SubjectTreeStore":
+    """Return a SubjectTreeStore instance (LRU-cached per project/datasource/prefix)."""
+    return _get_subject_tree_cached(project, datasource_id or "", current_table_prefix())
+
+
+def preload_all_storages(
+    project: str,
+    data_dir: str = "",
+    config: Optional[StorageBackendConfig] = None,
+    **defaults: Any,
+) -> None:
+    """One-stop initialization: backends + defaults + all storage singletons.
+
+    Combines ``init_backends()``, ``configure_storage_defaults()``, and
+    eager loading of every storage singleton into a single call.
+
+    Args:
+        project: Project identifier for per-project isolation, forwarded
+            to every storage factory.  Must be non-empty.
+        data_dir: Root data directory for file-based backends (e.g.
+            ``~/.pico/data``).  Passed to ``init_backends()``.
+        config: Storage backend configuration. Controls which RDB
+            (sqlite/postgresql) and vector (lance) backends are used.
+            Defaults to sqlite + lance if omitted.
+        **defaults: Deployment-level defaults forwarded to
+            ``configure_storage_defaults()`` and then to every
+            storage constructor (e.g. ``table_prefix="tb_"``).
+
+    Example (SaaS — PostgreSQL + LanceDB)::
+
+        from datus_storage_base.backend_config import (
+            StorageBackendConfig, RdbBackendConfig, VectorBackendConfig,
+        )
+        preload_all_storages(
+            data_dir="/data/tenants/t1/workspaces/ws1/data",
+            config=StorageBackendConfig(
+                rdb=RdbBackendConfig(type="postgresql", params={...}),
+                vector=VectorBackendConfig(type="lance"),
+            ),
+            project="ws1",
+            table_prefix="tb_",
+        )
+
+    Example (CLI — default sqlite + lance)::
+
+        preload_all_storages(data_dir="~/.pico/data", project="my_project")
+    """
+    from pico.storage.backend_holder import init_backends
+
+    # 1. Initialize backends (vector DB + RDB connections)
+    init_backends(config=config, data_dir=data_dir)
+
+    # 2. Apply deployment-level defaults
+    if defaults:
+        configure_storage_defaults(**defaults)
+
+    logger.info("Storage backends initialized; datasource-scoped stores will be created lazily")
+
+
+def clear_storage_registry() -> None:
+    """Clear all cached storage instances and reset backends.
+
+    Does NOT clear ``_storage_defaults``. The teardown runs under
+    ``_registry_lock`` so concurrent ``get_storage()`` callers do not observe
+    a half-initialized backend state.
+    """
+    from pico.storage.backend_holder import reset_backends
+
+    with _registry_lock:
+        _get_storage_cached.cache_clear()
+        _factory_registry.clear()
+        _get_subject_tree_cached.cache_clear()
+        reset_backends()

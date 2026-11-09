@@ -1,0 +1,23 @@
+# An allow-list: only what the Dockerfile copies is sent to the build, never a secret.
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!NOTICE
+!loader/**
+!pico/**
+!pico_finops_agent/**
+!plugins/focus/**
+!deploy/pico-finops-agent.yml
+
+# Never, even inside the folders above
+**/.env
+**/.env.*
+!**/.env.example
+**/*.pem
+**/*.key
+**/*.p12
+**/credentials.json
+**/__pycache__
+**/.pytest_cache

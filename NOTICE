@@ -1,0 +1,11 @@
+Pico FinOps Agent
+Copyright 2026 PurpleData Inc. (CloudPi)
+
+This product includes software derived from Datus-agent 0.4.1
+(https://github.com/datus-ai/datus-agent), Copyright 2025-present DatusAI, Inc.,
+licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Modifications by PurpleData Inc.: the Python package, console scripts, entry-point groups,
+home directory, environment variables and HTTP headers were renamed from "datus" to "pico";
+a few core changes were made in pico/ (marked "Pico patch" in the code); and the Pico FinOps
+Agent (pico_finops_agent/, loader/, plugins/focus/) was added.
