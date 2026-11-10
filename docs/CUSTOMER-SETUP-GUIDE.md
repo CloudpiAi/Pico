@@ -1,187 +1,222 @@
 # Pico FinOps Agent: Setup Guide
 
-The **Pico FinOps Agent** is an assistant for your AWS costs. You can ask it questions in Slack, for example:
+**What you get:** a Slack assistant that answers questions about your AWS costs, and posts a short summary
+twice a day with anything that changed.
 
 > **@Pico FinOps Agent** what did I spend on AWS in October?
 > **@Pico FinOps Agent** which service grew the most this week?
 
-It also keeps an eye on your costs. Twice a day it posts what changed, and it warns you about sudden increases.
+**Where it runs:** on one small EC2 server in **your own AWS account**. Your cost data stays in your account.
+Nothing is sent to Pico FinOps or CloudPi.
 
-**Your data stays in your AWS account.** The agent runs on one EC2 server in your account. It reads your AWS billing export and keeps its copy of the data in your own S3. It doesn't need any Pico FinOps servers or a database, and nothing is sent to Pico FinOps.
+**Time needed:** about 45 minutes of work. AWS can take up to 24 hours to deliver the first cost files.
 
 ---
 
-## How it works
+## Contents
 
-### Architecture
+1. [How it works (2-minute read)](#1-how-it-works)
+2. [Before you start](#2-before-you-start)
+3. [Your setup worksheet](#3-your-setup-worksheet)
+4. [Setup, step by step](#4-setup-step-by-step)
+   - Part A, AWS: [Step 1](#step-1-turn-on-the-aws-cost-export) · [Step 2](#step-2-create-two-storage-buckets) · [Step 3](#step-3-create-the-two-permission-roles)
+   - Part B, keys: [Step 4](#step-4-get-a-language-model-api-key) · [Step 5](#step-5-create-the-slack-app)
+   - Part C, server: [Step 6](#step-6-launch-the-ec2-server) · [Step 7](#step-7-configure-and-start-the-agent) · [Step 8](#step-8-confirm-it-works)
+5. [Using the agent](#5-using-the-agent)
+6. [Troubleshooting](#6-troubleshooting)
+7. [Updating, stopping and removing](#7-updating-stopping-and-removing)
+8. [Security summary](#8-security-summary)
 
-Everything inside the dashed box runs **in your own AWS account**. The only things outside it are Slack, where people
-ask questions, and the language model (LLM) that writes the answers: Google Gemini by default, or OpenAI,
-Anthropic Claude or DeepSeek if you choose one of those.
+---
+
+## 1. How it works
+
+There are three parts:
+
+| Part | What it does | Where it runs |
+|---|---|---|
+| **Cost data** | AWS writes your daily cost file (the **FOCUS** export) into an S3 bucket. | Your AWS account |
+| **The agent** | Twice a day it loads the new cost files and keeps a fast copy of them. It answers questions and posts summaries. | One Docker container on your EC2 server |
+| **Slack + the language model** | People ask questions in Slack. A language model (LLM) such as Google Gemini turns each question into a query and writes the answer. | Slack, and the LLM provider you choose |
+
+### The daily flow
 
 ```mermaid
 flowchart LR
     subgraph AWS["Your AWS account"]
-        direction LR
-        BILL["AWS Billing"]
-        EXP[("S3 export bucket<br/>FOCUS files")]
-        subgraph LOAD["Data loading (twice a day)"]
-            LAMBDA["Loader Lambda<br/>(created by the agent)"]
-        end
+        EXP[("S3 export bucket<br/>daily cost files")]
+        LAMBDA["Loader Lambda<br/>(the agent creates it)"]
         TABLE[("S3 table bucket<br/>cost table")]
-        STATE[("S3 state bucket<br/>progress file")]
-        subgraph EC2["EC2 server: one Docker container"]
-            AGENT["Pico FinOps Agent<br/>scheduler + Slack bot"]
-            LOCAL[("Fast local copy<br/>of the cost data")]
-        end
+        AGENT["Pico FinOps Agent<br/>on your EC2"]
     end
-    SLACK["Slack<br/>questions, answers, notices"]
-    GEMINI["Language model (LLM)<br/>Gemini (default), OpenAI,<br/>Anthropic Claude or DeepSeek"]
+    SLACK["Slack"]
+    LLM["Language model<br/>(Gemini, OpenAI,<br/>Claude or DeepSeek)"]
 
-    BILL -- "1. daily cost export" --> EXP
-    AGENT -- "2. runs at 06:00 / 18:00 UTC" --> LAMBDA
-    EXP -- "3. reads new files" --> LAMBDA
-    LAMBDA -- "4. writes new rows" --> TABLE
-    LAMBDA -- "records progress" --> STATE
-    TABLE -- "5. syncs new data" --> LOCAL
-    SLACK <-- "6. question in / answer out" --> AGENT
-    AGENT <-- "7. question + result rows" --> GEMINI
-    AGENT -- "8. daily summary & alerts" --> SLACK
+    EXP -- "1. new files" --> LAMBDA
+    LAMBDA -- "2. new rows" --> TABLE
+    TABLE -- "3. synced copy" --> AGENT
+    SLACK <-- "4. question / answer" --> AGENT
+    AGENT <-- "5. question + result rows" --> LLM
 ```
 
-> If the diagram above doesn't render where you're reading this, here is the same flow in plain text:
->
-> ```
->  AWS Billing ─(daily)─► S3 export bucket ─► Loader Lambda ─► S3 table ─► Agent on EC2 (local copy)
->                                               │                               ▲   │
->                                               └─► S3 state bucket             │   ├─► LLM (Gemini by default)
->                                                   (progress file)             │   │
->                                                                   Slack ◄─────┴───┘
->                                                          (questions, answers, notices)
-> ```
+In plain words:
 
-### How the data flows
+1. **Every day**, AWS writes your cost data into the export bucket.
+2. **At 06:00 and 18:00 UTC**, the agent runs its loader. The loader reads only the new files and adds them to the cost table.
+3. The agent copies the new rows to its server and **posts a 📊 summary in Slack**.
+4. **When someone asks a question**, the agent sends the question to the LLM. It runs the query the LLM writes on its own copy of the data, then posts the answer in Slack.
 
-**A. Loading the cost data** (automatic, twice a day):
-1. **AWS Billing** writes your cost data (the **FOCUS** export) into your **S3 export bucket** once a day.
-2. At **06:00 and 18:00 UTC**, the agent on the EC2 starts its **loader Lambda** function.
-3. The Lambda reads only the **new** export files. The **progress file** in the state bucket tells it what it has already loaded.
-4. It writes the new rows into the **cost table** in your S3 table bucket, then updates the progress file.
-5. The agent copies the new data from the cost table into its **fast local copy** on the EC2.
-6. The agent posts a 📊 **summary** in Slack: yesterday's cost vs. usual, the month so far, and any sudden increases.
+### What leaves your AWS account
 
-**B. Answering a question** (whenever someone asks):
-1. Someone @mentions the agent in Slack, or sends it a direct message.
-2. The agent gets the message over an **outgoing** connection to Slack. No port is open on the EC2.
-3. The agent asks the **LLM** (Gemini by default) to turn the question into a query, then runs that query on its **local copy**.
-4. The LLM writes a short answer from the result rows. The agent posts it back in Slack.
-
-**What goes where:**
-
-| Data | Stays in your AWS account? |
+| Data | Where it goes |
 |---|---|
-| Your full cost data (export, cost table, local copy) | ✅ Yes, always |
-| AWS credentials | ✅ Yes. The agent uses IAM roles, and no access keys are created |
-| A question and the rows that answer it | Sent to the LLM you use (Gemini by default) to write the answer |
-| The answer and the notices | Posted to your Slack |
-| Anything sent to Pico FinOps | ❌ Nothing |
+| Your full cost data | **Stays in your AWS account** |
+| AWS credentials | **No access keys are created.** The agent uses IAM roles. |
+| One question and the few rows that answer it | Sent to your LLM provider to write the answer |
+| Answers and summaries | Posted to your Slack |
+| Anything to Pico FinOps / CloudPi | **Nothing** |
 
-The agent creates the Lambda function and the cost table **by itself** on its first start. You only prepare the buckets and the permissions below.
+The server opens **no inbound ports**. It only makes outgoing HTTPS connections to AWS, Slack and your LLM provider.
 
 ---
 
-## Before you start: checklist
+## 2. Before you start
 
 | You need | Why |
 |---|---|
-| An AWS account with admin access for the one-time setup | To create the buckets, the roles and the EC2 |
-| A Slack workspace where you can create an app | So the agent can answer in Slack |
-| An API key for one LLM provider: Google Gemini (default), OpenAI, Anthropic Claude or DeepSeek | The agent's language model, which answers questions in Slack. See [Choosing the language model](#choosing-the-language-model-llm) |
-| This repository, and Docker with the compose plugin on the EC2 | The agent's image is built from this repo on the EC2 (step 7) |
+| **Admin access to the AWS account** (for this one-time setup) | To create the buckets, the roles and the server |
+| **A Slack workspace where you can create apps** | So the agent can answer in Slack |
+| **An API key for one LLM**: Google Gemini (default), OpenAI, Anthropic Claude or DeepSeek | To understand questions and write answers |
+| **A web browser.** That's all you need on your computer. | You run all commands in AWS **CloudShell** (step 3) and on the EC2 server (step 7). You don't install anything locally. |
 
-### How long it takes
+**Pick one AWS Region** (for example `us-east-1`) and use it for **everything**: the buckets, the server, and CloudShell.
 
-The whole setup takes about **30-45 minutes** in total. Roughly:
+---
 
-| Step | What you do | Time |
+## 3. Your setup worksheet
+
+As you go, you'll collect the values below. Copy this table into a note and fill it in. In step 7 you paste these
+values into the agent's settings file.
+
+| # | Value | Example | You get it in |
+|---|---|---|---|
+| 1 | AWS Region | `us-east-1` | Your choice (section 2) |
+| 2 | Export bucket | `acme-cost-export` | Step 1 |
+| 3 | Export prefix (ends with `data/`) | `focus/acme-focus-export/data/` | Step 1 |
+| 4 | Table bucket ARN | `arn:aws:s3tables:us-east-1:111122223333:bucket/acme-cost-agent` | Step 2 |
+| 5 | State bucket | `acme-cost-agent-state` | Step 2 |
+| 6 | Loader role ARN | `arn:aws:iam::111122223333:role/pico-finops-agent-loader-role` | Step 3 |
+| 7 | LLM API key | `AIza…` | Step 4 |
+| 8 | Slack app token | `xapp-…` | Step 5 |
+| 9 | Slack bot token | `xoxb-…` | Step 5 |
+
+> Treat items 7-9 like passwords. Keep them out of email and chat.
+
+---
+
+## 4. Setup, step by step
+
+Each step tells you **what to do** and then how to **check it**. Don't move on until the check passes.
+
+### Part A: Prepare AWS
+
+---
+
+### Step 1: Turn on the AWS cost export
+
+**Goal:** AWS writes your cost data into an S3 bucket every day.
+
+1. In the AWS Console, open **Billing and Cost Management → Data Exports → Create**.
+2. **Export type:** choose **FOCUS 1.2** (with AWS columns).
+3. **Export name:** for example `acme-focus-export`.
+4. **Data export storage settings:** create or choose an S3 bucket (for example `acme-cost-export`) and a
+   path prefix (for example `focus`).
+5. Click **Create**.
+
+**Write down** (worksheet #2 and #3):
+- **Export bucket:** `acme-cost-export`
+- **Export prefix:** `<prefix>/<export-name>/data/`, for example `focus/acme-focus-export/data/`.
+  It must end with `data/`.
+
+**Check:** the export shows in the Data Exports list. The first files arrive **within 24 hours**. You can carry on
+with the next steps in the meantime.
+
+---
+
+### Step 2: Create two storage buckets
+
+**Goal:** a place for the agent's cost table, and a place for its small progress file.
+Create both in **your chosen Region**.
+
+**2a. Table bucket** (holds the cost table)
+1. Open **S3 → Table buckets → Create table bucket**.
+2. Name it, for example `acme-cost-agent`, and create it.
+3. Open the bucket and copy its **ARN** (worksheet #4). It looks like
+   `arn:aws:s3tables:us-east-1:111122223333:bucket/acme-cost-agent`.
+
+> If S3 asks you to turn on the **integration with AWS analytics services**, you can leave it off. The agent doesn't need it.
+
+**2b. State bucket** (holds a small progress file)
+1. Open **S3 → General purpose buckets → Create bucket**.
+2. Name it, for example `acme-cost-agent-state`.
+3. Leave **Block all public access** turned **on**, and create it.
+4. Write down the name (worksheet #5).
+
+**Check:** both buckets appear in S3, in the same Region.
+
+---
+
+### Step 3: Create the two permission roles
+
+**Goal:** two IAM roles that let the agent work without any access keys.
+
+| Role | Used by | Allowed to |
 |---|---|---|
-| 1 | Turn on the AWS cost export | ~5 min |
-| 2 | Create the two buckets | ~5 min |
-| 3 | Get and fill in the permission files | ~5 min |
-| 4 | Create the two roles | ~5 min |
-| 5 | Create the EC2 server and install Docker | ~10 min |
-| 6 | Create the Slack app | ~10 min |
-| 7 | Configure and start the agent | ~5 min |
-| | **Total** | **~30-45 min** |
+| `pico-finops-agent-loader-role` | The loader Lambda | Read your export; write the cost table and the progress file; write its own logs |
+| `pico-finops-agent-ec2-role` | The agent on the EC2 server | Create and run **only** the loader Lambda; read the cost table and the progress file |
 
-After it starts, the agent needs a few more minutes to load your data for the first time, or longer if you have many
-months of data.
+Neither role can reach anything else in your account.
 
-> **If you don't have a cost export yet:** AWS takes up to **24 hours** to deliver the first one after step 1. You can
-> do steps 2-7 in the meantime. The agent loads the first files on its next scheduled run after they arrive, or right away if you ask it
-> `set up the cost agent`.
+**3a. Open CloudShell.** In the AWS Console, check that your Region is selected (top right). Then click the
+**CloudShell** icon (`>_`) in the top bar. A terminal opens in your browser. It's already signed in, and the AWS CLI
+is installed.
 
----
+**3b. Enter your values.** Replace the example values with your own from the worksheet, then paste the whole block
+into CloudShell:
 
-## Step 1: Turn on the AWS cost export (FOCUS)
+```bash
+export REGION=us-east-1                            # worksheet #1
+export EXPORT_BUCKET=acme-cost-export              # worksheet #2
+export EXPORT_PREFIX=focus/acme-focus-export/data/ # worksheet #3 (ends with data/)
+export TABLE_BUCKET=acme-cost-agent                # the table bucket's NAME (the last part of worksheet #4)
+export STATE_BUCKET=acme-cost-agent-state          # worksheet #5
+export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+echo "Account: $ACCOUNT_ID  Region: $REGION"
+```
 
-1. Open **AWS Console → Billing and Cost Management → Data Exports → Create**.
-2. For **Export type**, choose **FOCUS 1.2** (with AWS columns).
-3. Under **Data export storage settings**, choose or create an S3 bucket, for example `acme-cost-export`, and a path prefix, for example `focus`.
-4. Save it.
+> If CloudShell reconnects later, these values are lost. Paste the block again before you continue.
 
-AWS delivers the first data within 24 hours. The files appear under `s3://<export-bucket>/<prefix>/<export-name>/data/`.
-
-Note these down:
-- **Export bucket**, e.g. `acme-cost-export`
-- **Export prefix**: the path up to and including `data/`, e.g. `focus/acme-focus-export/data/`
-
----
-
-## Step 2: Create two buckets
-
-Create both in the **same Region** as the EC2 you'll use in step 5.
-
-1. **A table bucket** for the agent's cost table.
-   - Go to **S3 → Table buckets → Create table bucket**, e.g. `acme-cost-agent`.
-   - Note its **ARN**: `arn:aws:s3tables:<region>:<account-id>:bucket/acme-cost-agent`.
-2. **A small private bucket** for the agent's progress file.
-   - Go to **S3 → Buckets → Create bucket**, e.g. `acme-cost-agent-state`.
-   - Keep "Block all public access" turned on.
-
-The agent creates the table inside the table bucket by itself.
-
----
-
-## Step 3: Get the permission files
-
-The permission files are in this repo under [`policies/aws/`](../policies/aws/): `ec2-role-policy.json`,
-`ec2-role-trust.json`, `loader-role-policy.json` and `loader-role-trust.json`. Copy them into a new folder:
+**3c. Download the permission files and fill in your values:**
 
 ```bash
 git clone https://github.com/CloudpiAi/Pico.git pico-finops-agent
-mkdir pico-finops-agent-iam && cp pico-finops-agent/policies/aws/*.json pico-finops-agent-iam/
-cd pico-finops-agent-iam
+mkdir -p pico-iam && cp pico-finops-agent/policies/aws/*.json pico-iam/ && cd pico-iam
+
+sed -i -e "s|<region>|$REGION|g" \
+       -e "s|<account-id>|$ACCOUNT_ID|g" \
+       -e "s|<export-bucket>|$EXPORT_BUCKET|g" \
+       -e "s|<export-prefix>|$EXPORT_PREFIX|g" \
+       -e "s|<table-bucket>|$TABLE_BUCKET|g" \
+       -e "s|<state-bucket>|$STATE_BUCKET|g" \
+       -e "s|<state-key>|pico-finops-agent/state.json|g" *.json
+
+grep -l '<' *.json || echo "OK: all values filled in"
 ```
 
-Fill in your own values. Use the names from steps 1 and 2:
+**Check:** the last line prints `OK: all values filled in`. If it prints a file name instead, that file still has
+a `<placeholder>` in it. Check the values in 3b and run 3c again.
 
-```bash
-sed -i -e 's|<region>|us-east-1|g' \
-       -e 's|<account-id>|111122223333|g' \
-       -e 's|<export-bucket>|acme-cost-export|g' \
-       -e 's|<export-prefix>|focus/acme-focus-export/data/|g' \
-       -e 's|<table-bucket>|acme-cost-agent|g' \
-       -e 's|<state-bucket>|acme-cost-agent-state|g' \
-       -e 's|<state-key>|pico-finops-agent/state.json|g' *.json
-grep -l '<' *.json || echo "All placeholders filled."
-```
-
----
-
-## Step 4: Create the two roles
-
-**4a. The Lambda role**, which the agent's data loader uses:
+**3d. Create the loader role** (for the Lambda):
 
 ```bash
 aws iam create-role --role-name pico-finops-agent-loader-role \
@@ -192,265 +227,439 @@ aws iam attach-role-policy --role-name pico-finops-agent-loader-role \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
 ```
 
-Note the role's **ARN**: `arn:aws:iam::<account-id>:role/pico-finops-agent-loader-role`.
+**3e. Create the EC2 role and its instance profile** (for the agent):
 
-**4b. The EC2 role**, which the agent itself uses:
+> **Role vs. instance profile.** An EC2 server can't use an IAM role directly. The role goes inside an
+> **instance profile**, and you attach the instance profile to the server. The commands below create both, with the
+> same name, `pico-finops-agent-ec2-role`:
+>
+> | Name | What it is | Where you use it |
+> |---|---|---|
+> | `pico-finops-agent-ec2-role` (**role**) | Holds the permissions (`ec2-role-policy.json`) | You don't select it directly |
+> | `pico-finops-agent-ec2-role` (**instance profile**) | A container that holds the role | You select it on the EC2 server in step 6 |
+>
+> In the AWS Console, the EC2 field is called **IAM instance profile** (or **IAM role** under
+> **Actions → Security → Modify IAM role**). Both show the instance profile name.
 
 ```bash
-# ec2-role-trust.json (policies/aws/) lets EC2 use the role
-aws iam create-role --role-name pico-finops-agent-ec2-role --assume-role-policy-document file://ec2-role-trust.json
+aws iam create-role --role-name pico-finops-agent-ec2-role \
+  --assume-role-policy-document file://ec2-role-trust.json
 aws iam put-role-policy --role-name pico-finops-agent-ec2-role \
   --policy-name pico-finops-agent --policy-document file://ec2-role-policy.json
 aws iam create-instance-profile --instance-profile-name pico-finops-agent-ec2-role
-aws iam add-role-to-instance-profile --instance-profile-name pico-finops-agent-ec2-role --role-name pico-finops-agent-ec2-role
+aws iam add-role-to-instance-profile --instance-profile-name pico-finops-agent-ec2-role \
+  --role-name pico-finops-agent-ec2-role
 ```
 
-**What these roles allow, in plain words:**
-- **The EC2 role:**
-  - Manage and run **only** the `pico-finops-agent-loader` Lambda function and its `pico-finops-agent-duckdb` layer.
-  - Hand **only** the loader role to Lambda.
-  - Read the agent's progress file.
-  - **Read** the cost table.
-- **The Lambda role:**
-  - **Read** your export.
-  - Create and **write** the cost table.
-  - Read and write the progress file.
-  - Write its own logs.
-- **Neither role** can touch anything else in your account. No access keys are created or stored anywhere.
-
-> **Is your export bucket encrypted with your own KMS key (SSE-KMS)?** Then also allow `kms:Decrypt` on that key for
-> `pico-finops-agent-loader-role`. S3-managed encryption (the default) needs nothing extra.
-
----
-
-## Step 5: Create the EC2 server
-
-1. **Launch an instance:** Linux (e.g. Amazon Linux 2023 or Ubuntu 24.04), **x86_64**, at least **2 vCPU / 4 GB** (e.g. `t3.medium`). Use the **same Region** as the buckets.
-2. **IAM instance profile:** `pico-finops-agent-ec2-role`.
-3. **Security group:** **no inbound rules are needed.** Add SSH only if you manage the server that way. The agent only makes outbound HTTPS connections to AWS, Slack and your LLM provider (Google Gemini by default).
-4. **Metadata:** set **IMDSv2 required** with **hop limit 1**. Set it explicitly, because some images (e.g. Amazon Linux 2023) default to 2, which would let any other container on the server use the role:
-   ```bash
-   aws ec2 modify-instance-metadata-options --instance-id <instance-id> \
-     --http-tokens required --http-put-response-hop-limit 1
-   ```
-5. **Install Docker** with the compose plugin, e.g. on Amazon Linux 2023:
-   ```bash
-   sudo dnf install -y docker && sudo systemctl enable --now docker
-   sudo mkdir -p /usr/local/lib/docker/cli-plugins
-   sudo curl -sSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
-     -o /usr/local/lib/docker/cli-plugins/docker-compose && sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-   sudo usermod -aG docker $USER   # log out and back in
-   ```
-
-> Use this server **for the Pico FinOps Agent only**, and don't give other people logins on it.
-
----
-
-## Step 6: Create the Slack app
-
-You can skip this step if you don't want Slack. The agent still loads the data, but there's nobody to answer questions.
-
-1. Go to **[api.slack.com/apps](https://api.slack.com/apps) → Create New App → From scratch**. Name it **Pico FinOps Agent** and pick your workspace.
-2. Under **Socket Mode**, turn it **on**. Create the **app-level token** with the scope `connections:write`. It starts with **`xapp-`**.
-3. Under **OAuth & Permissions → Bot Token Scopes**, add:
-   - `chat:write`
-   - `channels:history`
-   - `groups:history`
-   - `im:history`
-   - `reactions:write`
-   - `mpim:history` (optional, for group DMs)
-4. Under **Event Subscriptions**, turn it **on**. Under **Subscribe to bot events**, add:
-   - `message.channels`
-   - `message.groups`
-   - `message.im`
-   - `message.mpim` (optional)
-5. Under **App Home**, turn on the **Messages tab** and tick "Allow users to send messages", so people can DM the agent.
-6. Under **Install App**, install it to your workspace. Copy the **Bot User OAuth Token**, which starts with **`xoxb-`**.
-7. In Slack, create a channel for notices, e.g. **#pico-finops-agent**, and invite the bot: `/invite @Pico FinOps Agent`.
-
-Keep both tokens private: they work like passwords.
-
----
-
-## Step 7: Configure and start the agent
-
-On the EC2:
+**3f. Copy the loader role's ARN** (worksheet #6):
 
 ```bash
-sudo dnf install -y git                     # or: sudo apt-get install -y git
-git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent && cd ~/pico-finops-agent
-docker compose build                        # builds the image pico-finops-agent:local (a few minutes)
-umask 077                                   # the settings file holds keys: readable by you only
-cp .env.example .env
-nano .env                                   # fill in the values below
+aws iam get-role --role-name pico-finops-agent-loader-role --query Role.Arn --output text
 ```
 
-**Settings in `.env`:**
+**3g. Check that the instance profile holds the EC2 role:**
 
-| Setting | Your value |
-|---|---|
-| `FOCUS_REGION` | e.g. `us-east-1` |
-| `FOCUS_EXPORT_BUCKET` | from step 1, e.g. `acme-cost-export` |
-| `FOCUS_EXPORT_PREFIX` | from step 1, ends with `data/` |
-| `FOCUS_TABLE_BUCKET_ARN` | from step 2 |
-| `FOCUS_STATE_BUCKET` | from step 2, e.g. `acme-cost-agent-state` |
-| `FOCUS_LAMBDA_ROLE_ARN` | from step 4a |
-| `AGENT_LLM_PROVIDER` | Optional: `gemini` (default), `openai`, `anthropic` or `deepseek` (see below) |
-| `GEMINI_API_KEY` | your Gemini key, when the provider is Gemini (or the key of the provider you chose, see below) |
-| `SLACK_APP_TOKEN` | `xapp-…` from step 6 |
-| `SLACK_BOT_TOKEN` | `xoxb-…` from step 6 |
-| `SLACK_NOTIFY_CHANNEL` | `pico-finops-agent` (the channel for notices and alerts) |
+```bash
+aws iam get-instance-profile --instance-profile-name pico-finops-agent-ec2-role \
+  --query 'InstanceProfile.Roles[].RoleName' --output text
+```
 
-### Choosing the language model (LLM)
+**Check:**
+- 3f prints an ARN like `arn:aws:iam::111122223333:role/pico-finops-agent-loader-role`.
+- 3g prints `pico-finops-agent-ec2-role`. If it prints nothing, the role isn't in the instance profile yet. Run the
+  last command of 3e again.
 
-The agent uses an LLM to understand questions and write the answers. These providers are supported:
+> **Is your export bucket encrypted with your own KMS key (SSE-KMS)?** Then also allow `kms:Decrypt` on that key for
+> `pico-finops-agent-loader-role`. The default S3 encryption needs nothing extra.
 
-| Provider | Setting in `.env` | Get a key from |
+---
+
+### Part B: Get your keys
+
+---
+
+### Step 4: Get a language model API key
+
+**Goal:** an API key so the agent can understand questions and write answers.
+
+Choose **one** provider and create a key there:
+
+| Provider | Get a key from | Settings name for the key |
 |---|---|---|
-| **Google Gemini** (default, model `gemini-3.8-flash`) | `GEMINI_API_KEY` | [Google AI Studio](https://aistudio.google.com/) |
-| **OpenAI** | `OPENAI_API_KEY` | [platform.openai.com](https://platform.openai.com/api-keys) |
-| **Anthropic Claude** | `ANTHROPIC_API_KEY` | [console.anthropic.com](https://console.anthropic.com/) |
-| **DeepSeek** | `DEEPSEEK_API_KEY` | [platform.deepseek.com](https://platform.deepseek.com/) |
+| **Google Gemini** (default) | [Google AI Studio](https://aistudio.google.com/) | `GEMINI_API_KEY` |
+| OpenAI | [platform.openai.com](https://platform.openai.com/api-keys) | `OPENAI_API_KEY` |
+| Anthropic Claude | [console.anthropic.com](https://console.anthropic.com/) | `ANTHROPIC_API_KEY` |
+| DeepSeek | [platform.deepseek.com](https://platform.deepseek.com/) | `DEEPSEEK_API_KEY` |
 
-- **To keep the default (Gemini):** set only `GEMINI_API_KEY`. Nothing else is needed.
-- **To use another provider:** set `AGENT_LLM_PROVIDER` and that provider's key. For example, for Anthropic Claude:
+Write down the key (worksheet #7) and which provider it's for.
+
+**Check:** you have one key and know its provider. Step 8 tests the key automatically.
+
+---
+
+### Step 5: Create the Slack app
+
+**Goal:** a Slack bot that people can @mention or send direct messages to.
+
+> **Skip this step if you don't want Slack.** The agent still loads the data, but nobody can ask it questions.
+
+**5a. Create the app from a ready-made manifest** (this sets all the permissions in one go):
+
+1. Go to **[api.slack.com/apps](https://api.slack.com/apps) → Create New App → From a manifest**.
+2. Pick your workspace, choose **YAML**, and paste this:
+
+   ```yaml
+   display_information:
+     name: Pico FinOps Agent
+     description: Answers questions about your AWS costs
+   features:
+     app_home:
+       messages_tab_enabled: true
+       messages_tab_read_only_enabled: false
+     bot_user:
+       display_name: Pico FinOps Agent
+       always_online: true
+   oauth_config:
+     scopes:
+       bot:
+         - chat:write
+         - channels:history
+         - groups:history
+         - im:history
+         - mpim:history
+         - reactions:write
+   settings:
+     event_subscriptions:
+       bot_events:
+         - message.channels
+         - message.groups
+         - message.im
+         - message.mpim
+     socket_mode_enabled: true
+     org_deploy_enabled: false
+     token_rotation_enabled: false
+   ```
+
+3. Click **Next → Create**.
+
+**5b. Get the app token** (worksheet #8):
+1. In the app's settings, open **Basic Information → App-Level Tokens → Generate Token and Scopes**.
+2. Name it `socket`, add the scope `connections:write`, and click **Generate**.
+3. Copy the token. It starts with **`xapp-`**.
+
+**5c. Install the app and get the bot token** (worksheet #9):
+1. Open **Install App → Install to Workspace → Allow**.
+2. Copy the **Bot User OAuth Token**. It starts with **`xoxb-`**.
+
+**5d. Create the summary channel:**
+1. In Slack, create a channel, for example **#pico-finops-agent**.
+2. Invite the bot to it: `/invite @Pico FinOps Agent`.
+
+**Check:** you have an `xapp-…` token and an `xoxb-…` token, and the bot is in the channel.
+
+<details>
+<summary>Prefer to set up the Slack app by hand instead of with a manifest?</summary>
+
+1. **Create New App → From scratch**, name it **Pico FinOps Agent**.
+2. **Socket Mode:** turn it on and create an app-level token with `connections:write` (`xapp-…`).
+3. **OAuth & Permissions → Bot Token Scopes:** `chat:write`, `channels:history`, `groups:history`, `im:history`,
+   `reactions:write`, and optionally `mpim:history`.
+4. **Event Subscriptions:** turn it on. Under **Subscribe to bot events**, add `message.channels`, `message.groups`,
+   `message.im`, and optionally `message.mpim`.
+5. **App Home:** turn on the **Messages tab** and tick **Allow users to send messages**.
+6. **Install App:** install it and copy the bot token (`xoxb-…`).
+
+</details>
+
+---
+
+### Part C: Start the agent
+
+---
+
+### Step 6: Launch the EC2 server
+
+**Goal:** a small Linux server that runs the agent.
+
+1. Open **EC2 → Launch instance**, in **your chosen Region**.
+2. Choose these settings:
+
+   | Setting | Value |
+   |---|---|
+   | Name | `pico-finops-agent` |
+   | Image | **Amazon Linux 2023** (x86_64) |
+   | Instance type | **`t3.medium`** (2 vCPU, 4 GB) or larger |
+   | Key pair | Your choice. You won't need it if you connect with Session Manager (see below). |
+   | Security group | **No inbound rules.** The agent doesn't need any. |
+   | Storage | 20 GB or more |
+   | Advanced details → **IAM instance profile** | **`pico-finops-agent-ec2-role`**: the instance profile from step 3e |
+   | Advanced details → **Metadata version** | **V2 only (token required)** |
+   | Advanced details → **Metadata response hop limit** | **1** |
+
+3. Click **Launch instance**.
+
+> **Don't see `pico-finops-agent-ec2-role` in the IAM instance profile list?** The list shows instance profiles, not
+> roles. Check step 3g, then click the refresh icon next to the list.
+>
+> **Already have a server running?** Attach the instance profile to it: select the instance, then
+> **Actions → Security → Modify IAM role**, choose `pico-finops-agent-ec2-role`, and click **Update IAM role**.
+> Or, in CloudShell:
+> ```bash
+> aws ec2 associate-iam-instance-profile --instance-id <instance-id> \
+>   --iam-instance-profile Name=pico-finops-agent-ec2-role
+> ```
+>
+> **Why hop limit 1?** It stops other containers on the server from using the agent's role. Some images default to 2,
+> so set it explicitly. For a server that's already running:
+> ```bash
+> aws ec2 modify-instance-metadata-options --instance-id <instance-id> \
+>   --http-tokens required --http-put-response-hop-limit 1
+> ```
+
+**How to connect to the server without opening a port:** use **AWS Systems Manager Session Manager**. Give the role
+access to it once (in CloudShell):
+
+```bash
+aws iam attach-role-policy --role-name pico-finops-agent-ec2-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+```
+
+Wait 2-3 minutes. Then select the instance in EC2, click **Connect → Session Manager → Connect**, and run `sudo su - ec2-user`.
+(If you'd rather use SSH, add an inbound rule for port 22 from your own IP address only.)
+
+**Install Docker** on the server. Paste this block:
+
+```bash
+sudo dnf install -y docker git
+sudo systemctl enable --now docker
+sudo mkdir -p /usr/local/lib/docker/cli-plugins
+sudo curl -sSL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+  -o /usr/local/lib/docker/cli-plugins/docker-compose
+sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+sudo usermod -aG docker $USER
+```
+
+Then **log out and connect again**, so you can use Docker without `sudo`.
+
+**Check:**
+- `docker compose version` prints a version number.
+- The server is using the agent's role:
+  ```bash
+  TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+  curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/iam/security-credentials/
   ```
-  AGENT_LLM_PROVIDER=anthropic
-  ANTHROPIC_API_KEY=<your key>
-  ```
-  A Gemini key isn't needed then.
-- **To pick a specific model** (optional): set `AGENT_LLM_MODEL`, e.g. `AGENT_LLM_MODEL=gpt-5.4-mini`. Without it the
-  agent uses the provider's default: `gemini-3.8-flash`, `gpt-5.5`, `claude-sonnet-4-6` or `deepseek-v4-pro`.
-- **To change provider later:** edit `.env`, then run `docker compose up -d`. The agent reads the choice on every start.
-- The start-up check and `docker compose run --rm agent check` test the key of the provider you chose, without
-  using any tokens. If the provider name or its key is missing or wrong, they name the setting to fix.
-- Whichever provider you use, only the question and the rows that answer it are sent to it.
+  This prints `pico-finops-agent-ec2-role`. If it prints nothing or an error, the instance profile isn't attached.
+  See "Already have a server running?" above.
 
-**Check first** (posts nothing, changes nothing). It checks:
-- the AWS role
-- the agent's buckets and data
-- the Slack tokens
-- the key of your LLM provider
+> Use this server **only** for the Pico FinOps Agent, and don't give other people logins on it.
 
-Fix any `ALERT:` line it prints before you start:
+---
+
+### Step 7: Configure and start the agent
+
+**Goal:** the agent is built, configured with your worksheet values, and running.
+
+**7a. Download and build the agent** (on the EC2 server; the build takes a few minutes):
+
+```bash
+git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
+cd ~/pico-finops-agent
+docker compose build
+```
+
+**7b. Create the settings file:**
+
+```bash
+umask 077
+cp .env.example .env
+nano .env
+```
+
+Change these lines to your worksheet values. Leave the other lines as they are.
+
+| Line in `.env` | Value |
+|---|---|
+| `FOCUS_REGION=` | worksheet #1 |
+| `FOCUS_EXPORT_BUCKET=` | worksheet #2 |
+| `FOCUS_EXPORT_PREFIX=` | worksheet #3 (ends with `data/`) |
+| `FOCUS_TABLE_BUCKET_ARN=` | worksheet #4 |
+| `FOCUS_STATE_BUCKET=` | worksheet #5 |
+| `FOCUS_LAMBDA_ROLE_ARN=` | worksheet #6 |
+| `GEMINI_API_KEY=` | worksheet #7, if you use Gemini |
+| `SLACK_APP_TOKEN=` | worksheet #8. Remove the `#` at the start of the line |
+| `SLACK_BOT_TOKEN=` | worksheet #9. Remove the `#` at the start of the line |
+| `SLACK_NOTIFY_CHANNEL=` | `pico-finops-agent`. Remove the `#` at the start of the line |
+
+**Using OpenAI, Claude or DeepSeek instead of Gemini?** Remove the `#` from `AGENT_LLM_PROVIDER` and from the
+provider's key line, and set both. For example, for Claude:
+
+```
+AGENT_LLM_PROVIDER=anthropic
+ANTHROPIC_API_KEY=<your key>
+```
+
+Save with **Ctrl+O, Enter**, then exit with **Ctrl+X**.
+
+<details>
+<summary>What a finished <code>.env</code> looks like (example values)</summary>
+
+```bash
+FOCUS_REGION=us-east-1
+FOCUS_EXPORT_BUCKET=acme-cost-export
+FOCUS_EXPORT_PREFIX=focus/acme-focus-export/data/
+FOCUS_TABLE_BUCKET_ARN=arn:aws:s3tables:us-east-1:111122223333:bucket/acme-cost-agent
+FOCUS_STATE_BUCKET=acme-cost-agent-state
+FOCUS_LAMBDA_ROLE_ARN=arn:aws:iam::111122223333:role/pico-finops-agent-loader-role
+GEMINI_API_KEY=AIza...
+SLACK_APP_TOKEN=xapp-...
+SLACK_BOT_TOKEN=xoxb-...
+SLACK_NOTIFY_CHANNEL=pico-finops-agent
+```
+
+</details>
+
+**7c. Run the pre-flight check.** It tests your AWS role, buckets, Slack tokens and LLM key. It posts nothing and
+changes nothing.
 
 ```bash
 docker compose run --rm agent check
 ```
 
-**Start it:**
+Each line starts with `OK:` or `ALERT:`. An `ALERT:` line names the setting or permission to fix. Fix it in `.env`,
+then run the check again.
+
+**Check:** the last line says **`All checks passed.`**
+
+> **First time?** You'll see `OK: AWS: nothing loaded yet (the first start loads every month)`. That's expected.
+> If AWS hasn't delivered the first cost files yet (step 1 was less than 24 hours ago), start the agent anyway: it
+> loads them on its next scheduled run after they arrive, or right away if you ask it `set up the cost agent`.
+
+**7d. Start the agent:**
 
 ```bash
-docker compose up -d                       # starts the agent (one container: data loading, notices and the Slack bot)
-docker logs -f pico-finops-agent               # watch the first setup (Ctrl+C to stop watching)
+docker compose up -d
+docker logs -f pico-finops-agent       # watch the first start; press Ctrl+C to stop watching (the agent keeps running)
 ```
 
-Everything runs in **one container**, `pico-finops-agent`, from one image. The Slack bot starts by itself when both Slack
-tokens are in `.env`. Without them the agent still loads the data, and the log says it's running without the bot.
-
-On the first start the agent sets itself up:
-1. It creates its Lambda function and the cost table.
-2. It loads all your cost months and builds its local copy.
+On its first start the agent sets itself up:
+1. It creates its loader Lambda and the cost table.
+2. It loads your cost months and builds its local copy.
 3. It posts a 📊 message in `#pico-finops-agent`.
 
-This takes a few minutes, or longer for many months of data.
-
-If a setting is missing or wrong, the agent doesn't start and names the setting, e.g. `FOCUS_EXPORT_BUCKET is not set`. Fix it in `.env` and run the command again.
+This takes a few minutes, or longer if you have many months of data.
 
 ---
 
-## Using the agent
+### Step 8: Confirm it works
 
-Mention the bot in a channel it's in, or send it a direct message:
+| Check | How | Expected |
+|---|---|---|
+| The agent is running | `docker compose ps` | Status **healthy** |
+| Data has loaded | Look in `#pico-finops-agent` | A 📊 **Fresh cost data is in…** message |
+| The bot answers | In Slack: `@Pico FinOps Agent what did I spend this month?` | An answer within about a minute |
+
+**Setup is complete.** 🎉
+
+---
+
+## 5. Using the agent
+
+**Ask questions:** @mention the bot in a channel it's in, or send it a direct message.
 
 - `@Pico FinOps Agent what did I spend on AWS in October?`
 - `@Pico FinOps Agent top 5 services this month`
 - `@Pico FinOps Agent why did EC2 cost go up yesterday?`
 - `@Pico FinOps Agent when was the cost data last updated?`
-- `@Pico FinOps Agent set up the cost agent`, which loads the newest data now
+- `@Pico FinOps Agent set up the cost agent` (loads the newest data right now)
 
-**Automatic messages in `#pico-finops-agent`:**
+**Automatic messages** in `#pico-finops-agent`:
 
-| Message | When |
+| Message | When it appears |
 |---|---|
-| 📊 **Fresh cost data is in…** | After new data arrives: yesterday's cost vs. usual, month so far, sudden increases, new resources |
-| ⚠️ **I couldn't refresh the cost data: …** | Something is broken. It says what and how to fix it, once |
+| 📊 **Fresh cost data is in…** | After new data loads: yesterday vs. usual, month so far, sudden increases, new resources |
+| ⚠️ **I couldn't refresh the cost data: …** | Something broke. The message says what to fix. It's sent once per problem. |
 | ✅ **Cost data is refreshing again** | The problem is fixed |
 | ⚠️ **No new AWS cost data for N days** | The AWS export may have stopped |
 
-Data is loaded twice a day, at 06:00 and 18:00 UTC. To change that, set `FOCUS_SCHEDULE` in `.env`, e.g.
-`0 2,14 * * *`. AWS itself updates the export about once a day.
+**Optional settings** (in `.env`; after changing one, run `docker compose up -d`):
+
+| Setting | Default | What it changes |
+|---|---|---|
+| `FOCUS_SCHEDULE` | `0 6,18 * * *` | When data loads (cron, UTC) |
+| `FOCUS_MONTHS` | `4` | How many months of cost data to keep |
+| `FOCUS_ALERT_INCREASE_PCT` | `50` | How big a jump counts as a "sudden increase" (% above the 7-day average) |
+| `FOCUS_ALERT_STALE_DAYS` | `3` | After how many days without new data it warns you |
+| `AGENT_LLM_MODEL` | Provider default | Choose a specific model, e.g. `gpt-5.4-mini` |
+
+The default models are `gemini-3.8-flash`, `gpt-5.5`, `claude-sonnet-4-6` and `deepseek-v4-pro`.
 
 ---
 
-## If something goes wrong
+## 6. Troubleshooting
 
-The agent tells you in Slack what's wrong. The most common messages:
+The agent tells you in Slack (and in `docker logs`) what's wrong. Find the message below:
 
-| Message says | What to do |
+| You see | What to do |
 |---|---|
-| "the EC2 role isn't allowed to …" | Add the named permission to `pico-finops-agent-ec2-role` from `ec2-role-policy.json` (step 4b) |
-| "the loader Lambda's role isn't allowed to …" | Add it to `pico-finops-agent-loader-role` from `loader-role-policy.json` (step 4a) |
-| "the loader Lambda's role is missing or can't be used" | Recreate the role exactly as in step 4a. The agent picks it up on its next run |
-| "the state bucket doesn't exist" | Create the bucket from step 2, or fix `FOCUS_STATE_BUCKET` in `.env` |
-| "the EC2 has no working AWS credentials" | Attach `pico-finops-agent-ec2-role` to the EC2 (step 5) |
-| "No new AWS cost data for N days" | Check Billing and Cost Management → Data Exports; the export may be paused or deleted |
-| The bot doesn't answer | Check the bot is invited to the channel, and that you @mention it. Run `docker logs pico-finops-agent` |
-| `docker compose ps` shows **unhealthy**: "Slack tokens rejected" | A Slack token is wrong or revoked: fix `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN` in `.env`, then `docker compose up -d`. Data collection keeps running meanwhile |
-| **unhealthy**: "Slack unreachable" or "disconnected" | Usually the network or Slack itself; the agent retries and restarts itself after 10 minutes |
+| "the EC2 role isn't allowed to …" | Re-apply `ec2-role-policy.json` to `pico-finops-agent-ec2-role` (step 3e) |
+| "the loader Lambda's role isn't allowed to …" | Re-apply `loader-role-policy.json` to `pico-finops-agent-loader-role` (step 3d) |
+| "the loader Lambda's role is missing or can't be used" | Recreate the role exactly as in step 3d, and check `FOCUS_LAMBDA_ROLE_ARN` |
+| "the state bucket doesn't exist" | Create it (step 2b), or fix `FOCUS_STATE_BUCKET` in `.env` |
+| "the EC2 has no working AWS credentials" | The instance profile isn't attached. Attach the `pico-finops-agent-ec2-role` instance profile: **EC2 → Actions → Security → Modify IAM role** (step 6). Check that hop limit is 1 and IMDSv2 is required |
+| `FOCUS_… is not set` when the agent starts | That line is missing or empty in `.env`. Fix it and run `docker compose up -d` |
+| "No new AWS cost data for N days" | Check **Billing and Cost Management → Data Exports**. The export may be paused or deleted. |
+| The bot doesn't answer | Check that the bot is in the channel and that you @mention it. Then run `docker logs --tail 50 pico-finops-agent` |
+| **unhealthy**: "Slack tokens rejected" | A Slack token is wrong or revoked. Fix `SLACK_APP_TOKEN` / `SLACK_BOT_TOKEN`, then `docker compose up -d` |
+| **unhealthy**: "Slack unreachable" / "disconnected" | Usually a network problem or a Slack outage. The agent retries, and restarts itself after 10 minutes. |
 
-IAM changes can take a few minutes to apply. The agent retries on its next run, and you can also ask it `set up the cost agent`.
+IAM changes can take a few minutes to apply. The agent retries on its next run, or ask it `set up the cost agent`.
 
-**Useful commands** (run in `~/pico-finops-agent`):
+**Useful commands** (run them in `~/pico-finops-agent`):
 
 ```bash
-docker compose ps                         # is it running? (shows "healthy"; "unhealthy" says why below)
+docker compose ps                          # running? healthy?
+docker logs --tail 50 pico-finops-agent    # recent activity and errors
+docker compose run --rm agent check        # re-run the pre-flight check (posts nothing)
+docker compose restart                     # restart the agent
 docker inspect pico-finops-agent --format '{{json .State.Health.Log}}' | tail -c 400   # the last health check result
-docker logs --tail 50 pico-finops-agent       # data loading, notices and the Slack bot
-docker compose restart                    # restart the agent
-docker compose run --rm agent check       # re-run the pre-flight check (posts nothing)
 ```
+
+**Still stuck?** Open an issue at [github.com/CloudpiAi/Pico/issues](https://github.com/CloudpiAi/Pico/issues) and
+attach the output of `docker logs --tail 100 pico-finops-agent`. The agent never prints your keys or tokens, but
+please read the output before you share it.
 
 ---
 
-## Updating to a new version
+## 7. Updating, stopping and removing
+
+**Update to a new version** (your data is kept):
 
 ```bash
 cd ~/pico-finops-agent
-git pull                                  # the newest code (or: git checkout <release-tag>)
-docker compose build                      # rebuilds the image
-docker compose up -d                      # restarts the agent on the new image
+git pull                    # or: git checkout <release-tag>
+docker compose build
+docker compose up -d
 ```
 
-Your data is kept. If the agent's own data is ever lost, it rebuilds itself from the S3 table on its next start.
-
-## Stopping or removing
+**Stop:**
 
 ```bash
-docker compose down                       # stop (data kept)
-docker compose down -v                    # stop and delete the agent's local data
+docker compose down         # stop, and keep the local data
+docker compose down -v      # stop, and delete the local data (it's rebuilt from S3 on the next start)
 ```
 
-To remove everything, also delete these in AWS:
-- the Lambda function `pico-finops-agent-loader`
-- the layer `pico-finops-agent-duckdb`
-- the two roles
+**Remove everything:** stop the agent, terminate the EC2 instance, then delete these in AWS:
+- the Lambda function `pico-finops-agent-loader` and the layer `pico-finops-agent-duckdb`
+- the roles `pico-finops-agent-loader-role` and `pico-finops-agent-ec2-role`, and the instance profile `pico-finops-agent-ec2-role`
 - the table bucket and the state bucket
-- the export, if you no longer need it
+- the cost export, if you no longer need it
 
 ---
 
-## Security at a glance
+## 8. Security summary
 
-- **Runs in your account:**
-  - Everything runs inside your AWS account.
-  - Cost data never leaves it, except what's needed to answer a question: the question and the result rows go to your LLM provider (Google Gemini by default).
-  - Answers go to your Slack.
-- **No incoming connections:** the agent opens no port at all; it only connects out to AWS, Slack and your LLM provider.
-- **No AWS keys:** the EC2 and Lambda roles are used, and each one can only reach the agent's own resources.
-- **Hardened containers:** they run as a normal user, read-only, with no extra privileges.
-- **Keep `.env` private:** it holds the LLM API keys and the Slack tokens.
-
-**Questions or problems:** open an issue at [github.com/CloudpiAi/Pico](https://github.com/CloudpiAi/Pico/issues) and include the output of
-`docker logs --tail 100 pico-finops-agent`. The agent doesn't print your keys or tokens, but please look through it
-before you send it.
+- **Your data stays in your account.** Only a question and the few rows that answer it go to your LLM provider. Answers go to your Slack.
+- **No inbound connections.** The server opens no ports. It connects out to AWS, Slack and the LLM only.
+- **No AWS access keys.** The agent uses two IAM roles, and each role can reach only the agent's own resources.
+- **Hardened container.** It runs as a normal user, on a read-only file system, with all Linux capabilities dropped.
+- **Keep `.env` private.** It holds your LLM key and Slack tokens. Step 7b creates it readable by you only.

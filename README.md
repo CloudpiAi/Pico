@@ -9,7 +9,7 @@ The agent runs on one EC2 server in **your own AWS account**. It reads your AWS 
 the data in your own S3, and answers with the language model you choose: Google Gemini (default), OpenAI,
 Anthropic Claude or DeepSeek. There's no hosted service and no database to run.
 
-**Set it up:** [docs/CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) (about 30-45 minutes).
+**Set it up:** [docs/CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) (about 45 minutes, step by step, with a check after each step).
 
 ## What's in this repo
 
