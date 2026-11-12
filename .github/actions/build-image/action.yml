@@ -29,6 +29,12 @@ runs:
         load: true
         push: false
         tags: ${{ inputs.image }}
+        # The source label links a published image to this repository on GitHub's package page.
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.title=Pico FinOps Agent
+          org.opencontainers.image.licenses=Apache-2.0
         no-cache: ${{ inputs.disableCaching == 'true' }}
         cache-from: ${{ inputs.disableCaching != 'true' && 'type=gha,scope=pico-image' || '' }}
         cache-to: ${{ inputs.disableCaching != 'true' && 'type=gha,scope=pico-image,mode=max' || '' }}

@@ -1,0 +1,9 @@
+# Build the image yourself from this repository instead of pulling the released one.
+# Use it together with docker-compose.yml (everything else comes from there):
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.build.yml up -d
+# The image is tagged pico-finops-agent:local, so it is never mistaken for a released one.
+services:
+  agent:
+    build: .
+    image: pico-finops-agent:local

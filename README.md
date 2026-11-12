@@ -65,13 +65,13 @@ Everything inside the dashed box runs **in your AWS account**. Only Slack and th
 | Customer setup guide | Step-by-step to get Pico running | This repository |
 | `.env.example` | Configuration template (Slack tokens, LLM choice, etc.) | Your EC2 |
 
-The **agent code** (query execution, Slack integration, LLM interaction) is in this repository. You build the Docker image yourself on your EC2 (`docker compose build`), so you can read every line that runs in your account.
+The **agent code** (query execution, Slack integration, LLM interaction) is in this repository. Each release's image is built and checked by this repository's GitHub Actions and published as `ghcr.io/cloudpiai/pico-finops-agent` (public, no login). You can also build it yourself from this repository with `docker-compose.build.yml`.
 
 ## Getting started
 
 1. **Read the [setup guide](docs/CUSTOMER-SETUP-GUIDE.md)** — Step-by-step instructions to run Pico on your EC2
 2. **Prepare your AWS account** — Create S3 buckets, set up IAM roles (use the policies in `policies/aws/`)
-3. **Pull the Docker image** and start the container with your `.env` configuration
+3. **Pull the image** (`docker compose pull`, or build it yourself) and start the container with your `.env` configuration
 4. **Ask Pico a question in Slack** and get an answer
 
 **Estimated setup time:** 20–30 minutes for first-time AWS users
@@ -102,7 +102,9 @@ See [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) for a detailed priva
 ├── README.md                          # This file
 ├── CONTRIBUTING.md                    # How to contribute
 ├── CLAUDE.md                          # Guidelines for Claude Code
-├── docker-compose.yml                 # Docker container definition
+├── docker-compose.yml                 # Runs the released image (docker compose pull)
+├── docker-compose.build.yml           # Add it to build the image yourself
+├── Dockerfile                         # The image recipe (used by GitHub Actions and by you)
 ├── .env.example                       # Configuration template
 ├── policies/aws/                      # IAM role policies
 │   ├── ec2-role-policy.json          # Permissions for EC2 instance

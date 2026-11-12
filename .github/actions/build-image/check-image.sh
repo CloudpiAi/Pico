@@ -95,8 +95,9 @@ else bad "the heartbeat health check doesn't behave"; fi
 if [ "$(docker run --rm --network none --entrypoint id "$IMG" -u)" = "10001" ]; then ok "runs as uid 10001"
 else bad "does not run as uid 10001"; fi
 
-# 11. No CloudPi text in the agent's own files. Allowed: NOTICE's copyright line and this repository's URL.
-hits=$(run sh "$IMG" -c 'grep -rIin "cloudpi" --exclude-dir=.venv --exclude=NOTICE /app /home/pico /opt /usr/local/bin 2>/dev/null' | grep -vi "github.com/CloudpiAi/Pico")
+# 11. No CloudPi text in the agent's own files. Allowed: NOTICE's copyright line, this repository's URL and the
+#     published image's name (ghcr.io/cloudpiai/pico-finops-agent).
+hits=$(run sh "$IMG" -c 'grep -rIin "cloudpi" --exclude-dir=.venv --exclude=NOTICE /app /home/pico /opt /usr/local/bin 2>/dev/null' | grep -vi -e "github.com/CloudpiAi/Pico" -e "ghcr.io/cloudpiai/pico-finops-agent")
 if [ -z "$hits" ]; then
   ok "no CloudPi text outside NOTICE"
 else bad "CloudPi text is in the image: $(echo "$hits" | head -3 | cut -c1-160 | tr '
