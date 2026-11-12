@@ -131,6 +131,8 @@ Each step tells you **what to do** and then how to **check it**. Don't move on u
 3. **Export name:** for example `acme-focus-export`.
 4. **Data export storage settings:** create or choose an S3 bucket (for example `acme-cost-export`) and a
    path prefix (for example `focus`).
+   **File versioning:** either choice works. "Create new data export file" and "Overwrite existing data export
+   file" are both loaded.
 5. Click **Create**.
 
 **Write down** (worksheet #2 and #3):
@@ -188,6 +190,7 @@ into CloudShell:
 export REGION=us-east-1                            # worksheet #1
 export EXPORT_BUCKET=acme-cost-export              # worksheet #2
 export EXPORT_PREFIX=focus/acme-focus-export/data/ # worksheet #3 (ends with data/)
+export EXPORT_ROOT=${EXPORT_PREFIX%data/}          # the prefix without data/ (overwrite exports keep metadata/ here)
 export TABLE_BUCKET=acme-cost-agent                # the table bucket's NAME (the last part of worksheet #4)
 export STATE_BUCKET=acme-cost-agent-state          # worksheet #5
 export ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -206,6 +209,7 @@ sed -i -e "s|<region>|$REGION|g" \
        -e "s|<account-id>|$ACCOUNT_ID|g" \
        -e "s|<export-bucket>|$EXPORT_BUCKET|g" \
        -e "s|<export-prefix>|$EXPORT_PREFIX|g" \
+       -e "s|<export-root>|$EXPORT_ROOT|g" \
        -e "s|<table-bucket>|$TABLE_BUCKET|g" \
        -e "s|<state-bucket>|$STATE_BUCKET|g" \
        -e "s|<state-key>|pico-finops-agent/state.json|g" *.json
