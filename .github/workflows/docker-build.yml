@@ -1,0 +1,98 @@
+name: Pico / Build Docker Image
+
+# Builds the image exactly as a customer does (`docker compose build` uses the same Dockerfile) and checks it.
+# Nothing is pushed to any registry: customers build the image themselves.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!**/*.md'
+      - '!.github/**'
+      - '.github/actions/build-image/**'
+      - '.github/workflows/docker-build.yml'
+  pull_request:
+    paths:
+      - '**'
+      - '!docs/**'
+      - '!**/*.md'
+      - '!.github/**'
+      - '.github/actions/build-image/**'
+      - '.github/workflows/docker-build.yml'
+  workflow_dispatch:
+    inputs:
+      disableCaching:
+        description: 'Disable Caching'
+        required: false
+        type: boolean
+        default: false
+
+# Runs on pull requests from forks too: read-only token, no secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: "pico-finops-agent:ci"
+
+jobs:
+  build:
+    name: "Build Docker Image (AMD64)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build Image
+        uses: ./.github/actions/build-image
+        with:
+          image: ${{ env.IMAGE }}
+          disableCaching: ${{ inputs.disableCaching == true && 'true' || 'false' }}
+
+      - name: Check the image
+        shell: bash
+        run: |
+          set -u
+          fails=0
+          ok()  { echo "PASS: $1"; }
+          bad() { echo "::error::$1"; fails=$((fails + 1)); }
+          inspect() { docker image inspect "$IMAGE" --format "$1"; }
+
+          [ "$(inspect '{{json .Config.Entrypoint}}')" = '["pico-finops-agent-entrypoint","pico-finops-agent"]' ] \
+            && ok "entrypoint" || bad "entrypoint is $(inspect '{{json .Config.Entrypoint}}')"
+          [ "$(inspect '{{json .Config.Cmd}}')" = '["serve","--config","/home/pico/.pico/conf/agent.yml"]' ] \
+            && ok "default command: serve" || bad "default command is $(inspect '{{json .Config.Cmd}}')"
+          [ "$(inspect '{{json .Config.Healthcheck.Test}}')" = '["CMD","pico-finops-agent","health"]' ] \
+            && ok "health check" || bad "health check is $(inspect '{{json .Config.Healthcheck.Test}}')"
+          [ "$(inspect '{{json .Config.ExposedPorts}}')" = "null" ] \
+            && ok "no port declared" || bad "the image declares a port"
+          [ "$(docker run --rm --network none --entrypoint id "$IMAGE" -u)" = "10001" ] \
+            && ok "runs as uid 10001" || bad "does not run as uid 10001"
+
+          # Started with no settings, the agent refuses to start and names the first missing one.
+          out=$(docker run --rm --network none "$IMAGE" 2>&1); rc=$?
+          { [ "$rc" -eq 1 ] && echo "$out" | grep -q "FOCUS_REGION is not set"; } \
+            && ok "empty settings: exits 1 naming FOCUS_REGION" || bad "empty settings: exit $rc: $(echo "$out" | tail -2)"
+
+          docker run --rm --network none --entrypoint sh "$IMAGE" -c \
+            'pico-finops-agent --help | grep -q serve && cd /pico-workspace && pico focus-data status --help' >/dev/null 2>&1 \
+            && ok "pico-finops-agent and pico focus-data run" || bad "pico-finops-agent or pico focus-data doesn't run"
+
+          # docker-compose.yml as Docker reads it: host networking, no published port.
+          tmp=$(mktemp -d); cp docker-compose.yml "$tmp/"; : > "$tmp/.env"
+          cfg=$(docker compose -f "$tmp/docker-compose.yml" config --format json | tr -d ' \n')
+          { echo "$cfg" | grep -q '"network_mode":"host"' && ! echo "$cfg" | grep -q '"ports"'; } \
+            && ok "compose: host networking, no published port" || bad "compose publishes a port or isn't host networking"
+
+          echo "---"
+          [ "$fails" -eq 0 ] && echo "All checks passed." || { echo "$fails check(s) failed."; exit 1; }

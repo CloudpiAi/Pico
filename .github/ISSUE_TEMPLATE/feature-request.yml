@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest something Pico FinOps Agent could do
+labels: ["type: feature", "status: triage needed"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation and who runs into it.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would you like to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: Deployment impact
+      description: Would it need new IAM permissions, settings in `.env`, Slack scopes or Docker changes?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered

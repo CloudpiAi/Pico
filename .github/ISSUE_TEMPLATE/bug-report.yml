@@ -1,0 +1,51 @@
+name: Bug report
+description: Something in Pico FinOps Agent doesn't work as the setup guide says
+labels: ["type: bug", "status: triage needed"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please **don't paste secrets** (Slack tokens, API keys, AWS account IDs) — replace them
+        with placeholders.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release tag you run (`git describe --tags`), or the commit.
+      placeholder: v0.2.0
+    validations:
+      required: true
+  - type: textarea
+    id: check-output
+    attributes:
+      label: Output of `docker compose run --rm agent check`
+      description: Remove any secrets first.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: For example `docker compose logs --tail 100 agent`. Remove any secrets first.
+      render: text
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: EC2 type and OS, Docker and Compose versions, LLM provider.
+      placeholder: t3.medium, Amazon Linux 2023, Docker 25, Compose 2.29, Gemini
