@@ -17,7 +17,7 @@ We welcome contributions in these areas:
 
 1. **Check existing issues/PRs** — Someone might already be working on what you want to do
 2. **Propose big changes first** — Open a GitHub issue to discuss before spending time on a large change
-3. **Read CLAUDE.md** — It explains conventions for documentation, IAM policies, and tone
+3. **Check the relevant section below for conventions on documentation, IAM policies, and commit format**.
 
 ## How to contribute
 
@@ -84,7 +84,7 @@ Use the `/plan-pico-feature` Claude Code skill to structure a proposal.
 
 Before submitting a PR, make sure:
 
-- [ ] Your changes follow the conventions in [CLAUDE.md](CLAUDE.md)
+- [ ] Your changes follow the conventions described in this guide.
 - [ ] No hardcoded secrets (API keys, account IDs, customer-specific values)
 - [ ] All links work and point to current AWS/Slack/Pico docs
 - [ ] JSON files are valid syntax (`jq` can parse them)
@@ -119,7 +119,6 @@ By contributing, you agree that your contributions will be licensed under the sa
 ## Questions?
 
 - **Setup or deployment questions?** Check [docs/CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md)
-- **How should I structure this?** See [CLAUDE.md](CLAUDE.md)
 - **Want to use Claude Code?** Try `/update-customer-guide`, `/validate-iam-policy`, or `/plan-pico-feature`
 
 Thanks for contributing! 🚀
