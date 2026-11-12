@@ -251,3 +251,91 @@ def test_script_is_executable_and_posix():
     assert text.startswith("#!/bin/sh\n")
     assert "set -x" not in text and "[[" not in text
     assert os.access(SCRIPT, os.X_OK)
+
+
+# ---------- scheduled tasks settings (PRD R12, R15, R18, R19) ----------
+
+@pytest.mark.parametrize("name", ["FOCUS_REPORT_HISTORY_MAX", "FOCUS_ASK_MAX_PER_DAY"])
+@pytest.mark.parametrize("value,ok", [("20", True), ("1", True), ("0", False), ("abc", False), ("", False),
+                                      ("2.5", False)])
+def test_task_counts(tmp_path, name, value, ok):
+    r = run(tmp_path, env_over={name: value})
+    assert (r.returncode == 0) is ok, r.stderr
+    if not ok:
+        assert name in r.stderr
+
+
+# ---------- Slack answer hardening (pico_finops_agent/slack_guard.py; optional, defaults 8 / 180 / 30) ----------
+
+@pytest.mark.parametrize("name,value,ok", [
+    ("AGENT_HISTORY_TURNS", "1", True), ("AGENT_HISTORY_TURNS", "8", True), ("AGENT_HISTORY_TURNS", "50", True),
+    ("AGENT_HISTORY_TURNS", "0", False), ("AGENT_HISTORY_TURNS", "51", False), ("AGENT_HISTORY_TURNS", "abc", False),
+    ("AGENT_HISTORY_TURNS", "", False), ("AGENT_HISTORY_TURNS", "2.5", False),
+    ("AGENT_ANSWER_DEADLINE_S", "30", True), ("AGENT_ANSWER_DEADLINE_S", "180", True),
+    ("AGENT_ANSWER_DEADLINE_S", "900", True), ("AGENT_ANSWER_DEADLINE_S", "29", False),
+    ("AGENT_ANSWER_DEADLINE_S", "901", False), ("AGENT_ANSWER_DEADLINE_S", "1000", False),
+    ("AGENT_ANSWER_DEADLINE_S", "x", False), ("AGENT_ANSWER_DEADLINE_S", "", False),
+    ("AGENT_QUESTIONS_PER_HOUR", "0", True), ("AGENT_QUESTIONS_PER_HOUR", "30", True),
+    ("AGENT_QUESTIONS_PER_HOUR", "1000", True), ("AGENT_QUESTIONS_PER_HOUR", "-1", False),
+    ("AGENT_QUESTIONS_PER_HOUR", "07", False), ("AGENT_QUESTIONS_PER_HOUR", "x", False),
+    ("AGENT_QUESTIONS_PER_HOUR", "", False),
+])
+def test_slack_answer_settings(tmp_path, name, value, ok):
+    r = run(tmp_path, env_over={name: value})
+    assert (r.returncode == 0) is ok, r.stderr
+    if not ok:
+        assert name in r.stderr
+
+
+@pytest.mark.parametrize("value,ok", [("", True), ("C0AAA00001", True), ("C0AAA00001,G0BBB00002", True),
+                                      ("C0AAA00001, C0BBB00002", True), ("general", False), ("#finance", False)])
+def test_task_channels(tmp_path, value, ok):
+    r = run(tmp_path, env_over={"FOCUS_REPORT_CHANNELS": value})
+    assert (r.returncode == 0) is ok, r.stderr
+
+
+@pytest.mark.parametrize("value,ok", [("U0ADMIN001", True), ("U0ADMIN001,W0ADMIN002", True), ("", True),
+                                      ("ravi", False)])
+def test_task_admins(tmp_path, value, ok):
+    r = run(tmp_path, env_over={"FOCUS_REPORT_ADMINS": value})
+    assert (r.returncode == 0) is ok, r.stderr
+
+
+@pytest.mark.parametrize("value,ok", [("true", True), ("false", True), ("yes", False), ("", False)])
+def test_task_mentions_switch(tmp_path, value, ok):
+    r = run(tmp_path, env_over={"FOCUS_REPORT_ALLOW_MENTIONS": value})
+    assert (r.returncode == 0) is ok, r.stderr
+
+
+
+@pytest.mark.parametrize("value,ok", [("U0RAVI0001", True), ("U0RAVI0001,U0MEENA001", True), ("", True),
+                                      ("ravi", False)])
+def test_task_creators(tmp_path, value, ok):
+    r = run(tmp_path, env_over={"FOCUS_REPORT_CREATORS": value})
+    assert (r.returncode == 0) is ok, r.stderr
+
+
+# ---------- FOCUS_EXPORT_PREFIX is a key path inside the bucket (2026-11-11: an s3:// prefix loaded nothing) ----------
+
+@pytest.mark.parametrize("value", ["s3://acme-focus-export/focus2/focus2/data/", "S3://acme-focus-export/focus2/data/"])
+def test_export_prefix_must_be_a_key_path_not_a_url(tmp_path, value):
+    r = run(tmp_path, env_over={"FOCUS_EXPORT_PREFIX": value})
+    assert r.returncode == 1 and "FOCUS_EXPORT_PREFIX" in r.stderr and "key path" in r.stderr
+    assert value not in r.stderr
+
+
+def test_export_prefix_without_data_warns_but_starts(tmp_path):
+    r = run(tmp_path, env_over={"FOCUS_EXPORT_PREFIX": "focus2/flat/"})
+    assert r.returncode == 0 and r.stdout.strip() == "started"
+    assert "FOCUS_EXPORT_PREFIX" in r.stderr and "data/" in r.stderr and "focus2/flat/" not in r.stderr
+
+
+def test_export_prefix_ending_with_data_does_not_warn(tmp_path):
+    r = run(tmp_path, env_over={"FOCUS_EXPORT_PREFIX": "focus2/focus2/data/"})
+    assert r.returncode == 0 and "FOCUS_EXPORT_PREFIX" not in r.stderr
+
+
+def test_export_prefix_starting_with_the_bucket_name_warns_but_starts(tmp_path):
+    """Review: a real folder can have the bucket's name, so this is a warning, not a refusal."""
+    r = run(tmp_path, env_over={"FOCUS_EXPORT_PREFIX": "acme-focus-export/focus2/data/"})
+    assert r.returncode == 0 and "FOCUS_EXPORT_PREFIX" in r.stderr and "bucket name" in r.stderr

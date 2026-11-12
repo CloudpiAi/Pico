@@ -161,7 +161,7 @@ def test_early_month_includes_previous_month():
     assert list(fl.select_periods(state, AVAIL, early, force=False, periods=None)) == ["2026-10", "2026-11"]
 
 
-def test_newest_folder_ignores_names_with_sql_characters():
+def test_newest_delivery_folder_ignores_names_with_sql_characters():
     base = "focus/acme/data/billing_period=2026-10/"
     keys = [base + "2026-11-01T23:09:48.098Z-c079028e-d969-3a86-a07d-bf59f6c526d1/p.parquet",
             base + "2026-11-02T15:07:11.328Z-e2891bd6-5d2b-3e19-83a2-6eda07f5202e/p.parquet",
@@ -172,7 +172,7 @@ def test_newest_folder_ignores_names_with_sql_characters():
         def get_paginator(self, n):
             return types.SimpleNamespace(paginate=lambda **kw: [{"Contents": [{"Key": k} for k in keys]}])
 
-    assert fl.newest_folder(S3(), "b", "focus/acme/data/", "2026-10") == (
+    assert fl.find_delivery(S3(), "b", "focus/acme/data/", "2026-10").ident == (
         "2026-11-02T15:07:11.328Z-e2891bd6-5d2b-3e19-83a2-6eda07f5202e")
 
 

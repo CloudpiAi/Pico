@@ -416,6 +416,24 @@ def test_status_shows_identity_remote_state_and_local(cfg, monkeypatch, capsys):
     assert "last_load" in out
 
 
+def test_status_shows_the_export_mode_per_month(cfg, monkeypatch, capsys):
+    """2026-11-11: an overwrite export (focus2) loaded nothing; status now says which mode each month had."""
+    monkeypatch.setattr(lambda_ops, "identity", lambda c: "arn:aws:sts::111122223333:assumed-role/ec2-role/i-1")
+    monkeypatch.setattr(lambda_ops, "remote_state", lambda c: {
+        "loaded": {"2026-10": "s3://u", "2026-11": "overwrite:e1"},
+        "export_modes": {"2026-10": "create_new", "2026-11": "overwrite"}})
+    assert cli.main(["status"], {**PROFILE, "cache_path": cfg.cache_path, "zip_dir": cfg.zip_dir}) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["export_modes"] == {"2026-10": "create_new", "2026-11": "overwrite"}
+
+
+def test_status_export_modes_empty_before_any_load(cfg, monkeypatch, capsys):
+    monkeypatch.setattr(lambda_ops, "identity", lambda c: "arn:aws:sts::111122223333:assumed-role/ec2-role/i-1")
+    monkeypatch.setattr(lambda_ops, "remote_state", lambda c: None)
+    assert cli.main(["status"], {**PROFILE, "cache_path": cfg.cache_path, "zip_dir": cfg.zip_dir}) == 0
+    assert json.loads(capsys.readouterr().out)["export_modes"] == {}
+
+
 def test_status_without_credentials_says_so(cfg, monkeypatch, capsys):
     def no_creds(c):
         raise lambda_ops.NoCredentials("no AWS credentials: attach the instance role, and set the IMDSv2 hop limit to 2 for Docker")
@@ -525,3 +543,53 @@ def test_load_after_an_interrupted_one_rebuilds_the_local_copy(run, cfg, capsys)
     rc, _, st = run([OK_NOOP], cache=True)  # nothing new delivered
     assert rc == 0 and run.refreshed == [1] and "load_in_progress" not in st
     assert "previous_load_interrupted" in capsys.readouterr().out + open(cfg.log_path).read()
+
+
+@pytest.mark.parametrize("method,source", [
+    ("env", "env"), ("explicit", "env"), ("shared-credentials-file", "profile"), ("config-file", "profile"),
+    ("sso", "profile"), ("assume-role", "profile"), ("iam-role", "instance_role"), ("container-role", "instance_role"),
+    ("something-new", "unknown"),
+])
+def test_credential_source_follows_boto3s_method(cfg, method, source):
+    class Creds:
+        def __init__(self, m):
+            self.method = m
+
+    class Session:
+        def get_credentials(self):
+            return Creds(method)
+    assert lambda_ops.credential_source(cfg, session=lambda c: Session()) == source
+
+
+def test_credential_source_none_and_errors(cfg):
+    class NoCreds:
+        def get_credentials(self):
+            return None
+
+    class Broken:
+        def get_credentials(self):
+            raise RuntimeError("imds timeout")
+    assert lambda_ops.credential_source(cfg, session=lambda c: NoCreds()) == "none"
+    assert lambda_ops.credential_source(cfg, session=lambda c: Broken()) == "unknown"
+
+
+def test_a_load_with_an_expired_env_token_reports_expired(cfg, monkeypatch):
+    """2026-11-12 on a test server: the .env session token expired; the alert must say so, not 'attach the role'."""
+    class Expired(Exception):
+        response = {"Error": {"Code": "ExpiredTokenException", "Message": "The security token is expired"}}
+
+    lam = FakeLambda()
+
+    def expired(**kw):
+        raise Expired("An error occurred (ExpiredTokenException) when calling the ListLayerVersions operation")
+
+    lam.list_layer_versions = expired
+    monkeypatch.setattr(lambda_ops, "lambda_client", lambda c: lam)
+    monkeypatch.setattr(lambda_ops, "credential_source", lambda c, **kw: "env")
+    assert loader.run_load(cfg) == 2
+    p = loader.read_state(cfg)["problem"]
+    assert (p["cause"], p["source"], p["aws_code"]) == ("expired", "env", "ExpiredTokenException")
+
+
+def test_the_no_credentials_hint_is_not_ec2_only():
+    assert "instance role" in lambda_ops.NO_CREDENTIALS_MSG and ".env" in lambda_ops.NO_CREDENTIALS_MSG

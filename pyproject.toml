@@ -132,7 +132,7 @@ where = ["."]
 include = ["pico*"]
 # The wheel is the Pico framework only: the agent (pico_finops_agent, which "pico*" would match) runs from
 # the source tree, and plugins/focus is installed as its own package.
-exclude = ["benchmark*", "docs*", "plugins.focus*", "pico_finops_agent*"]
+exclude = ["benchmark*", "docs*", "plugins.focus*", "plugins.schedule*", "pico_finops_agent*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yml", "*.yaml", "*.json", "*.md", "*.txt", "*.j2"]
@@ -188,7 +188,7 @@ ignore = [
 max-complexity = 10
 
 [tool.ruff.lint.isort]
-known-first-party = ["pico", "plugins", "pico_finops_agent", "pico_plugin_focus_data"]
+known-first-party = ["pico", "plugins", "pico_finops_agent", "pico_plugin_focus_data", "pico_plugin_schedule"]
 known-third-party = ["mcp"]
 
 [tool.pytest.ini_options]
@@ -239,7 +239,7 @@ ci = [
 ]
 
 [tool.coverage.run]
-source = ["pico", "plugins", "pico_finops_agent", "plugins/focus/pico_plugin_focus_data"]
+source = ["pico", "plugins", "pico_finops_agent", "plugins/focus/pico_plugin_focus_data", "plugins/schedule/pico_plugin_schedule"]
 omit = [
     "pico/prompts/prompt_templates/*",
     "pico/cli/screen/*",

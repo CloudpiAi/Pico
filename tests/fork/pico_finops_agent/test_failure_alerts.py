@@ -12,9 +12,8 @@ pytest.importorskip("apscheduler", reason="Needs the pico-finops-agent extra")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "plugins" / "focus"))
-from pico_plugin_focus_data import problems  # noqa: E402
-
 from pico_finops_agent import scheduler as agent_api  # noqa: E402
+from pico_plugin_focus_data import problems  # noqa: E402
 
 
 class _ClientError(Exception):
@@ -195,7 +194,7 @@ def test_the_last_load_before_an_upgrade_is_not_posted_again(chan, tmp_path):
 
 def test_scheduler_has_the_watch_job(monkeypatch):
     sched = agent_api.build_scheduler()
-    assert {j.id for j in sched.get_jobs()} == {agent_api.JOB_ID, agent_api.WATCH_JOB_ID}
+    assert {j.id for j in sched.get_jobs()} == {agent_api.JOB_ID, agent_api.WATCH_JOB_ID, "tasks_sync"}  # + scheduled Slack tasks
 
 
 def test_slack_load_after_a_failure_posts_the_recovery_too(chan, tmp_path):
@@ -236,3 +235,73 @@ def test_recovery_and_notice_never_overlap(chan, tmp_path):
         agent_api._ANNOUNCE_LOCK.release()
     t.join(2)
     assert len(posts) == 1
+
+
+# --- the credentials alert names the real cause (2026-11-12: an expired .env session token on a test server was
+# reported as "the EC2 has no working AWS credentials. Attach the instance role (IMDSv2 hop limit 2 for Docker).")
+
+
+def test_an_expired_token_from_env_says_expired_and_how_to_renew():
+    p = problems.from_exception(_ClientError("ExpiredTokenException", "The security token included in the request "
+                                             "is expired"), source_of=lambda: "env")
+    assert (p["code"], p["cause"], p["source"], p["aws_code"]) == ("credentials", "expired", "env",
+                                                                    "ExpiredTokenException")
+    assert p["summary"] == "the AWS credentials have expired"
+    assert "AWS_SESSION_TOKEN" in p["action"] and ".env" in p["action"]
+    assert "EC2" not in p["summary"] + p["action"] and "hop limit" not in p["action"]
+    assert p["permanent"] is True
+
+
+def test_an_expired_profile_says_sign_in_again():
+    p = problems.from_exception(_ClientError("ExpiredToken"), source_of=lambda: "profile")
+    assert p["cause"] == "expired" and "aws sso login" in p["action"] and "hop limit" not in p["action"]
+
+
+def test_expired_instance_role_credentials_point_at_the_role():
+    p = problems.from_exception(_ClientError("ExpiredTokenException"), source_of=lambda: "instance_role")
+    assert "instance role" in p["summary"] + p["action"] and "hop limit 2" in p["action"]
+
+
+def test_an_invalid_key_from_env_says_fix_the_key():
+    p = problems.from_exception(_ClientError("InvalidClientTokenId"), source_of=lambda: "env")
+    assert (p["cause"], p["aws_code"]) == ("invalid", "InvalidClientTokenId")
+    assert p["summary"] == "the AWS access key isn't valid"
+    assert "AWS_ACCESS_KEY_ID" in p["action"] and "hop limit" not in p["action"]
+
+
+def test_no_credentials_at_all_offers_both_ways():
+    e = RuntimeError("Secret Validation Failure: during `create` using the following:\nCredential Chain: 'config'")
+    p = problems.from_exception(e, stage="cache", source_of=lambda: "none")
+    assert (p["code"], p["cause"]) == ("credentials", "missing")
+    assert p["summary"] == "no AWS credentials were found"
+    assert "instance role" in p["action"] and ".env" in p["action"]
+
+
+def test_an_unknown_source_gives_the_generic_hint():
+    p = problems.from_exception(_ClientError("ExpiredTokenException"))
+    assert p["source"] == "unknown" and ".env" in p["action"] and "instance role" in p["action"]
+
+
+def test_the_source_is_only_looked_up_for_a_credentials_problem():
+    def boom():
+        raise AssertionError("looked up for a non-credentials problem")
+    assert problems.from_exception(_ClientError("TooManyRequestsException"), source_of=boom)["code"] == "timeout"
+
+
+def test_a_failing_source_lookup_does_not_break_the_classification():
+    def broken():
+        raise RuntimeError("no metadata")
+    p = problems.from_exception(_ClientError("ExpiredTokenException"), source_of=broken)
+    assert p["cause"] == "expired" and p["source"] == "unknown"
+
+
+def test_the_slack_alert_shows_the_cause_and_the_aws_code():
+    p = problems.from_exception(_ClientError("ExpiredTokenException"), source_of=lambda: "env")
+    text = agent_api.failure_text(p, "2026-11-09")
+    assert "the AWS credentials have expired (ExpiredTokenException)." in text
+    assert "EC2" not in text and "hop limit" not in text and "data through Mon 9 Nov" in text
+
+
+def test_problems_without_an_aws_code_keep_their_text():
+    p = problems.config("FOCUS_REGION is not set")
+    assert agent_api.failure_text(p, None) == f":warning: I couldn't refresh the cost data: {p['summary']}. {p['action']}"

@@ -29,6 +29,11 @@ agent:
   target_provider: gemini
   target_model: gemini-3.8-flash
 
+  # At most 15 model/tool rounds per Slack answer (Pico's default is 50), like the platform analyst's cap.
+  agentic_nodes:
+    chat:
+      max_turns: 15
+
   # No statement that writes, on any datasource (one-way switch).
   sql_read_only: true
 
@@ -56,7 +61,7 @@ agent:
 
   bash:
     enabled: true
-    allowed_patterns: ["pico:focus-data"]
+    allowed_patterns: ["pico:focus-data", "pico:schedule"]
 
   filesystem:
     strict: true
@@ -82,6 +87,13 @@ agent:
         state_key: ${FOCUS_STATE_KEY:-pico-finops-agent/state.json}
         months: ${FOCUS_MONTHS:-4}
         lambda_role_arn: ${FOCUS_LAMBDA_ROLE_ARN}
+    # Scheduled Slack tasks (plugins/schedule): reports read the FOCUS cache through FocusSource.
+    schedule:
+      default:
+        default: true
+        data_dir: /data
+        source: "pico_plugin_focus_data.schedule_source:FocusSource"
+        cache_path: /data/focus.duckdb
 
   # Slack is off when the tokens are unset (the adapter needs both non-empty).
   # When on, Slack is NOT authenticated per user: anyone who can message the bot in the workspace

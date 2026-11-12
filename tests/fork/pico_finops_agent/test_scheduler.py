@@ -18,7 +18,7 @@ def test_job_defaults_from_env(monkeypatch):
     monkeypatch.delenv("FOCUS_SCHEDULE", raising=False)
     sched = agent_api.build_scheduler()
     jobs = sched.get_jobs()
-    assert [j.id for j in jobs] == ["pico_finops_agent_load", "pico_finops_agent_watch"]
+    assert sorted(j.id for j in jobs) == ["pico_finops_agent_load", "pico_finops_agent_watch", "tasks_sync"]  # + scheduled Slack tasks
     assert sched._job_defaults["max_instances"] == 1
     assert sched._job_defaults["coalesce"] is True
 
@@ -197,6 +197,19 @@ def test_notice_without_anything_unusual():
     quiet = {**INSIGHTS, "latest_day_cost": 17.2, "spikes": [], "stopped": [], "new_resources": {"count": 0, "cost": 0}}
     text = agent_api.notice_text(["2026-11"], quiet)
     assert ":warning:" not in text and "Nothing unusual stood out" in text and "about the same as" in text
+
+
+def test_notice_shows_a_partial_newest_day():
+    """2026-11-11: the notice said "through 9 Nov" while 10 Nov was already partly in; say so, with its hours and cost."""
+    text = agent_api.notice_text(["2026-11"], {**INSIGHTS, "partial_day": {"day": "2026-11-05", "hours": 20, "cost": 2.51}})
+    assert "through *Wed 4 Nov*" in text
+    assert "• *Thu 5 Nov* is partly in: 20 of 24 hours, *$2.51* so far." in text
+    assert text.index("partly in") < text.index("so far:")       # right after the day's own line
+
+
+def test_notice_without_a_partial_day_says_nothing_about_it():
+    assert "partly in" not in agent_api.notice_text(["2026-11"], {**INSIGHTS, "partial_day": None})
+    assert "partly in" not in agent_api.notice_text(["2026-11"], INSIGHTS)   # insights saved before this change
 
 
 def test_notice_without_insights_falls_back():

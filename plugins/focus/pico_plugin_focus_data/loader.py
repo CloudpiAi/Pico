@@ -247,11 +247,13 @@ def run_load(cfg, force=False):
         _log(cfg, "failed", error=state["last_error"])
         return RC_PERSON
     except lambda_ops.NoCredentialsError:  # a retry can't fix this
-        state.update(last_error=lambda_ops.NO_CREDENTIALS_MSG, last_error_at=_now(), problem=problems.credentials())
+        state.update(last_error=lambda_ops.NO_CREDENTIALS_MSG, last_error_at=_now(),
+                     problem=problems.credentials(cause="missing", source=lambda_ops.credential_source(cfg)))
         _log(cfg, "failed", error=state["last_error"])
         return RC_PERSON
     except Exception as e:  # kept in state.json so `status` (and the chat skill) can report it
-        state["problem"] = problems.from_exception(e, stage=stage)
+        state["problem"] = problems.from_exception(e, stage=stage,
+                                                   source_of=lambda: lambda_ops.credential_source(cfg))
         state.update(last_error=f"{type(e).__name__}: {str(e)[:300]}", last_error_at=_now())
         _log(cfg, "failed", error=state["last_error"], problem=state["problem"]["code"],
              seconds=round(time.perf_counter() - t0, 2))
@@ -277,4 +279,7 @@ def status(cfg):
         out["s3_table_state"] = lambda_ops.remote_state(cfg)
     except Exception as e:  # noqa: BLE001
         out["s3_table_state"] = f"unreadable: {type(e).__name__}: {str(e)[:200]}"
+    table = out["s3_table_state"]
+    # each month's AWS export mode as the Lambda found it: create_new | overwrite | mixed (both layouts)
+    out["export_modes"] = dict(table.get("export_modes") or {}) if isinstance(table, dict) else {}
     return out

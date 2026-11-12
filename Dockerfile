@@ -17,7 +17,7 @@ RUN python loader/build_zip.py /out \
       z.extractall('/out/ext', [n for n in z.namelist() if n.startswith('duckdb_ext/')])" \
  && ls /out/ext/duckdb_ext/v*/linux_amd64/iceberg.duckdb_extension
 
-# 2. The Python environment: the Pico framework, the agent's extra and the focus-data plugin.
+# 2. The Python environment: the Pico framework, the agent's extra, the focus-data and the schedule plugins.
 FROM ${PYTHON_IMAGE} AS build
 WORKDIR /app
 # The same uv that wrote uv.lock; an older one may reject or rewrite it.
@@ -27,14 +27,21 @@ RUN uv sync --frozen --no-dev --extra pico-finops-agent --no-install-project
 COPY ./pico ./pico
 COPY ./pico_finops_agent ./pico_finops_agent
 COPY ./plugins/focus ./plugins/focus
+COPY ./plugins/schedule ./plugins/schedule
 COPY ./loader/pins.json /tmp/pins.json
-# The plugin's packages (boto3, duckdb) come from uv.lock, not resolved again; the lock's DuckDB must be the one
+# The plugins' packages (boto3, duckdb) come from uv.lock, not resolved again; the lock's DuckDB must be the one
 # the Lambda and the extensions are pinned to (loader/pins.json), or the local copy can't load them.
 RUN uv sync --frozen --no-dev --extra pico-finops-agent \
- && uv pip install --python /app/.venv/bin/python --no-deps ./plugins/focus \
+ && uv pip install --python /app/.venv/bin/python --no-deps ./plugins/focus ./plugins/schedule \
  && /app/.venv/bin/python -c "import json, boto3, duckdb; want = json.load(open('/tmp/pins.json'))['duckdb_version']; \
       assert duckdb.__version__ == want, (duckdb.__version__, want)" \
- && rm -rf ./plugins/focus/build /tmp/pins.json
+ && rm -rf ./plugins/focus/build ./plugins/schedule/build /tmp/pins.json
+# Precompile everything: the container's disk is read-only, so Python can't write a .pyc cache at run time and every
+# `pico` command (each Slack task, each scheduled question) would recompile ~3,200 files (~5 s). Hash-checked .pyc stay
+# valid however the copy below sets file times. Some third-party test files don't compile; that is expected.
+RUN /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash \
+      /app/pico /app/pico_finops_agent "$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+      >/dev/null || true
 
 # 3. What runs.
 FROM ${PYTHON_IMAGE}

@@ -25,7 +25,7 @@ import threading
 import time
 import urllib.request
 
-from pico_finops_agent import health, llm, scheduler
+from pico_finops_agent import bash_guard, health, llm, scheduler
 from pico_finops_agent.log import describe
 from pico_finops_agent.log import log_event as _log
 
@@ -249,7 +249,7 @@ class SlackRunner:
 # ---------- the supervisor (main thread) ----------
 
 def supervise(slack, last_tick, stop, *, heartbeat_path, clock=time.time, interval_s=HEARTBEAT_S,
-              log_every_s=UNHEALTHY_LOG_EVERY_S, load_running=lambda: False):
+              log_every_s=UNHEALTHY_LOG_EVERY_S, load_running=lambda: False, tasks_ok_at=lambda: None):
     """Heartbeat every interval_s until stop is set (returns 0) or a fatal verdict (returns its exit code)."""
     code = 0
     reported, reported_at = None, 0.0
@@ -257,7 +257,7 @@ def supervise(slack, last_tick, stop, *, heartbeat_path, clock=time.time, interv
         now = clock()
         snap = slack.snapshot()
         tick = last_tick()
-        verdict = health.evaluate(now, snap, tick, load_running=load_running())
+        verdict = health.evaluate(now, snap, tick, load_running=load_running(), tasks_ok_at=tasks_ok_at())
         _beat(heartbeat_path, now, verdict.status, verdict.reason, snap, tick)
         if verdict.exit_code is not None:
             _log("agent_restarting", reason=verdict.reason, exit_code=verdict.exit_code)
@@ -299,6 +299,30 @@ def _install_cache_reconnect():
     cache_reconnect.install()  # Slack answers see the new local copy after each load, without a restart
 
 
+def _install_slack_context():
+    """The signed who/where line scheduled tasks check (`--ctx`), from the schedule plugin. Without the plugin Slack
+    answers work as before; only tasks are off."""
+    try:
+        from pico_plugin_schedule.hooks import pico_gateway
+    except ImportError as e:
+        _log("tasks_off", reason=describe(e, 200))
+        return
+    pico_gateway.install_context(scheduler.data_dir())
+
+
+def _install_slack_guard():
+    """Slack answer hardening (pico_finops_agent/slack_guard.py): last-N-turns model input, empty-answer retry, clear
+    sentences instead of raw errors or a stuck answer, a per-person hourly limit, a reset phrase, one log line per
+    question. Installed after the ctx line so it is the outermost wrapper. If it can't install (a Pico change the
+    pin tests missed), Slack still answers, unguarded, and the log says so."""
+    from pico_finops_agent import slack_guard
+
+    try:
+        slack_guard.install(slack_guard.settings_from_env())
+    except Exception as e:  # noqa: BLE001
+        _log("slack_guard_off", reason=describe(e, 200))
+
+
 def _make_signal_handler(stop, exit=os._exit):
     def handle(signum, _frame):
         if stop.is_set():
@@ -322,10 +346,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     _configure_logging()
+    bash_guard.install()  # no $ / backtick expansion in allow-listed commands (secrets)
     _install_cache_reconnect()
     factory = _gateway_factory(_load_gateway_config(args.config)) if slack_tokens_set() else None
     if factory is None:
         _log("slack_off", reason="SLACK_APP_TOKEN and SLACK_BOT_TOKEN not both set: data collection only")
+    else:
+        _install_slack_context()
+        _install_slack_guard()
 
     stop = threading.Event()
     _install_signal_handlers(stop)
@@ -334,7 +362,7 @@ def main(argv=None):
     try:
         slack.start()
         return supervise(slack, scheduler.last_tick, stop, heartbeat_path=health.heartbeat_path(),
-                         load_running=scheduler.load_running)
+                         load_running=scheduler.load_running, tasks_ok_at=scheduler.tasks_ok_at)
     finally:
         slack.stop()
         scheduler.stop_scheduler(sched)

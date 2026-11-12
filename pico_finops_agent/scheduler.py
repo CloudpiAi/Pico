@@ -103,6 +103,11 @@ def notice_text(months, insights=None):
         lines.append(f"• That day came to *{_money(latest)}*, {_compare(latest, avg)} your usual *{_money(avg)}/day*.")
     else:
         lines.append(f"• That day came to *{_money(latest)}*.")
+    partial = insights.get("partial_day")
+    if partial and partial.get("hours"):  # the newest day is only partly in (AWS sends hours late)
+        pday = date.fromisoformat(partial["day"])
+        lines.append(f"• *{pday.strftime('%a')} {pday.day} {pday.strftime('%b')}* is partly in: {partial['hours']} of 24 "
+                     f"hours, *{_money(partial.get('cost', 0))}* so far.")
     mtd = insights.get("mtd") or {}
     month = calendar.month_name[day.month]
     if mtd.get("prev_same_days", 0) > 0:
@@ -193,7 +198,8 @@ def _post(token, channel, text, event, **kw):
 
 
 def failure_text(problem, data_through):
-    text = f":warning: I couldn't refresh the cost data: {problem['summary']}. {problem['action']}"
+    code = f" ({problem['aws_code']})" if problem.get("aws_code") else ""  # e.g. ExpiredTokenException
+    text = f":warning: I couldn't refresh the cost data: {problem['summary']}{code}. {problem['action']}"
     if data_through:
         text += f" Until then, answers use data through {_day_label(data_through)}."
     return text
@@ -311,17 +317,100 @@ def _load(retry):
     cmd = job_command()
     t0 = time.perf_counter()
     rc = None
+    _LOAD["running"] = True
+    ran = False
     try:
         rc = subprocess.run(shlex.split(cmd), timeout=JOB_TIMEOUT_S).returncode
+        ran = True
         _log("scheduled_load_done", cmd=cmd, rc=rc, seconds=round(time.perf_counter() - t0, 2))
-        _notify_after_load(rc, final=not (rc == RC_RETRY and retry and _SCHEDULER is not None))
     except Exception as e:  # a failed run must never take the agent down
         _log("scheduled_load_failed", cmd=cmd, error=describe(e, 300), seconds=round(time.perf_counter() - t0, 2))
         rc = RC_RETRY
+    finally:
+        _LOAD["running"] = False
+    if ran:
+        try:  # a notice that fails is logged; it never changes the load's result
+            _notify_after_load(rc, final=not (rc == RC_RETRY and retry and _SCHEDULER is not None))
+        except Exception as e:  # noqa: BLE001
+            _log("slack_notice_failed", error=describe(e, 200))
+    if _TASKS is not None:
+        _TASKS.on_load_done(rc)  # data tasks that waited for this load go out now
     if rc == RC_RETRY and retry and _SCHEDULER is not None:
         at = datetime.now(timezone.utc) + RETRY_AFTER
         _SCHEDULER.add_job(_run_job, "date", run_date=at, args=(False,), id="pico_finops_agent_retry", replace_existing=True)
         _log("retry_scheduled", at=at.isoformat(timespec="seconds"))
+
+
+# ---------------- the data load's side of scheduled Slack tasks (plugins/schedule) ----------------
+LOAD_JOB_IDS = (JOB_ID, "pico_finops_agent_startup", "pico_finops_agent_retry")
+_LOAD = {"running": False}
+
+
+def _next_load_at():
+    """When the next scheduled load starts (UTC), or None."""
+    if _SCHEDULER is None:
+        return None
+    times = [j.next_run_time for j in _SCHEDULER.get_jobs() if j.id in LOAD_JOB_IDS and j.next_run_time]
+    return min(times) if times else None
+
+
+def _last_slot(now):
+    """The most recent scheduled load time (FOCUS_SCHEDULE) at or before `now`, or None."""
+    trigger = CronTrigger.from_crontab(job_cron(), timezone="UTC")
+    t, last = trigger.get_next_fire_time(None, now - timedelta(days=8)), None
+    while t is not None and t <= now:
+        last = t
+        t = trigger.get_next_fire_time(t, t + timedelta(minutes=1))
+    return last
+
+
+def _fresh_since_last_slot(now):
+    """True when a load succeeded at or after the last scheduled load time: the next load won't be fresher by
+    schedule, so a data task need not wait for it (e.g. the startup load just ran)."""
+    state = _read_state() or {}
+    try:
+        last_ok = datetime.fromisoformat(state["last_success"])
+        slot = _last_slot(now)
+        return slot is not None and last_ok >= slot
+    except (KeyError, TypeError, ValueError):  # no state, or a time without a zone: hold as before
+        return False
+
+
+class _FocusLoadGate:
+    """The FOCUS load as the schedule plugin's LoadGate: data tasks wait for a running or soon-due load."""
+
+    def running(self):
+        return _LOAD["running"]
+
+    def next_load_at(self):
+        return _next_load_at()
+
+    def fresh_since_last_slot(self, now):
+        return _fresh_since_last_slot(now)
+
+
+_TASKS = None  # pico_plugin_schedule.runner when the schedule plugin is installed, else None (tasks off)
+
+
+def _install_tasks(sched):
+    """Scheduled Slack tasks, when the schedule plugin is installed. Without it the load, watch and notices run as
+    before (logged once as tasks_off)."""
+    global _TASKS
+    try:
+        from pico_plugin_focus_data.schedule_source import FocusSource
+        from pico_plugin_schedule import runner
+    except ImportError as e:
+        _TASKS = None
+        _log("tasks_off", reason=describe(e, 200))
+        return
+    runner.install(sched, data_dir=data_dir(), gate=_FocusLoadGate(),
+                   source=FocusSource({"cache_path": os.path.join(data_dir(), "focus.duckdb")}))
+    _TASKS = runner
+
+
+def tasks_ok_at():
+    """When scheduled tasks were last checked (wall clock), for the health check; None without the plugin."""
+    return _TASKS.health()["last_ok"] if _TASKS is not None else None
 
 
 def build_scheduler():
@@ -329,6 +418,7 @@ def build_scheduler():
     sched = BackgroundScheduler(job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 300})
     sched.add_job(_run_job, CronTrigger.from_crontab(job_cron(), timezone="UTC"), id=JOB_ID, replace_existing=True)
     sched.add_job(watch, "interval", minutes=1, id=WATCH_JOB_ID, replace_existing=True)
+    _install_tasks(sched)
     _SCHEDULER = sched
     return sched
 

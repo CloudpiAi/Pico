@@ -1,7 +1,8 @@
 """Insights for the post-load Slack notice, computed with SQL from the local cache (never by the LLM).
 
 Only usage rows count (tax rows would distort a day), and only full days are compared: the newest day in
-an export is usually incomplete. "Sudden increase" = the last full day is at least FOCUS_ALERT_INCREASE_PCT
+an export is usually incomplete (AWS delivers hours late). That partial day is reported on its own (`partial_day`:
+its date, hours in, cost so far) so the notice can say it is partly in, never as a day to compare. "Sudden increase" = the last full day is at least FOCUS_ALERT_INCREASE_PCT
 above the 7-day average before it AND at least FOCUS_ALERT_MIN_SERVICE_USD (per service) or
 FOCUS_ALERT_MIN_RESOURCE_USD (per resource) above it. Unset, empty or invalid settings use the defaults.
 """
@@ -85,8 +86,13 @@ def compute(cache_path, thresholds):
             SELECT count(*), coalesce(sum(cost), 0) FROM s
             WHERE dt = ? AND resourceid NOT IN (SELECT resourceid FROM s WHERE dt BETWEEN ? AND ?)""",
                         [day, day - timedelta(days=30), day - timedelta(days=1)]).fetchone()
+        partial = None
+        if (max_end.hour, max_end.minute, max_end.second) != (0, 0, 0):  # the data stops inside a day
+            pday = max_end.date()
+            partial = {"day": pday.isoformat(), "hours": max_end.hour, "cost": round(total(pday, pday), 2)}
         return {
             "last_full_day": day.isoformat(),
+            "partial_day": partial,
             "latest_day_cost": round(total(day, day), 2),
             "avg7": round(total(day - timedelta(days=7), day - timedelta(days=1)) / 7, 2),
             "mtd": {"cost": round(total(month_start, day), 2),
