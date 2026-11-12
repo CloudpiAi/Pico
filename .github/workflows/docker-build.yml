@@ -116,7 +116,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push vX.Y.Z and latest
+      - name: Push vX.Y.Z (and latest, when it is the newest release)
         env:
           VERSION: ${{ github.ref_name }}
         run: |
@@ -124,7 +124,14 @@ jobs:
           gunzip -c image.tar.gz | docker load
           V="${VERSION#v}"
           docker tag "$IMAGE" "$REGISTRY_IMAGE:$V"
-          docker tag "$IMAGE" "$REGISTRY_IMAGE:latest"
           docker push "$REGISTRY_IMAGE:$V"
-          docker push "$REGISTRY_IMAGE:latest"
-          echo "Published $REGISTRY_IMAGE:$V and :latest" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Published $REGISTRY_IMAGE:$V" | tee -a "$GITHUB_STEP_SUMMARY"
+          # :latest only moves forward: a patch tag for an older line (v0.1.5 after v0.2.0) must not roll it back.
+          NEWEST=$(git tag -l --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          if [ "$NEWEST" = "$VERSION" ]; then
+            docker tag "$IMAGE" "$REGISTRY_IMAGE:latest"
+            docker push "$REGISTRY_IMAGE:latest"
+            echo "Moved $REGISTRY_IMAGE:latest to $V" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Not moving :latest: the newest release is $NEWEST" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
