@@ -65,7 +65,7 @@ Everything inside the dashed box runs **in your AWS account**. Only Slack and th
 | Customer setup guide | Step-by-step to get Pico running | This repository |
 | `.env.example` | Configuration template (Slack tokens, LLM choice, etc.) | Your EC2 |
 
-The **agent code** (query execution, Slack integration, LLM interaction) runs inside the Docker image (`cloudpi1/cloudpi:*`), which is pulled from Docker Hub.
+The **agent code** (query execution, Slack integration, LLM interaction) is in this repository. You build the Docker image yourself on your EC2 (`docker compose build`), so you can read every line that runs in your account.
 
 ## Getting started
 
