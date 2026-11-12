@@ -9,13 +9,15 @@ import asyncio
 import inspect
 import json
 import signal
+import sys  # noqa: E402
 import threading
 import time
+from pathlib import Path  # noqa: E402
 
 import pytest
 
-from pico_finops_agent import agent, health
-
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "plugins" / "schedule"))
+from pico_finops_agent import agent, health  # noqa: E402
 
 # ---------- a fake of Pico's DatusGateway / SlackAdapter ----------
 
@@ -256,6 +258,8 @@ def test_main_without_slack_tokens(monkeypatch):
     monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
     monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
     monkeypatch.setattr(agent, "_install_cache_reconnect", lambda: calls.append("cache_reconnect"))
+    monkeypatch.setattr(agent, "_install_slack_context", lambda: calls.append("slack_context"))
+    monkeypatch.setattr(agent, "_install_slack_guard", lambda: calls.append("slack_guard"))
     monkeypatch.setattr(agent, "_configure_logging", lambda: calls.append("logging"))
     monkeypatch.setattr(agent.scheduler, "start_scheduler", lambda s=None: calls.append("scheduler_start") or "S")
     monkeypatch.setattr(agent.scheduler, "build_scheduler", lambda: "S")
@@ -273,6 +277,8 @@ def test_main_without_slack_tokens(monkeypatch):
     assert seen["slack"] == "disabled"
     assert calls.index("cache_reconnect") < calls.index("scheduler_start") < calls.index("supervise")
     assert calls[-1] == "scheduler_stop"
+    assert "slack_context" not in calls  # no Slack, no who/where line
+    assert "slack_guard" not in calls  # no Slack, Pico's bridge is left as it is
 
 
 def test_main_with_slack_tokens_builds_the_gateway_from_the_config(monkeypatch):
@@ -281,6 +287,8 @@ def test_main_with_slack_tokens_builds_the_gateway_from_the_config(monkeypatch):
     built = {}
     monkeypatch.setattr(agent, "_load_gateway_config", lambda path: built.setdefault("config", path) or "CFG")
     monkeypatch.setattr(agent, "_install_cache_reconnect", lambda: None)
+    monkeypatch.setattr(agent, "_install_slack_context", lambda: built.setdefault("order", []).append("context"))
+    monkeypatch.setattr(agent, "_install_slack_guard", lambda: built.setdefault("order", []).append("guard"))
     monkeypatch.setattr(agent, "_configure_logging", lambda: None)
     monkeypatch.setattr(agent, "_install_signal_handlers", lambda stop: None)
     monkeypatch.setattr(agent.scheduler, "build_scheduler", lambda: "S")
@@ -304,6 +312,9 @@ def test_main_with_slack_tokens_builds_the_gateway_from_the_config(monkeypatch):
     monkeypatch.setattr(agent, "supervise", lambda *a, **k: 0)
     assert agent.main(["--config", "conf/agent.yml"]) == 0
     assert built["config"] == "conf/agent.yml" and callable(built["factory"]) and built["stopped"]
+    # every Slack message gets the signed who/where line for scheduled tasks; the answer guard goes on after it, so
+    # it is the outermost wrapper and sees the text the person typed (reset phrase)
+    assert built["order"] == ["context", "guard"]
 
 
 def test_slack_needs_both_tokens(monkeypatch):
@@ -318,10 +329,11 @@ def test_slack_needs_both_tokens(monkeypatch):
 
 def test_pico_gateway_internals_the_agent_relies_on():
     pytest.importorskip("slack_sdk")
+    from slack_sdk.socket_mode.aiohttp import SocketModeClient
+
     from pico.gateway import main as gw_main
     from pico.gateway.adapters.slack import SlackAdapter
     from pico.gateway.runtime import DatusGateway
-    from slack_sdk.socket_mode.aiohttp import SocketModeClient
 
     init_src = inspect.getsource(DatusGateway.__init__)
     assert "self._adapters" in init_src and "self._shutdown_event" in init_src
@@ -442,3 +454,48 @@ def test_main_returns_the_supervisors_exit_code(monkeypatch):
     monkeypatch.setattr(agent.scheduler, "stop_scheduler", lambda s: None)
     monkeypatch.setattr(agent, "supervise", lambda *a, **k: health.EXIT_SLACK)
     assert agent.main(["--config", "x"]) == health.EXIT_SLACK
+
+
+# ---------- plugins/schedule split ----------
+
+def test_slack_hook_comes_from_the_schedule_plugin(monkeypatch, tmp_path):
+    from pico_plugin_schedule.hooks import pico_gateway
+
+    seen = {}
+    monkeypatch.setenv("FOCUS_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(pico_gateway, "install_context", lambda data_dir=None: seen.setdefault("dir", data_dir))
+    agent._install_slack_context()
+    assert seen["dir"] == str(tmp_path)
+
+
+def test_slack_guard_installs_with_env_settings(monkeypatch):
+    from pico_finops_agent import slack_guard
+
+    seen = {}
+    monkeypatch.setenv("AGENT_HISTORY_TURNS", "5")
+    monkeypatch.setattr(slack_guard, "install", lambda settings=None: seen.setdefault("settings", settings))
+    agent._install_slack_guard()
+    assert seen["settings"].history_turns == 5
+
+
+def test_slack_still_starts_when_the_guard_cannot_install(monkeypatch, capsys):
+    from pico_finops_agent import slack_guard
+
+    monkeypatch.setattr(slack_guard, "install", lambda settings=None: 1 / 0)
+    agent._install_slack_guard()  # no exception: Slack answers work, unguarded, and the log says so
+    assert '"event": "slack_guard_off"' in capsys.readouterr().out
+
+
+def test_slack_answers_still_work_without_the_schedule_plugin(monkeypatch, capsys):
+    import builtins
+
+    real = builtins.__import__
+
+    def blocked(name, *a, **k):
+        if name.startswith("pico_plugin_schedule"):
+            raise ImportError(f"not installed: {name}")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    agent._install_slack_context()  # no exception: the gateway starts without the who/where line
+    assert '"event": "tasks_off"' in capsys.readouterr().out

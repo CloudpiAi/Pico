@@ -1,0 +1,73 @@
+manifest_version: 1
+description: "Scheduled Slack tasks: reminders, cost reports, saved queries and recurring questions, sent at a set time."
+cli: pico_plugin_schedule.cli:main
+
+# Every action needs a --ctx signed by the host's Slack hook (who/where from Slack, never the message text), and
+# the owner rules (only the creator changes a task; others only ask) are enforced in the command itself.
+# `--config` before the command would point the plugin at another agent.yml: denied outright.
+# Any `pico schedule` command is allowed ("*:*"): a refused command stops the whole Slack answer ("Sorry, I couldn't
+# answer that just now"), and the model writes forms no list keeps up with (`--ctx` before the action, `--help`, a
+# made-up `create`; live 2026-11-12). That's safe because the command itself refuses what isn't real: an unknown
+# action or option exits with the valid choices, and every action checks the signed --ctx and the owner rules.
+# A chained second command (`; rm ...`, `&& date`) is still judged on its own. Each token is a glob, so `--ctx *` is
+# one value: --config after a leading --ctx is denied too. (Security review 2026-11-12: Pico's dispatcher reads only a
+# LEADING exact --config/--config= and managed dispatch refuses it; any other spelling or position reaches task_cli,
+# which has no config option. cli.main runs nothing but task_cli's 10 actions. Pinned in test_plugin_cli.)
+permissions:
+  normal:
+    allow: ["*:*"]
+    deny: ["--config:*", "--config=*:*", "--ctx * --config:*", "--ctx * --config=*:*"]
+  auto:
+    allow: ["*:*"]
+    deny: ["--config:*", "--config=*:*", "--ctx * --config:*", "--ctx * --config=*:*"]
+
+skills: skills
+
+config_schema:
+  type: object
+  properties:
+    data_dir: {type: string, default: "/data", description: "Folder for tasks.json, the history and the Slack signing key"}
+    source: {type: string, description: "module:Class of the data source for report/query tasks (empty: reminders and asks only)"}
+    cache_path: {type: string, description: "Passed to the source (FocusSource: the DuckDB cache; default <data_dir>/focus.duckdb)"}
+
+commands:
+  - name: add
+    description: "Save a task (reminder, report, query, ask) for a time or a repeat"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: list
+    description: "The person's tasks and this channel's"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: show
+    description: "One task: owner, settings, next run"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: history
+    description: "Who created, changed or stopped a task"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: remove
+    description: "Stop a task (others: asks its creator)"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: pause
+    description: "Pause a task"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: resume
+    description: "Resume a paused task"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: edit
+    description: "Change time, place, name or content"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: confirm
+    description: "The creator accepts a request"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}
+  - name: decline
+    description: "The creator turns a request down"
+    args:
+      - {name: "--ctx", required: true, description: "the value from the [slack ctx=...] line of the current message"}

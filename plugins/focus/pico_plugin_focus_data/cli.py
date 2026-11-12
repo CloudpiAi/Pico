@@ -1,6 +1,7 @@
-"""`pico focus-data <load|status>`. Called by Pico as main(argv, profile)."""
+"""`pico focus-data <load|status>`. Scheduled tasks are their own plugin (`pico schedule`). Called by Pico as main(argv, profile)."""
 import argparse
 import json
+import os
 import sys
 
 from . import loader
@@ -14,6 +15,9 @@ def main(argv, profile):
     sub.add_parser("status", help="AWS identity, last load, last error, months in the table")
     a = p.parse_args(argv)
 
+    if a.cmd == "load" and os.environ.get("PICO_FINOPS_AGENT_UNATTENDED") == "1":
+        print("focus-data: a scheduled question can't start a data load", file=sys.stderr)
+        return 2
     cfg = loader.Config.from_profile(profile)
     if a.cmd == "load":
         return loader.run_load(cfg, force=a.force)

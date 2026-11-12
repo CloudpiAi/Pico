@@ -74,6 +74,22 @@ def llm_check(timeout=15):
     return True, f"LLM: {provider.label} key accepted (model {model})"
 
 
+_MODE_LABEL = {"create_new": "Create new", "overwrite": "Overwrite", "mixed": "both layouts, the newer one used"}
+
+
+def _modes_text(modes):
+    """'Overwrite' when every month has the same mode; else each mode with its months."""
+    found = sorted(set(modes.values()))
+    if len(found) == 1 and found[0] != "mixed":
+        return _MODE_LABEL.get(found[0], found[0])
+    parts = []
+    for mode in sorted(found, key=lambda m: min(p for p, v in modes.items() if v == m)):
+        months = sorted(p for p, v in modes.items() if v == mode)
+        span = months[0] if len(months) == 1 else f"{months[0]}..{months[-1]}"
+        parts.append(f"{_MODE_LABEL.get(mode, mode)} ({span})")
+    return ", ".join(parts)
+
+
 def _status_lines(status):
     """(ok, line) pairs from the focus-data status report."""
     lines = []
@@ -83,6 +99,8 @@ def _status_lines(status):
     if isinstance(table, dict):
         months = len(table.get("loaded") or {})
         lines.append((True, f"AWS: the agent's state is readable; {months} month(s) loaded into the S3 table"))
+        if status.get("export_modes"):
+            lines.append((True, f"AWS: export mode: {_modes_text(status['export_modes'])}"))
     elif table is None:
         lines.append((True, "AWS: nothing loaded yet (the first start loads every month)"))
     else:

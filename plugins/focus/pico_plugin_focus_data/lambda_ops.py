@@ -27,7 +27,26 @@ TIMEOUT_S = 900
 EPHEMERAL_MB = 2048
 DESCRIPTION = "Pico FinOps Agent: loads the AWS FOCUS export into the S3 Table"
 ROLE_RETRIES = 6
-NO_CREDENTIALS_MSG = "no AWS credentials: attach the instance role, and set the IMDSv2 hop limit to 2 for Docker"
+NO_CREDENTIALS_MSG = ("no AWS credentials: attach the EC2 instance role (IMDSv2 hop limit 2 for Docker), "
+                      "or set the AWS_* settings in .env")
+# botocore Credentials.method -> where the credentials come from (for the problem text, problems.credentials)
+_SOURCE_OF_METHOD = {
+    "env": "env", "explicit": "env",
+    "shared-credentials-file": "profile", "config-file": "profile", "sso": "profile", "assume-role": "profile",
+    "assume-role-with-web-identity": "profile", "custom-process": "profile",
+    "iam-role": "instance_role", "container-role": "instance_role",
+}
+
+
+def credential_source(cfg, session=None):
+    """env | profile | instance_role | none | unknown: where boto3 finds the credentials (never raises)."""
+    try:
+        creds = (session or _session)(cfg).get_credentials()
+    except Exception:  # noqa: BLE001 - only used to word a problem; a lookup failure must not hide it
+        return "unknown"
+    if creds is None:
+        return "none"
+    return _SOURCE_OF_METHOD.get(getattr(creds, "method", None), "unknown")
 
 
 class LoadConfigError(Exception):

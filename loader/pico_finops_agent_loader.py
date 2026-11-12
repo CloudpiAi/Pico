@@ -18,6 +18,16 @@ Result:
    "schema_diff": null | {"added": [...], "type_changed": [the casts tried], "cannot_convert"?: "..."},
    "state_etag": "...", "error": null | "..."}
 
+Export modes (worked out per month from what is in S3, no setting): "Create new" puts each delivery in its own folder,
+billing_period=X/<delivery>/*.parquet; the newest folder is loaded and its URL is the "has it changed" token in
+state.json `loaded`. "Overwrite" puts the files straight in the month folder, billing_period=X/*.parquet; the files
+the month's manifest lists (<export root>/metadata/billing_period=X/<export>-Manifest.json `dataFiles`, only files
+really in that folder) are loaded and the token is overwrite:<executionId>; without a usable manifest every parquet
+in the folder is loaded and the token is overwrite:etag:<sha256 of the keys and ETags>. A month with both layouts
+(the export changed mode) loads the newer set. After an overwrite month is loaded, its token is read again: when AWS
+rewrote the month meanwhile it isn't saved, so the next run loads the month again. state.json `export_modes` says
+which mode each month had (create_new | overwrite | mixed).
+
 Months kept: only the last `months` months, counting the current month (4 in November = Aug..Nov). Older
 exported months are never loaded, and months older than that are deleted from the table on every run.
 
@@ -30,11 +40,13 @@ the month's rows stay as they are. Before each month the remaining Lambda time i
 the run stops with `partial` and the next run continues. state.json is written after every month with an ETag
 condition.
 """
+import hashlib
 import json
 import os
 import re
 import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 import boto3
@@ -43,6 +55,9 @@ from botocore.exceptions import ClientError
 EXTENSIONS = ("httpfs", "aws", "avro", "iceberg")  # iceberg needs avro; Lambda cannot auto-install it
 CONFLICT_CODES = ("PreconditionFailed", "ConditionalRequestConflict")
 NOT_FOUND_CODES = ("NotFoundException", "NoSuchKey", "404")
+# A manifest that is missing or not ours to read: use the ETag fallback. Any other S3 error (throttling, 5xx) fails
+# the run, so the month's token never flips between overwrite:<executionId> and overwrite:etag:... on a passing error.
+NO_MANIFEST_CODES = NOT_FOUND_CODES + ("AccessDenied", "403")
 PARTITION_CLAUSE = " PARTITIONED BY (month(billingperiodstart))"
 MIN_REMAINING_MS = 120_000
 DEFAULT_MONTHS = 4  # months kept, counting the current month (FOCUS_MONTHS on the EC2)
@@ -55,6 +70,9 @@ PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])\Z")
 # Real AWS folders: 2026-11-02T15:07:11.328Z-e2891bd6-5d2b-3e19-83a2-6eda07f5202e
 DELIVERY_RE = re.compile(r"^[0-9A-Za-z_.:=-]+\Z")
 PERIOD_PREFIX_RE = re.compile(r"billing_period=(\d{4}-\d{2})/$")
+# Real AWS overwrite files: focus2-00001.snappy.parquet (no quotes or SQL characters allowed)
+FILE_RE = re.compile(r"^[0-9A-Za-z_.=-]+\.parquet\Z")
+_OLDEST = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 class BadRequest(Exception):
@@ -165,7 +183,8 @@ def month_window(now, months):
 
 
 def select_periods(state, available, now, force, periods, months=DEFAULT_MONTHS):
-    """{period: url} to load, oldest first. available = {period: url of its newest delivery}.
+    """{period: delivery} to load, oldest first. available = {period: its newest Delivery (or a token string)};
+    a month is due when its token differs from the one in state.json `loaded`.
 
     Only months inside month_window count. After the backfill: the due months, plus any month in the window
     never loaded (the window grew, e.g. FOCUS_MONTHS went from 4 to 6)."""
@@ -178,7 +197,7 @@ def select_periods(state, available, now, force, periods, months=DEFAULT_MONTHS)
     else:
         wanted = periods_due(now) + [p for p in available if p not in state["loaded"]]
     return {p: available[p] for p in sorted(set(wanted)) if p in available
-            and (force or state["loaded"].get(p) != available[p])}
+            and (force or state["loaded"].get(p) != getattr(available[p], "token", available[p]))}
 
 
 def list_periods(s3, bucket, prefix):
@@ -191,25 +210,130 @@ def list_periods(s3, bucket, prefix):
     return sorted(out)
 
 
-def newest_folder(s3, bucket, prefix, period):
-    base = f"{prefix}billing_period={period}/"
-    folders = set()
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=base):
-        for o in page.get("Contents", []):
-            parts = o["Key"][len(base):].split("/")
-            if len(parts) == 2 and parts[1].endswith(".parquet") and DELIVERY_RE.match(parts[0]):
-                folders.add(parts[0])
-    return max(folders) if folders else None
+@dataclass
+class Delivery:
+    """A month's newest data in the export: the files to read and the token that says whether it changed."""
+    mode: str              # create_new | overwrite (the layout loaded)
+    files: list            # URLs for read_parquet
+    token: str             # saved in state.json `loaded`
+    ident: str             # the delivery folder, the executionId, or etag:<first 12 of the digest>
+    written_at: datetime = None
+    mixed: bool = False    # the month folder had both layouts
+
+    @property
+    def export_mode(self):
+        return "mixed" if self.mixed else self.mode
 
 
 def delivery_source(bucket, prefix, period, folder):
     return f"s3://{bucket}/{prefix}billing_period={period}/{folder}/*.parquet"
 
 
+def _object_url(bucket, key):
+    return f"s3://{bucket}/{key}"
+
+
+def _export_root(prefix):
+    """The export root for a .../data/ prefix (its manifests are under <root>metadata/); None otherwise."""
+    if prefix == "data/":
+        return ""
+    return prefix[:-len("data/")] if prefix.endswith("/data/") else None
+
+
+def read_manifest(s3, bucket, prefix, period):
+    """(executionId, dataFiles) from the month's <export>-Manifest.json, or None when there is none to use (no
+    data/ prefix, no manifest, no access, not JSON, or missing fields). The -Manifest-FOCUS.json next to it has no
+    dataFiles and is skipped."""
+    root = _export_root(prefix)
+    if root is None:
+        return None
+    base = f"{root}metadata/billing_period={period}/"
+    try:
+        keys = [o["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=base,
+                                                                                   Delimiter="/")
+                for o in page.get("Contents", [])]
+        for key in sorted((k for k in keys if k.endswith("-Manifest.json")), reverse=True):
+            try:
+                m = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+            except ValueError as e:
+                _log("manifest_unreadable", period=period, error=f"not JSON: {str(e)[:120]}")
+                continue
+            eid = m.get("executionId") if isinstance(m, dict) else None
+            files = m.get("dataFiles") if isinstance(m, dict) else None
+            if isinstance(eid, str) and eid and isinstance(files, list) and files and all(
+                    isinstance(f, str) for f in files):
+                return eid, list(dict.fromkeys(files))  # a file listed twice is read once
+    except ClientError as e:
+        if _code(e) not in NO_MANIFEST_CODES:
+            raise
+        _log("manifest_unreadable", period=period, error=_code(e))
+    return None
+
+
+def _overwrite_delivery(s3, bucket, prefix, period, flat):
+    listed = {_object_url(bucket, o["Key"]): o for o in flat}
+    written = max((o["LastModified"] for o in flat if o.get("LastModified")), default=None)
+    man = read_manifest(s3, bucket, prefix, period)
+    if man:
+        eid, files = man
+        if all(f in listed for f in files):  # only files really in this month's folder are read
+            return Delivery("overwrite", list(files), f"overwrite:{eid}", eid, written)
+        _log("manifest_ignored", period=period, reason="it lists files that are not in this month's folder")
+    digest = hashlib.sha256("\n".join(f"{o['Key']} {o.get('ETag', '')}" for o in
+                                       sorted(flat, key=lambda o: o["Key"])).encode()).hexdigest()
+    return Delivery("overwrite", sorted(listed), f"overwrite:etag:{digest}", f"etag:{digest[:12]}", written)
+
+
+def find_delivery(s3, bucket, prefix, period):
+    """The month's newest delivery (create new or overwrite layout, see the module notes), or None."""
+    base = f"{prefix}billing_period={period}/"
+    folders, flat, skipped = {}, [], []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=base):
+        for o in page.get("Contents", []):
+            parts = o["Key"][len(base):].split("/")
+            if len(parts) == 2 and parts[1].endswith(".parquet") and DELIVERY_RE.match(parts[0]):
+                folders[parts[0]] = max(folders.get(parts[0]) or _OLDEST, o.get("LastModified") or _OLDEST)
+            elif len(parts) == 1 and FILE_RE.match(parts[0]):
+                flat.append(o)
+            elif o["Key"].endswith(".parquet"):
+                skipped.append(o["Key"][len(base):])
+    if skipped:  # a name with characters outside FILE_RE / DELIVERY_RE is never read (it would go into SQL)
+        _log("files_skipped", period=period, count=len(skipped), first=skipped[0][:120])
+    new = None
+    if folders:
+        folder = max(folders)
+        url = delivery_source(bucket, prefix, period, folder)
+        new = Delivery("create_new", [url], url, folder, folders[folder])
+    over = _overwrite_delivery(s3, bucket, prefix, period, flat) if flat else None
+    if new and over:  # the export changed mode: the newer set is the month's data
+        pick = new if (new.written_at or _OLDEST) >= (over.written_at or _OLDEST) else over
+        pick.mixed = True
+        return pick
+    return new or over
+
+
+def _still_current(s3, bucket, prefix, period, d):
+    """After loading an overwrite month: is it still the same data? False (load it again next run) when AWS rewrote
+    the month meanwhile, or when that can't be checked now. Create new: a delivery folder never changes."""
+    if d.mode != "overwrite":
+        return True
+    try:
+        again = find_delivery(s3, bucket, prefix, period)
+    except Exception as e:  # noqa: BLE001 - the month is loaded; not saving its token only costs a reload
+        _log("month_recheck_failed", period=period, error=f"{type(e).__name__}: {str(e)[:200]}")
+        return False
+    if again is not None and again.token != d.token:
+        _log("month_changed_during_load", period=period, loaded=d.ident, now=again.ident)
+        return False
+    return True
+
+
 # ---------------- schema + SQL ----------------
 
-def source_sql(url):
-    return f"read_parquet([{q_str(url)}], hive_partitioning = false)"
+def source_sql(files):
+    """read_parquet over one URL (a create-new delivery glob) or a list of files (an overwrite month)."""
+    files = [files] if isinstance(files, str) else list(files)
+    return f"read_parquet([{', '.join(q_str(f) for f in files)}], hive_partitioning = false)"
 
 
 def _columns(c, from_sql):
@@ -279,7 +403,7 @@ def _rollback(c):
         pass
 
 
-def replace_month(c, fq, url, period=None):
+def replace_month(c, fq, files, period=None):
     """Replace a month with a delivery: DELETE + INSERT in one transaction (one Iceberg commit).
 
     Returns (rows, casts). rows == 0: the delivery is empty, nothing is checked or changed. The month comes from
@@ -287,7 +411,7 @@ def replace_month(c, fq, url, period=None):
     right month. A strict CAST that fails (ConversionException) rolls back and raises SchemaChanged."""
     import duckdb
 
-    src = source_sql(url)
+    src = source_sql(files)
     rows = c.sql(f"SELECT count(*) FROM {src}").fetchone()[0]
     if rows == 0:
         return 0, []
@@ -435,21 +559,22 @@ def lambda_handler(event, context):
     try:
         available = {}
         for period in list_periods(s3, eb, ep):
-            folder = newest_folder(s3, eb, ep, period)
-            if folder:
-                available[period] = delivery_source(eb, ep, period, folder)
+            found = find_delivery(s3, eb, ep, period)
+            if found:
+                available[period] = found
         exists = table_exists(tables, arn, ns, name)
         if not exists:  # new or deleted table: its data is gone, so start over and backfill
-            state.update(loaded={}, backfill_done=False)
+            state.update(loaded={}, export_modes={}, backfill_done=False)
         todo = select_periods(state, available, _now(), ev["force"], ev["periods"], ev["months"])
         result["new_deliveries"] = sorted(todo)
-        _log("start", table_exists=exists, available=sorted(available), todo=result["new_deliveries"])
+        _log("start", table_exists=exists, available=sorted(available), todo=result["new_deliveries"],
+             modes=sorted({d.export_mode for d in available.values()}))
 
         c = None
         if not exists and available:
             ensure_namespace(tables, arn, ns)
             c = connect(ev)
-            create_table(c, fq, source_sql(available[max(available)]))
+            create_table(c, fq, source_sql(available[max(available)].files))
             state["table_created_at"] = _now().isoformat(timespec="seconds")
             result["table_created"] = True
             _log("table_created", table=f"{ns}.{name}")
@@ -462,10 +587,13 @@ def lambda_handler(event, context):
                 break
             c = c or connect(ev)
             s = time.perf_counter()
-            rows, casts = replace_month(c, fq, todo[period], period)
-            state["loaded"][period] = todo[period]  # an empty delivery too, so the next run doesn't look again
+            d = todo[period]
+            rows, casts = replace_month(c, fq, d.files, period)
+            if _still_current(s3, eb, ep, period, d):
+                state["loaded"][period] = d.token  # an empty delivery too, so the next run doesn't look again
+                state.setdefault("export_modes", {})[period] = d.export_mode
             pending.remove(period)
-            rec = {"period": period, "rows": rows, "delivery": todo[period].split("/")[-2],
+            rec = {"period": period, "rows": rows, "delivery": d.ident, "mode": d.export_mode,
                    "seconds": round(time.perf_counter() - s, 2)}
             if rows == 0:  # no new data for this month: the rows already loaded stay
                 result["empty_deliveries"].append(period)
@@ -485,6 +613,8 @@ def lambda_handler(event, context):
             result["months_removed"] = remove_old_months(c, fq, oldest)
             for period in [p for p in state["loaded"] if p < oldest]:
                 del state["loaded"][period]
+            for period in [p for p in state.get("export_modes", {}) if p < oldest]:
+                del state["export_modes"][period]
             if result["months_removed"]:
                 _log("months_removed", months=result["months_removed"], keep_from=oldest)
         if result["status"] == "ok":

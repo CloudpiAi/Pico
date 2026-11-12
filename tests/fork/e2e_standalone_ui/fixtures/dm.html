@@ -1,0 +1,187 @@
+<!doctype html>
+<!-- SYNTHETIC fixture: fake names, ids and text; same data-qa structure as the Slack web app (2026-11-11). -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>fixture dm</title>
+<style>
+  #list { height: 260px; overflow-y: auto; }
+  #thread-list { height: 160px; overflow-y: auto; }
+</style>
+</head>
+<body>
+<div data-qa="message_pane" id="pane">
+  <div role="list" id="list">
+    <!-- day divider: a list item without a message_container -->
+    <div role="listitem" id="message-list_1700000000000.D0TESTDM001" data-qa="virtual-list-item"
+         data-item-key="1700000000000.D0TESTDM001"><div role="separator">Today</div></div>
+
+    <!-- my question, done -->
+    <div role="listitem" id="message-list_1700000100.000100" data-qa="virtual-list-item" data-item-key="1700000100.000100">
+      <div data-qa="message_container" data-msg-ts="1700000100.000100" data-msg-channel-id="D0TESTDM001">
+        <button aria-label="View Test User's Profile"></button>
+        <div data-qa="message_content">
+          <span data-qa="message_sender"><button data-qa="message_sender_name">Test User</button></span>
+          <a aria-label="Today at 1:00:00 PM" data-ts="1700000100.000100"
+             href="https://example.slack.com/archives/D0TESTDM001/p1700000100000100"><span data-qa="timestamp_label">1:00 PM</span></a>
+          <div data-qa="message-text"><div data-qa="block-kit-renderer">What did we spend last month?</div></div>
+          <div role="group" data-qa="reaction_bar" aria-label="Reactions">
+            <button data-qa="reactji" aria-label="1 reaction, react with white check mark emoji"><img aria-label="white check mark emoji" data-qa="emoji"></button>
+            <button data-qa="add_reaction_button"></button>
+          </div>
+          <button data-qa="reply_bar_count" onclick="document.getElementById('thread').hidden = false">1 reply</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- the bot's answer -->
+    <div role="listitem" id="message-list_1700000110.000200" data-qa="virtual-list-item" data-item-key="1700000110.000200">
+      <div data-qa="message_container">
+        <a aria-label="View Cost Bot's Profile" href="/team/U0TESTBOT01"></a>
+        <div data-qa="message_content">
+          <span data-qa="message_sender"><button data-qa="message_sender_name">Cost Bot</button></span>
+          <span data-qa="message_sender_app_badge">APP</span>
+          <a data-ts="1700000110.000200" href="https://example.slack.com/archives/D0TESTDM001/p1700000110000200"></a>
+          <div data-qa="message-text"><div data-qa="block-kit-renderer">You spent $1,234.56 last month.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- follow-on from the same sender: no sender name, no badge, no profile link -->
+    <div role="listitem" id="message-list_1700000111.000300" data-qa="virtual-list-item" data-item-key="1700000111.000300">
+      <div data-qa="message_container">
+        <div data-qa="message_content">
+          <a data-ts="1700000111.000300" href="https://example.slack.com/archives/D0TESTDM001/p1700000111000300"></a>
+          <div data-qa="message-text"><div data-qa="block-kit-renderer">Top service: Compute.</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- a scheduled post -->
+    <div role="listitem" id="message-list_1700000200.000400" data-qa="virtual-list-item" data-item-key="1700000200.000400">
+      <div data-qa="message_container">
+        <a aria-label="View Cost Bot's Profile" href="/team/U0TESTBOT01"></a>
+        <div data-qa="message_content">
+          <span data-qa="message_sender"><button data-qa="message_sender_name">Cost Bot</button></span>
+          <span data-qa="message_sender_app_badge">APP</span>
+          <a data-ts="1700000200.000400" href="https://example.slack.com/archives/D0TESTDM001/p1700000200000400"></a>
+          <div data-qa="message-text"><div data-qa="block-kit-renderer">Daily cost: $12.00<br>Set up by @Test User · task t7 · say 'stop task t7' to stop it</div></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- my second question, still working -->
+    <div role="listitem" id="message-list_1700000300.000500" data-qa="virtual-list-item" data-item-key="1700000300.000500">
+      <div data-qa="message_container">
+        <button aria-label="View Test User's Profile"></button>
+        <div data-qa="message_content">
+          <span data-qa="message_sender"><button data-qa="message_sender_name">Test User</button></span>
+          <a data-ts="1700000300.000500" href="https://example.slack.com/archives/D0TESTDM001/p1700000300000500"></a>
+          <div data-qa="message-text"><div data-qa="block-kit-renderer">List my tasks.</div></div>
+          <div role="group" data-qa="reaction_bar" aria-label="Reactions">
+            <button data-qa="reactji" aria-label="1 reaction, react with hourglass flowing sand emoji"><img aria-label="hourglass flowing sand emoji" data-qa="emoji"></button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div data-qa="message_input">
+  <div data-qa="texty_input" contenteditable="true" role="textbox" aria-label="Message to Cost Bot"></div>
+</div>
+
+<!-- thread pane, opened by the reply bar -->
+<div data-qa="threads_flexpane" id="thread" hidden>
+  <div role="list" id="thread-list">
+    <div data-qa="virtual-list-item" data-item-key="1700000100.000100">
+      <div data-qa="message_container">
+        <div data-qa="message_content">
+          <span data-qa="message_sender"><button data-qa="message_sender_name">Test User</button></span>
+          <a data-ts="1700000100.000100" href="#"></a>
+          <div data-qa="message-text">What did we spend last month?</div>
+        </div>
+      </div>
+    </div>
+    <div data-qa="virtual-list-item" data-item-key="1700000150.000700">
+      <div data-qa="message_container">
+        <a href="/team/U0TESTBOT01"></a>
+        <div data-qa="message_content">
+          <span data-qa="message_sender"><button data-qa="message_sender_name">Cost Bot</button></span>
+          <span data-qa="message_sender_app_badge">APP</span>
+          <a data-ts="1700000150.000700" href="#"></a>
+          <div data-qa="message-text">Thread answer: $1,234.56.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div data-qa="message_input">
+    <div data-qa="texty_input" contenteditable="true" role="textbox" aria-label="Reply..."></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  function el(tag, attrs, kids) {
+    var e = document.createElement(tag);
+    Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+    (kids || []).forEach(function (k) { e.appendChild(typeof k === 'string' ? document.createTextNode(k) : k); });
+    return e;
+  }
+  function reactji(name) {
+    var label = name.replace(/_/g, ' ') + ' emoji';
+    return el('button', {'data-qa': 'reactji', 'aria-label': '1 reaction, react with ' + label},
+              [el('img', {'aria-label': label, 'data-qa': 'emoji'})]);
+  }
+  window.fx = {
+    nextTs: 1700001000,
+    // o: {ts, name, bot, botId, text, reactions: [names]}
+    item: function (o, inThread) {
+      var content = el('div', {'data-qa': 'message_content'});
+      if (o.name) {
+        content.appendChild(el('span', {'data-qa': 'message_sender'},
+                               [el('button', {'data-qa': 'message_sender_name'}, [o.name])]));
+      }
+      if (o.bot) { content.appendChild(el('span', {'data-qa': 'message_sender_app_badge'}, ['APP'])); }
+      content.appendChild(el('a', {'data-ts': o.ts, 'href': '#'}));
+      content.appendChild(el('div', {'data-qa': 'message-text'}, [o.text || '']));
+      var bar = el('div', {'role': 'group', 'data-qa': 'reaction_bar'});
+      (o.reactions || []).forEach(function (r) { bar.appendChild(reactji(r)); });
+      content.appendChild(bar);
+      var kids = [];
+      if (o.botId) { kids.push(el('a', {'href': '/team/' + o.botId})); }
+      kids.push(content);
+      var attrs = {'role': 'listitem', 'data-qa': 'virtual-list-item', 'data-item-key': o.ts};
+      if (!inThread) { attrs.id = 'message-list_' + o.ts; }
+      return el('div', attrs, [el('div', {'data-qa': 'message_container'}, kids)]);
+    },
+    add: function (o, inThread) {
+      document.getElementById(inThread ? 'thread-list' : 'list').appendChild(this.item(o, inThread));
+    },
+    react: function (ts, names) {
+      var item = document.querySelector('#list [data-item-key="' + ts + '"]');
+      var bar = item.querySelector('[data-qa="reaction_bar"]');
+      if (!bar) {
+        bar = el('div', {'role': 'group', 'data-qa': 'reaction_bar'});
+        item.querySelector('[data-qa="message_content"]').appendChild(bar);
+      }
+      bar.innerHTML = '';
+      names.forEach(function (n) { bar.appendChild(reactji(n)); });
+    }
+  };
+  // Enter in a composer "sends": my message appears shortly after with a new ts.
+  document.addEventListener('keydown', function (e) {
+    var t = e.target;
+    if (e.key !== 'Enter' || !t.matches || !t.matches('[data-qa="texty_input"]')) { return; }
+    e.preventDefault();
+    var text = t.innerText.trim();
+    if (!text) { return; }
+    t.innerHTML = '';
+    var ts = String(window.fx.nextTs++) + '.000900';
+    var inThread = !!t.closest('[data-qa="threads_flexpane"]');
+    setTimeout(function () { window.fx.add({ts: ts, name: 'Test User', text: text}, inThread); }, 50);
+  });
+})();
+</script>
+</body>
+</html>

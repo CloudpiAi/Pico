@@ -13,6 +13,7 @@ The limit is down_limit(): 10 minutes, or PICO_FINOPS_AGENT_DOWN_LIMIT_S.
 | Slack unreachable since start, or disconnected (auto-reconnect tries) | unhealthy | after the limit (70); waits while a data load runs |
 | the Slack thread died, or stopped reporting for the limit (frozen)    | unhealthy | yes (70); waits while a data load runs |
 | the scheduler's 1-minute watch hasn't run for the limit               | unhealthy | yes (71) |
+| scheduled tasks: tasks_sync hasn't worked for the limit (e.g. tasks.json unreadable) | unhealthy | no: a restart can't fix the file |
 | the heartbeat is older than HEARTBEAT_MAX_AGE_S (the supervisor froze) | `--check` fails | - |
 """
 import json
@@ -49,9 +50,10 @@ def down_limit():
     return value if value > 0 else DOWN_LIMIT_S
 
 
-def evaluate(now, slack, last_tick, load_running=False):
+def evaluate(now, slack, last_tick, load_running=False, tasks_ok_at=None):
     """slack: SlackRunner.snapshot(); last_tick: scheduler.last_tick(); load_running: a data load is in progress
-    (a Slack problem then waits for it, so a restart never cuts a load short)."""
+    (a Slack problem then waits for it, so a restart never cuts a load short); tasks_ok_at: when scheduled tasks were
+    last checked (scheduler.tasks_ok_at(); None: no tasks plugin)."""
     limit = down_limit()
     if last_tick is None or now - last_tick >= limit:
         idle = "never" if last_tick is None else f"for {_minutes(now - last_tick)}"
@@ -59,6 +61,9 @@ def evaluate(now, slack, last_tick, load_running=False):
     verdict = _slack_verdict(now, slack, limit)
     if verdict.exit_code == EXIT_SLACK and load_running:
         return Verdict("unhealthy", f"{verdict.reason}; restart after the running data load")
+    if verdict.status == "healthy" and tasks_ok_at is not None and now - tasks_ok_at >= limit:
+        return Verdict("unhealthy", f"scheduled tasks haven't been checked for {_minutes(now - tasks_ok_at)} "
+                                    "(see tasks_sync_failed in the log)")
     return verdict
 
 

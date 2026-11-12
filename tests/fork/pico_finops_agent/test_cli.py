@@ -242,3 +242,21 @@ def test_focus_status_failure_raises(monkeypatch):
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(a, 1, stdout="", stderr="boom"))
     with pytest.raises(RuntimeError, match="exited 1"):
         cli.focus_status()
+
+
+# ---------- the export mode in the check (2026-11-11) ----------
+
+@pytest.mark.parametrize("modes,said", [
+    ({"2026-10": "overwrite", "2026-11": "overwrite"}, "export mode: Overwrite"),
+    ({"2026-10": "create_new", "2026-11": "create_new"}, "export mode: Create new"),
+    ({"2026-10": "create_new", "2026-11": "overwrite"}, "export mode: Create new (2026-10), Overwrite (2026-11)"),
+    ({"2026-11": "mixed"}, "export mode: both layouts, the newer one used (2026-11)"),
+])
+def test_check_names_the_export_mode(capsys, modes, said):
+    code, out = run_check(capsys, status=lambda: {**GOOD_STATUS, "export_modes": modes})
+    assert code == 0 and said in out
+
+
+def test_check_without_modes_says_nothing_about_them(capsys):
+    code, out = run_check(capsys, status=lambda: GOOD_STATUS)
+    assert code == 0 and "export mode" not in out

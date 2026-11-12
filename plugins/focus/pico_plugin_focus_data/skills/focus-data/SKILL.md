@@ -1,6 +1,6 @@
 ---
 name: focus-data
-description: Use for AWS cost questions on the FOCUS table, for "when was the cost data last loaded / is it up to date", for "reload / refresh the cost data now", and for "set up the cost agent / start collecting the cost data".
+description: Use for the cost data itself, not for cost questions (those are answered from the table guide in the system prompt): "when was the cost data last loaded / is it up to date", "reload / refresh the cost data now", and "set up the cost agent / start collecting the cost data".
 ---
 
 # FOCUS cost data
@@ -15,12 +15,8 @@ If querying `focus` fails because the table or the database file doesn't exist, 
 the first load runs at start and can take a few minutes." Then run `pico focus-data status` and report `last_load.last_error`
 if it is set. Never guess numbers.
 
-## Answering cost questions
-- All column names are lowercase (`billedcost`, `effectivecost`, `servicename`, `subaccountid`, `regionid`, `resourceid`, `chargecategory`, `chargedescription`, ...).
-- All timestamp columns are plain `TIMESTAMP` in **UTC**. A month is `billingperiodstart = TIMESTAMP '2026-10-01 00:00:00'`. Never add a time-zone offset to the literal.
-- `billingperiodstart` is the month of the bill; `chargeperiodstart` / `chargeperiodend` is the hour or period the charge covers.
-- Use `billedcost` for "cost" unless the user asks for effective (after discounts) cost.
-- The current month is month-to-date. Say so, and give "data through" as `max(chargeperiodend) WHERE chargecategory = 'Usage'`. Tax rows span the whole month (end = next month's first day), so never include them in "data through".
+Cost questions are answered from "The cost table and how to answer from it" in the system prompt (all columns, their
+values and one example query per question type); this skill is not needed for them.
 
 ## "When was the data last loaded?"
 Run:
@@ -30,7 +26,9 @@ pico focus-data status
 ```
 
 Report `last_load.last_success` (UTC), `last_load.last_error` if it is set, and from `s3_table_state` which export delivery each
-month came from (`loaded`). If `last_load.schema_diff` is set, say that AWS added a column (`added`) or sent a value the table's column type
+month came from (`loaded`). `export_modes` says how AWS writes each month, in plain words: `create_new` = "a new copy each
+time" (the AWS setting "Create new data export file"), `overwrite` = "the file is replaced in place" ("Overwrite existing
+data export file"), `mixed` = "the export changed setting; the newer data is used". Both settings work. If `last_load.schema_diff` is set, say that AWS added a column (`added`) or sent a value the table's column type
 can't hold (`cannot_convert`), and the load is stopped
 until someone recreates the table (see the setup guide). If `aws_identity` starts with "no AWS credentials", say so.
 

@@ -90,3 +90,22 @@ def test_thresholds_from_env_with_defaults(monkeypatch, env, expected):
         monkeypatch.setenv(k, v)
     t = insights.Thresholds.from_env()
     assert (t.increase_pct, t.min_service_usd, t.min_resource_usd) == expected
+
+
+# ---------- the newest day is shown as partial (2026-11-11: "through 9 Nov" while 10 Nov had 20 of 24 hours) ----------
+
+def test_partial_newest_day_is_reported(cache):
+    out = insights.compute(cache, insights.Thresholds())
+    assert out["partial_day"] == {"day": "2026-11-05", "hours": 6, "cost": 50.0}
+
+
+def test_no_partial_day_when_the_data_ends_at_midnight(tmp_path):
+    path = tmp_path / "focus.duckdb"
+    c = duckdb.connect(str(path))
+    c.sql("CREATE TABLE focus (chargeperiodstart TIMESTAMP, chargeperiodend TIMESTAMP, billedcost DOUBLE, "
+          "chargecategory VARCHAR, servicename VARCHAR, resourceid VARCHAR)")
+    c.execute("INSERT INTO focus VALUES (?, ?, 4.0, 'Usage', 'Amazon EC2', 'i-1')",
+              (datetime(2026, 11, 9, 23), datetime(2026, 11, 10, 0)))
+    c.close()
+    out = insights.compute(str(path), insights.Thresholds())
+    assert out["last_full_day"] == "2026-11-09" and out["partial_day"] is None

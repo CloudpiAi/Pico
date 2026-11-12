@@ -71,9 +71,18 @@ done
 match FOCUS_REGION '^[a-z]{2}(-[a-z]+)+-[0-9]$' "is not an AWS Region (e.g. us-east-1)"
 match FOCUS_EXPORT_BUCKET "$BUCKET_RE" "is not a valid S3 bucket name"
 match FOCUS_STATE_BUCKET "$BUCKET_RE" "is not a valid S3 bucket name"
+no_match FOCUS_EXPORT_PREFIX '^[sS]3://' "must be a key path inside the bucket (e.g. focus2/focus2/data/), not an s3:// URL"
+case "$(val FOCUS_EXPORT_PREFIX)" in
+    "$(val FOCUS_EXPORT_BUCKET)"/*) printf '%s: %s %s\n' "$PROG" FOCUS_EXPORT_PREFIX "starts with the bucket name: it is a key path inside the bucket (e.g. focus2/focus2/data/), so leave the bucket name out unless a folder really has that name" >&2 ;;
+esac
 match FOCUS_EXPORT_PREFIX '/$' "must end with /"
 no_match FOCUS_EXPORT_PREFIX '^/' "must not start with /"
 no_match FOCUS_EXPORT_PREFIX "\.\.|'|\"|;" "must not contain .., quotes or ;"
+case "$(val FOCUS_EXPORT_PREFIX)" in
+    data/ | */data/) ;;
+    *) printf '%s: %s %s
+' "$PROG" FOCUS_EXPORT_PREFIX "doesn't end with data/ (an AWS FOCUS export keeps its files under .../data/): the export's manifests can't be found, so an overwrite-mode month is read from every file in its folder" >&2 ;;
+esac
 region=$(val FOCUS_REGION)
 match FOCUS_TABLE_BUCKET_ARN "^arn:aws[a-z-]*:s3tables:${region}:[0-9]{12}:bucket/[a-z0-9-]{3,63}\$" \
     "must be an S3 Tables table bucket ARN in FOCUS_REGION"
@@ -96,6 +105,39 @@ fi
 for name in FOCUS_ALERT_INCREASE_PCT FOCUS_ALERT_MIN_SERVICE_USD FOCUS_ALERT_MIN_RESOURCE_USD FOCUS_ALERT_STALE_DAYS; do
     if opt_set "$name"; then match "$name" '^[0-9]+([.][0-9]+)?$' "must be a number (e.g. 50 or 0.5)"; fi
 done
+
+# Scheduled Slack tasks (all optional; unset = the defaults: 5 history changes per task, 1000 asks a day).
+for name in FOCUS_REPORT_HISTORY_MAX FOCUS_ASK_MAX_PER_DAY; do
+    if opt_set "$name"; then match "$name" '^[1-9][0-9]*$' "must be a whole number of 1 or more"; fi
+done
+# The lists may be empty: no channel list = any channel the bot is in; no creators = nobody may post tasks to
+# a channel (DM tasks still work); no admins = only each task's own creator changes it.
+if [ -n "$(val FOCUS_REPORT_CHANNELS)" ]; then
+    match FOCUS_REPORT_CHANNELS '^[CG][A-Z0-9]{8,}( ?, ?[CG][A-Z0-9]{8,})*$' \
+        "must be Slack channel IDs (C...), comma-separated"
+fi
+if [ -n "$(val FOCUS_REPORT_CREATORS)" ]; then
+    match FOCUS_REPORT_CREATORS '^[UW][A-Z0-9]{8,}( ?, ?[UW][A-Z0-9]{8,})*$' \
+        "must be Slack user IDs (U...), comma-separated"
+fi
+if [ -n "$(val FOCUS_REPORT_ADMINS)" ]; then
+    match FOCUS_REPORT_ADMINS '^[UW][A-Z0-9]{8,}( ?, ?[UW][A-Z0-9]{8,})*$' \
+        "must be Slack user IDs (U...), comma-separated"
+fi
+if opt_set FOCUS_REPORT_ALLOW_MENTIONS; then
+    match FOCUS_REPORT_ALLOW_MENTIONS '^(true|false)$' "must be true or false"
+fi
+
+# Slack answers (pico_finops_agent/slack_guard.py; all optional, defaults 8 / 180 / 30 when unset).
+if opt_set AGENT_HISTORY_TURNS; then
+    match AGENT_HISTORY_TURNS '^([1-9]|[1-4][0-9]|50)$' "must be a whole number of turns from 1 to 50"
+fi
+if opt_set AGENT_ANSWER_DEADLINE_S; then
+    match AGENT_ANSWER_DEADLINE_S '^([3-9][0-9]|[1-8][0-9][0-9]|900)$' "must be a whole number of seconds from 30 to 900"
+fi
+if opt_set AGENT_QUESTIONS_PER_HOUR; then
+    match AGENT_QUESTIONS_PER_HOUR '^(0|[1-9][0-9]{0,4})$' "must be a whole number (0 = no limit)"
+fi
 
 # 3. The LLM (pico_finops_agent/llm.py, same names): AGENT_LLM_PROVIDER picks it (default gemini); its key must be set.
 provider=gemini

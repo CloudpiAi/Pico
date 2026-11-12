@@ -9,6 +9,7 @@
 !pico/**
 !pico_finops_agent/**
 !plugins/focus/**
+!plugins/schedule/**
 !deploy/pico-finops-agent.yml
 
 # Never, even inside the folders above

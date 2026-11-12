@@ -8,10 +8,9 @@ import pytest
 
 duckdb = pytest.importorskip("duckdb")
 
+from pico_finops_agent import cache_reconnect  # noqa: E402
 from pico.configuration.agent_config import DbConfig  # noqa: E402
 from pico.tools.db_tools import db_manager as dbm  # noqa: E402
-
-from pico_finops_agent import cache_reconnect  # noqa: E402
 
 
 def _build(path, rows):

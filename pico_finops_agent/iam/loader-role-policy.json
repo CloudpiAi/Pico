@@ -9,7 +9,8 @@
       "Condition": {
         "StringLike": {
           "s3:prefix": [
-            "<export-prefix>*"
+            "<export-prefix>*",
+            "<export-root>metadata/*"
           ]
         }
       }
@@ -18,7 +19,10 @@
       "Sid": "ReadExportFiles",
       "Effect": "Allow",
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::<export-bucket>/<export-prefix>*"
+      "Resource": [
+        "arn:aws:s3:::<export-bucket>/<export-prefix>*",
+        "arn:aws:s3:::<export-bucket>/<export-root>metadata/*"
+      ]
     },
     {
       "Sid": "CreateAndWriteTheTable",

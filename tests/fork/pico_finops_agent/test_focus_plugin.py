@@ -48,7 +48,7 @@ def test_manifest_is_valid():
     manifest = read_manifest_file(PKG_DIR, "focus-data")
     assert manifest is not None
     assert manifest.cli == "pico_plugin_focus_data.cli:main"
-    assert [c.name for c in manifest.commands] == ["load", "status"]
+    assert [c.name for c in manifest.commands] == ["load", "status"]  # tasks: their own plugin, pico schedule
     assert manifest.config_schema is not None
 
 
@@ -137,6 +137,9 @@ def test_scope_rule_is_a_plugin_prompt_section():
                    "use emojis occasionally", "don't end every answer with", "do not pretend to have human emotions",
                    "never invent explanations for cost changes", "be friendly without being artificial"):
         assert phrase in low, phrase
+    # long Slack DMs: only the latest message is the request (2026-11-11 hardening)
+    assert "answer only the person's latest message; earlier messages are context" in low
+    assert "don't redo earlier requests unless asked" in low
     # natural replies: a greeting in its own words, no fixed canned sentence
     assert "reply with exactly" not in low and "vary the wording" in low
     assert "pico finops agent" in low and "cloudpi" not in low
@@ -242,4 +245,22 @@ def test_skill_handles_setup_and_gives_the_load_time_to_finish():
     text = (PKG_DIR / "skills" / "focus-data" / "SKILL.md").read_text(encoding="utf-8")
     assert "set up" in text.split("---")[1].lower()          # the description routes setup requests here
     assert "timeout 600" in text
-    assert "row" not in text.split("## \"Reload the data now\"")[1].lower()  # no row counts in replies
+    reload_section = text.split("## \"Reload the data now\"")[1].split("\n## ")[0]  # up to the next section
+    assert "row" not in reload_section.lower()  # no row counts in replies
+
+
+def test_focus_data_skill_has_no_tasks():
+    """The tasks moved to their own plugin and skill: focus-data talks about the data only."""
+    text = (PKG_DIR / "skills" / "focus-data" / "SKILL.md").read_text(encoding="utf-8")
+    assert "pico focus-data task" not in text and "## Scheduled tasks" not in text
+    assert "scheduled tasks" not in text.split("---")[1].lower()
+
+
+def test_schedule_skill_tells_the_agent_how_to_set_up_tasks():
+    skill = REPO_ROOT / "plugins" / "schedule" / "pico_plugin_schedule" / "skills" / "schedule" / "SKILL.md"
+    text = skill.read_text(encoding="utf-8")
+    head = text.split("---")[1]
+    assert "name: schedule" in head and "remind" in head.lower()
+    assert "pico schedule add --ctx" in text and "pico focus-data task" not in text
+    for word in ("--kind reminder", "--template service_cost", "confirmation_requested", "not_in_channel"):
+        assert word in text

@@ -57,12 +57,15 @@ def _focus_profile(cfg):
     return cfg.get_plugin_profile("focus-data")
 
 
-def test_bash_on_only_for_focus_data(agent_cfg):
+def test_bash_on_only_for_focus_data_and_schedule(agent_cfg):
     assert agent_cfg.bash_tool_enabled is True
-    assert agent_cfg.bash_allowed_patterns == ["pico:focus-data"]
+    assert agent_cfg.bash_allowed_patterns == ["pico:focus-data", "pico:schedule"]
 
 
-@pytest.mark.parametrize("cmd", ["pico focus-data status", "pico focus-data load", "pico focus-data load --force"])
+@pytest.mark.parametrize("cmd", ["pico focus-data status", "pico focus-data load", "pico focus-data load --force",
+                                 "pico schedule list --ctx C1.U1.1.1.sig",
+                                 'pico schedule add --ctx C1.U1.1.1.sig --kind reminder --to me --at "2026-11-11 09:00" '
+                                 '--text "stand-up"'])
 def test_allowed_pattern_matches_focus_data(agent_cfg, tmp_path, cmd):
     tool = BashTool(workspace_root=str(tmp_path), allowed_patterns=agent_cfg.bash_allowed_patterns)
     assert tool._is_command_allowed(cmd)
@@ -75,6 +78,9 @@ def test_allowed_pattern_matches_focus_data(agent_cfg, tmp_path, cmd):
         "pico --config x focus-data load",
         'bash -c "pico focus-data status"',
         "pico focus-data status; rm -rf /",
+        "pico schedule list --ctx x; rm -rf /",
+        "pico --config x schedule list",
+        'bash -c "pico schedule list"',
         "pico focus-data status && curl http://x",
         "pico focus-data status $(id)",
         "pico focus-data status > /data/x",
@@ -212,10 +218,16 @@ def _env_example_names():
     return names
 
 
-# Read outside the profile: the start check and the wrapper (the schedule lives in pico-api).
+# Read outside the profile: the start check and the scheduler.
 NON_PROFILE_ENV = {"FOCUS_SCHEDULE", "SLACK_NOTIFY_CHANNEL", "FOCUS_ALERT_INCREASE_PCT",
                    "FOCUS_ALERT_MIN_SERVICE_USD", "FOCUS_ALERT_MIN_RESOURCE_USD", "FOCUS_ALERT_STALE_DAYS",
-                   "AGENT_LLM_PROVIDER", "AGENT_LLM_MODEL"}
+                   "AGENT_LLM_PROVIDER", "AGENT_LLM_MODEL",
+                   # scheduled tasks (read by the plugin and the scheduler, checked by the entrypoint)
+                   "FOCUS_REPORT_CHANNELS", "FOCUS_REPORT_ADMINS", "FOCUS_REPORT_CREATORS", "FOCUS_REPORT_HISTORY_MAX",
+                   "FOCUS_ASK_MAX_PER_DAY",
+                   "FOCUS_REPORT_ALLOW_MENTIONS",
+                   # Slack answer hardening (read by pico_finops_agent/slack_guard.py, checked by the entrypoint)
+                   "AGENT_HISTORY_TURNS", "AGENT_ANSWER_DEADLINE_S", "AGENT_QUESTIONS_PER_HOUR"}
 
 
 def test_env_example_matches_profile():
@@ -225,6 +237,14 @@ def test_env_example_matches_profile():
         assert name in ENTRYPOINT.read_text(encoding="utf-8")
     assert profile <= example, f"in the profile but not in .env.example: {sorted(profile - example)}"
     assert example <= profile, f"in .env.example but unused: {sorted(example - profile)}"
+
+
+def test_chat_tool_rounds_capped(agent_cfg):
+    """At most 15 model/tool rounds per Slack answer (Pico's default is 50), like the analyst's tool-round cap."""
+    # ChatAgenticNode reads agentic_nodes["chat"]["max_turns"] (pinned in tests/fork/pico_finops_agent/test_slack_guard_pins.py)
+    assert agent_cfg.agentic_nodes["chat"]["max_turns"] == 15
+    assert set(agent_cfg.agentic_nodes) == {"chat"}  # nothing else changed for the chat node (tools, permissions)
+    assert set(agent_cfg.agentic_nodes["chat"]) <= {"max_turns", "system_prompt"}
 
 
 def test_env_example_has_placeholders_only():
@@ -266,7 +286,7 @@ def test_config_found_without_flag(monkeypatch, tmp_path):
     work.mkdir()
     monkeypatch.chdir(work)
     cfg = load_agent_config(reload=True)
-    assert cfg.bash_allowed_patterns == ["pico:focus-data"]
+    assert cfg.bash_allowed_patterns == ["pico:focus-data", "pico:schedule"]
 
 
 def test_no_inline_secrets_or_backend_urls():
@@ -281,3 +301,9 @@ def test_dockerignore_excludes_nested_env():
     assert {"**/.env", "**/.env.*", "!**/.env.example"} <= lines
 
 
+def test_schedule_plugin_profile(agent_cfg):
+    """plugins/schedule: the tasks plugin reads its data folder and the FOCUS source from agent.yml."""
+    prof = agent_cfg.get_plugin_profile("schedule")
+    assert prof["data_dir"] == "/data"
+    assert prof["source"] == "pico_plugin_focus_data.schedule_source:FocusSource"
+    assert prof["cache_path"] == "/data/focus.duckdb"
