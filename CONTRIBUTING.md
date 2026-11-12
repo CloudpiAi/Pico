@@ -48,7 +48,7 @@ Use the `/validate-iam-policy` Claude Code skill for a thorough review.
 
 1. **Add or update tests** — The agent's tests are in `tests/fork/`; see the README for how to run them
 2. **Run the tests** — All of `tests/fork` must pass
-3. **Build the image** — Run `docker compose build` if you changed the agent, the Dockerfile or the dependencies
+3. **Build the image** — Run `docker compose -f docker-compose.yml -f docker-compose.build.yml build` if you changed the agent, the Dockerfile or the dependencies; the PR's "Build Docker Image" check does the same and runs the image checks
 4. **Update the docs** — `.env.example` and the setup guide when a setting or a setup step changes
 
 ### Docker Compose or deployment config changes

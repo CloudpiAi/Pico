@@ -1,0 +1,40 @@
+name: 'Build Image'
+description: 'Builds the Pico FinOps Agent image from the Dockerfile in the repository root (load only, never pushed).'
+inputs:
+  image:
+    description: 'Name and tag to give the built image'
+    required: false
+    default: 'pico-finops-agent:ci'
+  disableCaching:
+    description: 'Build without the GitHub Actions layer cache'
+    required: false
+    default: 'false'
+outputs:
+  image:
+    description: 'Name and tag of the built image (loaded into the runner''s Docker)'
+    value: ${{ inputs.image }}
+runs:
+  using: "composite"
+  # Requires the repository checked out in the workspace root.
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+    - name: Build Docker Image
+      uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      with:
+        context: .
+        file: ./Dockerfile
+        platforms: linux/amd64
+        load: true
+        push: false
+        tags: ${{ inputs.image }}
+        # The source label links a published image to this repository on GitHub's package page.
+        labels: |
+          org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          org.opencontainers.image.revision=${{ github.sha }}
+          org.opencontainers.image.title=Pico FinOps Agent
+          org.opencontainers.image.licenses=Apache-2.0
+        no-cache: ${{ inputs.disableCaching == 'true' }}
+        cache-from: ${{ inputs.disableCaching != 'true' && 'type=gha,scope=pico-image' || '' }}
+        cache-to: ${{ inputs.disableCaching != 'true' && 'type=gha,scope=pico-image,mode=max' || '' }}

@@ -457,15 +457,22 @@ Then **log out and connect again**, so you can use Docker without `sudo`.
 
 ### Step 7: Configure and start the agent
 
-**Goal:** the agent is built, configured with your worksheet values, and running.
+**Goal:** the agent is downloaded, configured with your worksheet values, and running.
 
-**7a. Download and build the agent** (on the EC2 server; the build takes a few minutes):
+**7a. Download the agent** (on the EC2 server). The repository holds the settings template and the compose file;
+the image comes ready-made from the GitHub Container Registry (built and checked by this repository's GitHub
+Actions, public, no login needed):
 
 ```bash
 git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
 cd ~/pico-finops-agent
-docker compose build
+git checkout v0.2.0         # the latest release (Releases page)
+docker compose pull         # ghcr.io/cloudpiai/pico-finops-agent
 ```
+
+> **Prefer to build the image yourself?** Everything that runs is in this repository. Instead of `docker compose
+> pull`, run `docker compose -f docker-compose.yml -f docker-compose.build.yml build` (a few minutes), and add
+> the same two `-f` options to every `docker compose` command below.
 
 **7b. Create the settings file:**
 
@@ -632,14 +639,21 @@ please read the output before you share it.
 
 ## 7. Updating, stopping and removing
 
-**Update to a new version** (your data is kept):
+**Update to a new version** (your data is kept). Read the release's notes on the
+[Releases page](https://github.com/CloudpiAi/Pico/releases) first: they list any new setting or permission.
 
 ```bash
 cd ~/pico-finops-agent
-git pull                    # or: git checkout <release-tag>
-docker compose build
+git fetch --tags
+git checkout v0.2.0         # the release you want
+docker compose pull         # if you pin AGENT_IMAGE_TAG in .env, set it to the same version first
+docker compose run --rm agent check
 docker compose up -d
 ```
+
+Building it yourself: replace `docker compose pull` with
+`docker compose -f docker-compose.yml -f docker-compose.build.yml build`, and keep the two `-f` options on the
+other commands.
 
 **Stop:**
 
@@ -659,7 +673,9 @@ docker compose down -v      # stop, and delete the local data (it's rebuilt from
 ## 8. Security summary
 
 - **Your data stays in your account.** Only a question and the few rows that answer it go to your LLM provider. Answers go to your Slack.
-- **No inbound connections.** The server opens no ports. It connects out to AWS, Slack and the LLM only.
+- **No inbound connections.** The server opens no ports. It connects out to AWS, Slack and the LLM only. Setup and
+  updates also download from GitHub (`github.com`, and the image from `ghcr.io` / `pkg-containers.githubusercontent.com`);
+  building the image yourself also downloads from Docker Hub, PyPI and `extensions.duckdb.org`.
 - **No AWS access keys.** The agent uses two IAM roles, and each role can reach only the agent's own resources.
 - **Hardened container.** It runs as a normal user, on a read-only file system, with all Linux capabilities dropped.
 - **Keep `.env` private.** It holds your LLM key and Slack tokens. Step 7b creates it readable by you only.
