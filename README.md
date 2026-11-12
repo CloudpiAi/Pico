@@ -101,9 +101,11 @@ See [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) for a detailed priva
 .
 ├── README.md                          # This file
 ├── CONTRIBUTING.md                    # How to contribute
-├── CLAUDE.md                          # Guidelines for Claude Code
 ├── docker-compose.yml                 # Docker container definition
 ├── .env.example                       # Configuration template
+├── pico_finops_agent/                 # Agent source code (agent.py, llm.py, cli.py, scheduler.py, health.py)
+├── loader/                            # Lambda loader code
+├── deploy/                            # Deployment configuration
 ├── policies/aws/                      # IAM role policies
 │   ├── ec2-role-policy.json          # Permissions for EC2 instance
 │   ├── ec2-role-trust.json           # Who can assume EC2 role
@@ -112,6 +114,7 @@ See [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) for a detailed priva
 ├── docs/
 │   └── CUSTOMER-SETUP-GUIDE.md       # Complete setup instructions
 └── LICENSE                            # Apache 2.0
+
 ```
 
 ## Contributing
