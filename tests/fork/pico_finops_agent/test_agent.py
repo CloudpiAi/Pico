@@ -261,6 +261,7 @@ def test_main_without_slack_tokens(monkeypatch):
     monkeypatch.setattr(agent, "_install_cache_reconnect", lambda: calls.append("cache_reconnect"))
     monkeypatch.setattr(agent, "_install_slack_context", lambda: calls.append("slack_context"))
     monkeypatch.setattr(agent, "_install_slack_guard", lambda: calls.append("slack_guard"))
+    monkeypatch.setattr(agent, "_install_llm_log", lambda: calls.append("llm_log"))
     monkeypatch.setattr(agent, "_configure_logging", lambda: calls.append("logging"))
     monkeypatch.setattr(agent.scheduler, "start_scheduler", lambda s=None: calls.append("scheduler_start") or "S")
     monkeypatch.setattr(agent.scheduler, "build_scheduler", lambda: "S")
@@ -280,6 +281,7 @@ def test_main_without_slack_tokens(monkeypatch):
     assert calls[-1] == "scheduler_stop"
     assert "slack_context" not in calls  # no Slack, no who/where line
     assert "slack_guard" not in calls  # no Slack, Pico's bridge is left as it is
+    assert "llm_log" not in calls  # no Slack answers, no in-process model calls to log
 
 
 def test_main_with_slack_tokens_builds_the_gateway_from_the_config(monkeypatch):
@@ -290,6 +292,7 @@ def test_main_with_slack_tokens_builds_the_gateway_from_the_config(monkeypatch):
     monkeypatch.setattr(agent, "_install_cache_reconnect", lambda: None)
     monkeypatch.setattr(agent, "_install_slack_context", lambda: built.setdefault("order", []).append("context"))
     monkeypatch.setattr(agent, "_install_slack_guard", lambda: built.setdefault("order", []).append("guard"))
+    monkeypatch.setattr(agent, "_install_llm_log", lambda: built.setdefault("order", []).append("llm_log"))
     monkeypatch.setattr(agent, "_configure_logging", lambda: None)
     monkeypatch.setattr(agent, "_install_signal_handlers", lambda stop: None)
     monkeypatch.setattr(agent.scheduler, "build_scheduler", lambda: "S")
@@ -315,7 +318,31 @@ def test_main_with_slack_tokens_builds_the_gateway_from_the_config(monkeypatch):
     assert built["config"] == "conf/agent.yml" and callable(built["factory"]) and built["stopped"]
     # every Slack message gets the signed who/where line for scheduled tasks; the answer guard goes on after it, so
     # it is the outermost wrapper and sees the text the person typed (reset phrase)
-    assert built["order"] == ["context", "guard"]
+    # and every model call of a Slack answer logs why the model stopped (llm_call)
+    assert built["order"] == ["context", "guard", "llm_log"]
+
+
+def test_llm_log_install_failure_is_logged_not_raised(monkeypatch, capsys):
+    from pico_finops_agent import llm_log
+
+    monkeypatch.setattr(llm_log, "install", lambda **kw: 1 / 0)
+    agent._install_llm_log()
+    line = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert line["event"] == "llm_log_off" and "ZeroDivisionError" in line["reason"]
+
+
+def test_llm_log_saves_failed_calls_only_when_asked(monkeypatch):
+    from pico_finops_agent import llm_log
+
+    seen = {}
+    monkeypatch.setattr(llm_log, "install", lambda **kw: seen.update(kw))
+    monkeypatch.setenv("FOCUS_DATA_DIR", "/data")
+    monkeypatch.delenv("AGENT_SAVE_FAILED_CALLS", raising=False)
+    agent._install_llm_log()
+    assert seen["save_dir"] is None
+    monkeypatch.setenv("AGENT_SAVE_FAILED_CALLS", "1")
+    agent._install_llm_log()
+    assert seen["save_dir"] == "/data/llm-failures"
 
 
 def test_slack_needs_both_tokens(monkeypatch):

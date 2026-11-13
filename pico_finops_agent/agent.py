@@ -326,6 +326,18 @@ def _install_slack_guard():
         _log("slack_guard_off", reason=describe(e, 200))
 
 
+def _install_llm_log():
+    """One `llm_call` line per model call of a Slack answer: why the model stopped, tokens, tools called
+    (pico_finops_agent/llm_log.py). AGENT_SAVE_FAILED_CALLS=1 also keeps the request of an empty or failed call under
+    <data dir>/llm-failures/. If it can't install, answers work as before and the log says so."""
+    from pico_finops_agent import llm_log
+
+    try:
+        llm_log.install(save_dir=llm_log.save_dir_from_env(data_dir=scheduler.data_dir()))
+    except Exception as e:  # noqa: BLE001
+        _log("llm_log_off", reason=describe(e, 200))
+
+
 def _make_signal_handler(stop, exit=os._exit):
     def handle(signum, _frame):
         if stop.is_set():
@@ -357,6 +369,7 @@ def main(argv=None):
     else:
         _install_slack_context()
         _install_slack_guard()
+        _install_llm_log()
 
     stop = threading.Event()
     _install_signal_handlers(stop)

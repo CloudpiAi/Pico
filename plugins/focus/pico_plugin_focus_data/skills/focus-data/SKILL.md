@@ -1,6 +1,6 @@
 ---
 name: focus-data
-description: Use for the cost data itself, not for cost questions (those are answered from the table guide in the system prompt): "when was the cost data last loaded / is it up to date", "reload / refresh the cost data now", and "set up the cost agent / start collecting the cost data".
+description: 'Use for the cost data itself, not for cost questions (those are answered from the table guide in the system prompt): "when was the cost data last loaded / is it up to date", "reload / refresh the cost data now", and "set up the cost agent / start collecting the cost data".'
 ---
 
 # FOCUS cost data

@@ -75,6 +75,9 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for how the parts fit together.
 | History cap (`AGENT_HISTORY_TURNS`, default 8): the model sees only recent turns | `pico_finops_agent/slack_guard.py` (`trim_to_last_turns`) | Verified |
 | At most 15 model/tool rounds per answer | `deploy/pico-finops-agent.yml` (`agentic_nodes.chat.max_turns: 15`) | Verified |
 | Raw error text is never posted to Slack; it becomes a fixed sorry message | `pico_finops_agent/slack_guard.py` | Verified |
+| An unanswered attempt is taken back out of the session, so a later question never carries it (or carries it out) | `pico_finops_agent/slack_guard.py` (Pico's `rollback_turn`) | Verified |
+| The model-call log (`llm_call`) holds finish reasons, token counts and tool names, never the question, the answer or a key | `pico_finops_agent/llm_log.py` | Verified |
+| Failed-call requests are written only with `AGENT_SAVE_FAILED_CALLS=1` (default 0): they hold cost data and questions, owner-only files on the data volume, newest 50 | `pico_finops_agent/llm_log.py` | Verified |
 | In a channel thread, only the person who started it can reset it | `pico_finops_agent/slack_guard.py` (`RESET_NOT_YOURS`) | Verified |
 | Bad `AGENT_*` values are refused at start | `pico_finops_agent/entrypoint.sh` | Verified |
 | A system prompt keeps the LLM on AWS cost questions | `plugins/focus/pico_plugin_focus_data/prompts/scope.j2` | Verified (a prompt, not a hard control) |

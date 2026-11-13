@@ -279,6 +279,9 @@ def test_task_counts(tmp_path, name, value, ok):
     ("AGENT_QUESTIONS_PER_HOUR", "1000", True), ("AGENT_QUESTIONS_PER_HOUR", "-1", False),
     ("AGENT_QUESTIONS_PER_HOUR", "07", False), ("AGENT_QUESTIONS_PER_HOUR", "x", False),
     ("AGENT_QUESTIONS_PER_HOUR", "", False),
+    ("AGENT_SAVE_FAILED_CALLS", "0", True), ("AGENT_SAVE_FAILED_CALLS", "1", True),
+    ("AGENT_SAVE_FAILED_CALLS", "true", False), ("AGENT_SAVE_FAILED_CALLS", "yes", False),
+    ("AGENT_SAVE_FAILED_CALLS", "", False),
 ])
 def test_slack_answer_settings(tmp_path, name, value, ok):
     r = run(tmp_path, env_over={name: value})

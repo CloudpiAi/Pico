@@ -24,6 +24,7 @@ from pico.api.models.cli_models import (
 from pico.gateway.bridge import ChannelBridge
 from pico.gateway.channel.base import ChannelAdapter
 from pico.gateway.models import DONE_EMOJI, ERROR_EMOJI, PROCESSING_EMOJI, ChannelConfig, InboundMessage, Verbose
+from pico_finops_agent import llm_log
 from pico_finops_agent import slack_guard as sg
 
 # ======================================================================
@@ -127,10 +128,12 @@ class FakeSession:
 @pytest.fixture
 def restore_pico(monkeypatch):
     """Undo every class patch the guard makes (monkeypatch restores the saved originals)."""
+    from pico.agent.node.chat_agentic_node import ChatAgenticNode
     from pico.models.base import LLMBaseModel
 
     monkeypatch.setattr(LLMBaseModel, "_build_run_config", LLMBaseModel._build_run_config)
     monkeypatch.setattr(ChannelBridge, "handle_message", ChannelBridge.handle_message)
+    monkeypatch.setattr(ChatAgenticNode, "_build_success_result", ChatAgenticNode._build_success_result)
     sg._TURNS_SENT.clear()
     return monkeypatch
 
@@ -275,7 +278,8 @@ def test_rate_limiter_zero_is_off():
 def test_turn_stats_from_events():
     events = [tool_event("c1"), tool_event("c1", result=True), tool_event("c2"), message_event("hi"),
               end_event(input_tokens=1200, output_tokens=80, requests=3)]
-    assert sg.turn_stats(events) == {"tool_calls": 2, "requests": 3, "input_tokens": 1200, "output_tokens": 80}
+    assert sg.turn_stats(events) == {"tool_calls": 2, "tool_results": 1, "requests": 3, "input_tokens": 1200,
+                                     "output_tokens": 80}
     assert sg.turn_stats([error_event("boom", "RateLimitError")])["error_type"] == "RateLimitError"
     assert sg.turn_stats(None) == {}
 
@@ -326,14 +330,21 @@ SCRIPTS = {
     "empty": lambda: [end_event(input_tokens=170000, output_tokens=0, requests=1)],
     "error": lambda: [error_event("429 quota exceeded for key AIzaSECRET", "RateLimitError")],
     "slow": lambda: [message_event("late")],
+    "empty_wait": lambda: [end_event(input_tokens=10, output_tokens=0, requests=1)],
+    # a tool ran (e.g. `pico schedule add` saved a task), then the model wrote nothing
+    "tool_then_empty": lambda: [tool_event("c7"), tool_event("c7", result=True),
+                                end_event(input_tokens=10, output_tokens=0, requests=2)],
 }
 
 
 class FakeTasks:
     """Stands in for ChatTaskManager: each start_chat takes the next script."""
 
-    def __init__(self, *scripts, stop_works=True):
+    def __init__(self, *scripts, stop_works=True, session_dir=None):
         self.scripts = list(scripts)
+        self.session_dir = session_dir  # set: each run writes to the real session what Pico would
+        self.modes = []
+        self.slow_kinds = {"slow"}
         self.requests = []
         self.tasks = {}
         self.stopped = []
@@ -341,18 +352,29 @@ class FakeTasks:
 
     async def start_chat(self, agent_config, request, sub_agent_id=None):
         kind = self.scripts.pop(0)
+        if kind == "raise":
+            raise RuntimeError("the bridge broke")
         self.requests.append(request)
+        self.modes.append(sg._HISTORY_MODE.get())
+        record = llm_log._CURRENT.get()  # what llm_log's wrapper would add for this attempt's model call
+        if record is not None:
+            record.finishes.append("malformed_function_call" if kind == "empty" else "stop")
         if kind == "busy":
             raise ValueError("A task is already running for session x")
-        run = asyncio.ensure_future(asyncio.sleep(30 if kind == "slow" else 0))
+        if self.session_dir:
+            await write_turn(self.session_dir, request.session_id, request.message, kind)
+        slow = kind in self.slow_kinds
+        run = asyncio.ensure_future(asyncio.sleep(30 if slow else 0.3 if kind == "empty_wait" else 0))
         task = SimpleNamespace(session_id=request.session_id, kind=kind, events=SCRIPTS[kind](), asyncio_task=run,
                                status="running" if kind == "slow" else "completed")
         self.tasks[request.session_id] = task
         return task
 
     async def consume_events(self, task):
-        if task.kind == "slow":
+        if task.kind in self.slow_kinds:
             await asyncio.sleep(30)
+        if task.kind == "empty_wait":
+            await task.asyncio_task
         for event in task.events:
             yield event
 
@@ -364,6 +386,32 @@ class FakeTasks:
         if self.stop_works:
             self.tasks[session_id].asyncio_task.cancel()
         return True
+
+
+TURN_ITEMS = {  # what a run leaves in the session: the question, then whatever the model produced
+    "answer": lambda q: [user(q), bot("Here is your answer")],
+    "empty": lambda q: [user(q)],
+    "empty_wait": lambda q: [user(q)],
+    "tool_then_empty": lambda q: [user(q), call("c7"), output("c7")],
+    "error": lambda q: [user(q), call("c9")],
+    "slow": lambda q: [user(q)],
+}
+
+
+async def write_turn(session_dir, session_id, question, kind):
+    from pico.models.session_manager import SessionManager
+
+    await SessionManager(session_dir=session_dir).get_session(session_id).add_items(TURN_ITEMS[kind](question))
+
+
+def session_items(session_dir, session_id):
+    from pico.models.session_manager import SessionManager
+
+    return asyncio.run(SessionManager(session_dir=session_dir).get_session(session_id).get_items())
+
+
+def user_texts(items):
+    return [i["content"] for i in items if i.get("role") == "user"]
 
 
 class RecordingAdapter(ChannelAdapter):
@@ -410,9 +458,10 @@ async def ctx_like_wrapper(self, msg, adapter, channel_config=None):
 
 
 class Harness:
-    def __init__(self, tmp_path, *scripts, settings=None, stop_works=True, stop_wait_s=5):
-        self.tasks = FakeTasks(*scripts, stop_works=stop_works)
-        self.bridge = ChannelBridge(SimpleNamespace(session_dir=str(tmp_path / "sessions")), self.tasks)
+    def __init__(self, tmp_path, *scripts, settings=None, stop_works=True, stop_wait_s=5, real_session=False):
+        self.session_dir = str(tmp_path / "sessions")
+        self.tasks = FakeTasks(*scripts, stop_works=stop_works, session_dir=self.session_dir if real_session else None)
+        self.bridge = ChannelBridge(SimpleNamespace(session_dir=self.session_dir), self.tasks)
         self.adapter = RecordingAdapter()
         self.logs = []
         self.cleared = []
@@ -457,11 +506,27 @@ def test_empty_answer_is_retried_once_with_a_new_message_id(tmp_path):
     assert h.logs[0][1]["input_tokens"] == 170100  # both attempts
 
 
-def test_empty_twice_posts_the_sorry_sentence(tmp_path):
-    h = Harness(tmp_path, "empty", "empty")
+def test_question_line_lists_why_each_model_call_stopped(tmp_path):
+    h = Harness(tmp_path, "empty", "answer")
+    h.send(inbound())
+    fields = h.logs[0][1]
+    assert fields["finish_reasons"] == ["malformed_function_call", "stop"]
+    assert isinstance(fields["qid"], str) and len(fields["qid"]) >= 8  # matches the llm_call lines' qid
+
+
+def test_each_question_gets_its_own_qid(tmp_path):
+    h = Harness(tmp_path, "answer", "answer")
+    h.send(inbound(message_id="1731330000.000100"))
+    h.send(inbound(message_id="1731330000.000200"))
+    a, b = (f for e, f in h.logs if e == "slack_question")
+    assert a["qid"] != b["qid"] and a["finish_reasons"] == b["finish_reasons"] == ["stop"]
+
+
+def test_empty_every_time_posts_the_sorry_sentence(tmp_path):
+    h = Harness(tmp_path, "empty", "empty", "empty")
     h.send(inbound())
     assert h.adapter.texts() == [sg.SORRY]
-    assert len(h.tasks.requests) == 2
+    assert len(h.tasks.requests) == 3
     mid = "1731330000.000100"
     assert h.adapter.added == [(mid, PROCESSING_EMOJI), (mid, ERROR_EMOJI)]
     assert h.adapter.removed == [(mid, PROCESSING_EMOJI)]
@@ -591,7 +656,7 @@ def test_ignored_group_message_is_not_counted_or_logged(tmp_path):
 
 
 def test_log_line_never_has_question_or_answer_text(tmp_path):
-    h = Harness(tmp_path, "answer", "empty", "empty", "error")
+    h = Harness(tmp_path, "answer", "empty", "empty", "empty", "error")
     h.send(inbound(message_id="1.000001"))
     h.send(inbound(message_id="1.000002"))
     h.send(inbound(message_id="1.000003"))
@@ -746,3 +811,418 @@ def test_install_logs_partial_when_only_the_history_cap_is_on(restore_pico, monk
     assert not getattr(ChannelBridge.handle_message, "pico_finops_agent_guard", False)
     assert events[0][0] == "slack_guard_partial"
     assert events[0][1]["history_cap"] == "on" and events[0][1]["guard"] == "off"
+
+
+# ======================================================================
+# Unanswered questions never stay in the session (Pico's checkpoint_turn / rollback_turn)
+# ======================================================================
+
+SID = "gateway_slack--D0AAA00001"
+EARLIER = [user("[slack ctx=test] What did EC2 cost?"), bot("EC2 was $72.80")]
+
+
+def seeded(tmp_path, *scripts, **kw):
+    h = Harness(tmp_path, *scripts, real_session=True, **kw)
+    asyncio.run(_seed(h.session_dir))
+    return h
+
+
+async def _seed(session_dir):
+    from pico.models.session_manager import SessionManager
+
+    await SessionManager(session_dir=session_dir).get_session(SID).add_items(list(EARLIER))
+
+
+def test_rollback_empty_first_try_is_removed_before_the_retry(tmp_path):
+    h = seeded(tmp_path, "empty", "answer")
+    h.send(inbound())
+    items = session_items(h.session_dir, SID)
+    assert items[:2] == EARLIER
+    asked = [t for t in user_texts(items) if "how much did EC2" in t]
+    assert len(asked) == 1  # one copy of the question, the answered one; no unanswered first try
+    assert items[-1] == bot("Here is your answer")
+    assert h.logs[0][1]["rolled_back"] == 1
+
+
+def test_rollback_unanswered_question_leaves_no_trace(tmp_path):
+    h = seeded(tmp_path, "empty", "empty", "empty")
+    h.send(inbound())
+    assert h.adapter.texts() == [sg.SORRY]
+    assert session_items(h.session_dir, SID) == EARLIER  # a later question never sees it (or carries it out)
+    assert h.logs[0][1]["rolled_back"] == 3
+
+
+def test_rollback_after_an_error(tmp_path):
+    h = seeded(tmp_path, "error")
+    h.send(inbound())
+    assert h.adapter.texts() == [sg.SORRY]
+    assert session_items(h.session_dir, SID) == EARLIER
+
+
+def test_rollback_after_a_stopped_slow_answer(tmp_path):
+    h = seeded(tmp_path, "slow", settings=sg.Settings(history_turns=8, deadline_s=0.2, questions_per_hour=30))
+    h.send(inbound())
+    assert h.adapter.texts() == [sg.TOO_LONG]
+    assert session_items(h.session_dir, SID) == EARLIER
+
+
+def test_no_rollback_when_the_slow_run_did_not_stop(tmp_path):
+    h = seeded(tmp_path, "slow", settings=sg.Settings(history_turns=8, deadline_s=0.2, questions_per_hour=30),
+               stop_works=False, stop_wait_s=0.2)
+    h.send(inbound())
+    # it may still be writing: leave the session alone rather than race it
+    assert len(session_items(h.session_dir, SID)) == len(EARLIER) + 1
+
+
+def test_no_rollback_when_busy(tmp_path):
+    h = seeded(tmp_path, "busy")
+    asyncio.run(write_turn(h.session_dir, SID, "the running question", "empty"))  # another message's run, mid-way
+    h.send(inbound())
+    assert user_texts(session_items(h.session_dir, SID))[-1] == "the running question"  # never touched
+
+
+def test_answered_question_is_kept(tmp_path):
+    h = seeded(tmp_path, "answer")
+    h.send(inbound())
+    items = session_items(h.session_dir, SID)
+    assert items[:2] == EARLIER and items[-1] == bot("Here is your answer") and len(items) == 4
+    assert h.logs[0][1].get("rolled_back", 0) == 0
+
+
+def test_rollback_failure_never_breaks_the_answer(tmp_path, monkeypatch):
+    from pico.models.session_manager import SessionManager
+
+    monkeypatch.setattr(SessionManager, "rollback_turn", lambda self, sid, cp: 1 / 0)
+    h = seeded(tmp_path, "empty", "answer")
+    h.send(inbound())
+    assert h.adapter.texts() == ["Here is your answer"]
+    assert h.outcomes() == ["retried"]
+
+
+def test_a_second_message_while_one_is_in_flight_gets_busy_and_is_never_rolled_back(tmp_path):
+    """Security review: between an attempt's checkpoint and its rollback no other run may write the same session."""
+    h = seeded(tmp_path, "empty_wait", "answer")
+
+    async def both():
+        first = asyncio.ensure_future(h.handle(h.bridge, inbound(), h.adapter, h.channel_config))
+        await asyncio.sleep(0.05)  # the first question's attempt is running
+        await h.handle(h.bridge, inbound(text="and S3?", message_id="1731330000.000200"), h.adapter,
+                       h.channel_config)
+        await first
+
+    asyncio.run(both())
+    assert sg.BUSY_TEXT in h.adapter.texts()  # what Pico itself says while a run is going
+    # and, as Pico's own busy path does, the second message gets the error mark: it is finished, not pending
+    assert ("1731330000.000200", ERROR_EMOJI) in h.adapter.added
+    assert len(h.tasks.requests) == 2  # the first question's two attempts; "and S3?" started no run
+    assert "and S3?" not in json.dumps(session_items(h.session_dir, SID))
+    assert sorted(h.outcomes()) == ["busy", "retried"]
+
+
+# ======================================================================
+# The retry sends a lighter history (replay: same input failed 29/30, text-only 3/30, no history 0/30)
+# ======================================================================
+
+def test_text_only_history_keeps_questions_and_answers_drops_earlier_tool_items():
+    reasoning = {"type": "reasoning", "id": "r1", "summary": []}
+    sys_item = {"role": "system", "content": "rules"}
+    items = [sys_item, user("q0"), reasoning, call("c0"), output("c0"), bot("a0"),
+             user("q1"), call("c1"), output("c1"), bot(""), bot("a1"),
+             user("q2"), call("c2"), output("c2")]  # q2 is the question being answered: kept whole
+    got = sg.text_only_history(items)
+    assert got == [sys_item, user("q0"), bot("a0"), user("q1"), bot("a1"), user("q2"), call("c2"), output("c2")]
+
+
+def test_text_only_history_leaves_odd_input_alone():
+    for bad in (None, "x", [], [bot("a"), call("c")]):
+        assert sg.text_only_history(bad) is bad
+
+
+def test_current_turn_only_keeps_system_items_and_this_question():
+    sys_item = {"role": "system", "content": "rules"}
+    items = [sys_item] + conversation(3) + [user("q3"), call("c3"), output("c3")]
+    assert sg.current_turn_only(items) == [sys_item, user("q3"), call("c3"), output("c3")]
+    assert sg.current_turn_only(None) is None
+
+
+@pytest.mark.parametrize("mode,expect_turns", [("full", 3), ("text", 3), ("none", 1)])
+def test_history_cap_filter_applies_the_attempt_mode(restore_pico, mode, expect_turns):
+    from pico.models.base import LLMBaseModel
+
+    sg.install_history_cap(3)
+    cfg = LLMBaseModel._build_run_config(object(), session=FakeSession("gateway_ch--D1"))
+
+    async def run():
+        token = sg._HISTORY_MODE.set(mode)
+        try:
+            data = _call_data(conversation(6))
+            return await cfg.call_model_input_filter(data)
+        finally:
+            sg._HISTORY_MODE.reset(token)
+
+    got = asyncio.run(run()).input
+    assert sg.count_user_turns(got) == expect_turns
+    has_old_calls = any(i.get("type") == "function_call" and i["call_id"] != "c5" for i in got)
+    assert has_old_calls is (mode == "full")
+    assert sg.history_turns_sent("gateway_ch--D1") == expect_turns
+
+
+def _call_data(items):
+    from agents.run import CallModelData, ModelInputData
+
+    return CallModelData(model_data=ModelInputData(input=list(items), instructions="sys"), agent=None, context=None)
+
+
+def test_retries_escalate_text_only_then_question_only(tmp_path):
+    h = Harness(tmp_path, "empty", "empty", "answer")
+    h.send(inbound())
+    assert h.tasks.modes == ["full", "text", "none"]
+    assert h.adapter.texts() == ["Here is your answer"]
+    assert h.outcomes() == ["retried"] and h.logs[0][1]["attempts"] == 3
+    mid = "1731330000.000100"
+    assert h.adapter.added == [(mid, PROCESSING_EMOJI), (mid, DONE_EMOJI)]  # reactions stay on the person's message
+
+
+def test_second_attempt_answers_with_text_only_history(tmp_path):
+    h = Harness(tmp_path, "empty", "answer")
+    h.send(inbound())
+    assert h.tasks.modes == ["full", "text"] and h.logs[0][1]["attempts"] == 2
+
+
+def test_first_attempt_answer_uses_the_full_history(tmp_path):
+    h = Harness(tmp_path, "answer")
+    h.send(inbound())
+    assert h.tasks.modes == ["full"] and h.logs[0][1]["attempts"] == 1
+
+
+def test_retry_ids_are_distinct_and_ctx_safe():
+    first = "1731330000.000100"
+    second = sg.retry_message_id(first)
+    third = sg.retry_message_id(second)
+    assert len({first, second, third}) == 3
+    assert all(x.replace(".", "").isdigit() for x in (second, third))
+
+
+# ======================================================================
+# A tool's one-line summary never stands in for a Slack answer ("2×2 rows")
+# ======================================================================
+
+def _node(session_id):
+    from pico.agent.node.chat_agentic_node import ChatAgenticNode
+
+    node = ChatAgenticNode.__new__(ChatAgenticNode)  # only what _build_success_result reads
+    node.session_id = session_id
+    return node
+
+
+def _ctx(response="", summary="2×2 rows"):
+    from pico.schemas.action_history import ActionHistoryManager
+
+    return SimpleNamespace(response_content=response, last_successful_output=None, last_tool_summary=summary,
+                           action_history_manager=ActionHistoryManager())
+
+
+@pytest.fixture
+def no_summary(monkeypatch):
+    from pico.agent.node.chat_agentic_node import ChatAgenticNode
+
+    monkeypatch.setattr(ChatAgenticNode, "_build_success_result", ChatAgenticNode._build_success_result)
+    sg.install_no_tool_summary_answer()
+    return ChatAgenticNode
+
+
+def test_tool_summary_is_not_a_slack_answer(no_summary):
+    ctx = _ctx()
+    result = no_summary._build_success_result(_node("gateway_slack--D0AAA00001"), ctx)
+    assert result.response == ""  # nothing to post: the bridge says "(No response generated)" and the guard retries
+    assert ctx.last_tool_summary == "2×2 rows"  # the context is left as it was
+
+
+def test_a_real_answer_is_untouched(no_summary):
+    result = no_summary._build_success_result(_node("gateway_slack--D0AAA00001"), _ctx(response="Bucket X, 1.59 GB"))
+    assert result.response == "Bucket X, 1.59 GB"
+
+
+def test_other_sessions_keep_picos_fallback(no_summary):
+    result = no_summary._build_success_result(_node("chat_session_1234"), _ctx())
+    assert result.response == "2×2 rows"  # the CLI/web keep Pico's behaviour
+
+
+def test_no_tool_summary_install_is_idempotent(no_summary):
+    first = no_summary._build_success_result
+    sg.install_no_tool_summary_answer()
+    assert no_summary._build_success_result is first
+
+
+
+# ---------- review 2026-11-13: an attempt that ran a tool is never undone ----------
+
+def test_an_attempt_that_ran_a_tool_is_kept_and_retried_with_the_full_history(tmp_path):
+    """Rolling it back would hide that the tool ran (a task saved): the next attempt could save it again."""
+    h = seeded(tmp_path, "tool_then_empty", "answer")
+    h.send(inbound())
+    items = session_items(h.session_dir, SID)
+    assert call("c7") in items and output("c7") in items  # what the tool did stays visible
+    assert h.tasks.modes == ["full", "full"]
+    assert h.logs[0][1].get("rolled_back", 0) == 0 and h.outcomes() == ["retried"]
+
+
+def test_after_a_tool_ran_every_later_attempt_keeps_the_full_history(tmp_path):
+    h = seeded(tmp_path, "empty", "tool_then_empty", "answer")
+    h.send(inbound())
+    assert h.tasks.modes == ["full", "text", "full"]
+    assert h.logs[0][1]["rolled_back"] == 1
+
+
+def test_a_refused_tool_call_is_still_rolled_back(tmp_path):
+    """bash refused (sch_ask_not_met): no tool result, nothing ran, so the question goes."""
+    h = seeded(tmp_path, "error")
+    h.send(inbound())
+    assert session_items(h.session_dir, SID) == EARLIER
+
+
+def test_skipped_rollback_is_counted_and_logged(tmp_path, monkeypatch, caplog):
+    async def never(bridge, session_id, timeout):
+        return False
+
+    monkeypatch.setattr(sg, "_run_finished", never)
+    h = seeded(tmp_path, "empty", "answer")
+    with caplog.at_level("WARNING", logger="pico_finops_agent.slack_guard"):
+        h.send(inbound())
+    assert h.logs[0][1]["rollback_skipped"] == 1
+    assert any("rollback skipped" in r.getMessage() for r in caplog.records)
+
+
+def test_busy_reply_does_not_use_the_hourly_limit(tmp_path):
+    h = seeded(tmp_path, "empty_wait", "answer",
+               settings=sg.Settings(history_turns=8, deadline_s=5, questions_per_hour=1))
+
+    async def both():
+        first = asyncio.ensure_future(h.handle(h.bridge, inbound(), h.adapter, h.channel_config))
+        await asyncio.sleep(0.05)
+        await h.handle(h.bridge, inbound(text="and S3?", message_id="1731330000.000200"), h.adapter,
+                       h.channel_config)
+        await first
+
+    asyncio.run(both())
+    assert sg.SLOW_DOWN not in h.adapter.texts() and sg.BUSY_TEXT in h.adapter.texts()
+
+
+def test_reset_while_in_flight_is_refused(tmp_path):
+    h = seeded(tmp_path, "empty_wait", "answer")
+
+    async def both():
+        first = asyncio.ensure_future(h.handle(h.bridge, inbound(), h.adapter, h.channel_config))
+        await asyncio.sleep(0.05)
+        await h.handle(h.bridge, inbound(text="reset", message_id="1731330000.000300"), h.adapter, h.channel_config)
+        await first
+
+    asyncio.run(both())
+    assert sg.RESET_WHILE_BUSY in h.adapter.texts() and h.cleared == []
+
+
+def test_in_flight_is_cleared_when_the_bridge_raises(tmp_path):
+    h = seeded(tmp_path, "raise", "answer")
+    with pytest.raises(RuntimeError):
+        h.send(inbound())
+    h.send(inbound(message_id="1731330000.000400"))  # not refused as busy
+    assert h.adapter.texts()[-1] == "Here is your answer"
+
+
+def test_third_empty_attempt_ends_with_sorry_and_the_error_reaction(tmp_path):
+    h = Harness(tmp_path, "empty", "empty", "empty")
+    h.send(inbound())
+    mid = "1731330000.000100"
+    assert h.adapter.texts() == [sg.SORRY]
+    assert h.adapter.added == [(mid, PROCESSING_EMOJI), (mid, ERROR_EMOJI)]  # on the person's message
+    assert h.adapter.removed == [(mid, PROCESSING_EMOJI)]
+
+
+
+# ---------- PR #24 review follow-ups ----------
+
+def test_unreadable_attempt_stats_never_roll_back(tmp_path, monkeypatch, caplog):
+    """Unknown means a tool may have run: keep the attempt (and its full history) rather than risk repeating it."""
+    monkeypatch.setattr(sg, "_task_stats", lambda bridge, session_id: None)
+    h = seeded(tmp_path, "empty", "answer")
+    with caplog.at_level("WARNING", logger="pico_finops_agent.slack_guard"):
+        h.send(inbound())
+    assert h.logs[0][1].get("rolled_back", 0) == 0 and h.logs[0][1]["stats_unreadable"] == 2
+    assert h.tasks.modes == ["full", "full"]
+    assert any("stats unreadable" in r.getMessage() for r in caplog.records)
+
+
+def test_a_deadline_stop_mid_tool_call_is_not_rolled_back(tmp_path):
+    """A call with no result yet may have done its work (the deadline cut it off): keep it."""
+    SCRIPTS["slow_tool"] = lambda: [tool_event("c8")]
+    TURN_ITEMS["slow_tool"] = lambda q: [user(q), call("c8")]
+    try:
+        h = seeded(tmp_path, "slow_tool", settings=sg.Settings(history_turns=8, deadline_s=0.2, questions_per_hour=30))
+        h.tasks.slow_kinds = {"slow_tool"}
+        h.send(inbound())
+    finally:
+        SCRIPTS.pop("slow_tool")
+        TURN_ITEMS.pop("slow_tool")
+    assert h.adapter.texts() == [sg.TOO_LONG]
+    assert call("c8") in session_items(h.session_dir, SID)
+
+
+def test_run_finished_error_is_logged(caplog):
+    def boom(session_id, user_id=None):
+        raise RuntimeError("task table gone")
+
+    bridge = SimpleNamespace(_task_manager=SimpleNamespace(get_task=boom))
+    with caplog.at_level("WARNING", logger="pico_finops_agent.slack_guard"):
+        assert asyncio.run(sg._run_finished(bridge, SID, 0.1)) is False  # so no rollback: it stays visible
+    assert any("run state unreadable" in r.getMessage() for r in caplog.records)
+
+
+def test_checkpoint_failure_is_in_the_question_line(tmp_path, monkeypatch):
+    from pico.models.session_manager import SessionManager
+
+    monkeypatch.setattr(SessionManager, "checkpoint_turn", lambda self, sid: 1 / 0)
+    h = seeded(tmp_path, "empty", "answer")
+    h.send(inbound())
+    assert h.logs[0][1]["checkpoint_failed"] == 2 and h.outcomes() == ["retried"]
+
+
+def test_history_modes_and_their_filters_are_one_table():
+    assert set(sg._LIGHTER) == set(sg.HISTORY_MODES)
+    assert sg._LIGHTER["full"](conversation(3)) == conversation(3)
+
+
+def test_third_attempt_keeps_the_thread_and_the_session(tmp_path):
+    h = Harness(tmp_path, "empty", "empty", "answer")
+    h.send(inbound(chat_type="group", mentions_bot=True))
+    sid = "gateway_slack--D0AAA00001--1731330000.000100"
+    assert [r.session_id for r in h.tasks.requests] == [sid, sid, sid]
+    assert all(m.thread_id == "1731330000.000100" for m in h.adapter.sent)  # the answer lands in the thread
+    seen = [k for k in h.bridge._seen_message_ids]
+    assert len(seen) == 3 and len(set(seen)) == 3  # three ids the bridge didn't drop as duplicates
+
+
+def test_the_history_mode_reaches_a_task_the_chat_manager_creates(restore_pico):
+    """Pico's ChatTaskManager starts each run with asyncio.create_task (pinned); the mode set by the guard must
+    reach the history filter inside that task, as it does for _attempt's own task."""
+    from pico.models.base import LLMBaseModel
+
+    sg.install_history_cap(8)
+    cfg = LLMBaseModel._build_run_config(object(), session=FakeSession("gateway_ch--D1"))
+    seen = {}
+
+    async def chat_run():  # what the chat task does: the model call's input filter
+        got = await cfg.call_model_input_filter(_call_data(conversation(4)))
+        seen["has_old_calls"] = any(i.get("type") == "function_call" and i["call_id"] != "c3" for i in got.input)
+
+    async def guard():
+        token = sg._HISTORY_MODE.set("text")
+        try:
+            await asyncio.ensure_future(_bridge_like())
+        finally:
+            sg._HISTORY_MODE.reset(token)
+
+    async def _bridge_like():
+        await asyncio.create_task(chat_run())  # ChatTaskManager.start_chat
+
+    asyncio.run(guard())
+    assert seen["has_old_calls"] is False

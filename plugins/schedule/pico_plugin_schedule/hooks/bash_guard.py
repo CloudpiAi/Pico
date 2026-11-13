@@ -7,6 +7,15 @@ restricts the tool (not Pico's ["*"] agent nodes), a `$` or a backtick outside s
 leaves them alone - refuses the command. `'over $200'` still works; the skills ask for single-quoted values.
 A runtime wrapper: no change under pico/.
 
+install() also makes Pico's metacharacter check (`; & < > |`, newline) quote-aware for `pico schedule` only: Pico
+refuses them even inside quotes, so `--question 'If it was, report it; if not, stay quiet'` or `--sql '... >= ...'`
+stopped the Slack answer (live 2026-11-13). Inside single quotes bash takes every character literally, so for a
+`pico schedule` command the check runs on the text with each single-quoted span replaced by ''. Pico's strict check
+stays for anything that isn't plain quoting: a backslash anywhere, `$'...'`, an unbalanced quote, a newline or
+carriage return, a `#` outside single quotes, or a `$`/backtick that bash would expand outside single quotes;
+double-quoted text is still checked; every other command is untouched. Patched where both of Pico's layers look the function up:
+pico.tools.permission.bash_rules (the permission ceiling) and pico.tools.func_tool.bash_tool (the allow-list).
+
 install() also logs every command Pico's permission check refuses (log_denials): such a refusal stops the whole
 answer ("Sorry, I couldn't answer that just now" in Slack) and Pico doesn't name the command (live 2026-11-12). One JSON
 line `{"event": "bash_denied", "command": ..., "reason": ...}`, with the signed --ctx value replaced by <ctx>.
@@ -15,6 +24,8 @@ import json
 import re
 
 _MARK = "pico_finops_agent_bash_guard"
+_QUOTE_MARK = "pico_schedule_quote_aware_metachars"
+_SCHEDULE = re.compile(r"\s*pico\s+schedule(?:\s|$)")
 _DENIAL_MARK = "pico_finops_agent_bash_denial_log"
 _CTX = re.compile(r"(--ctx)(?:=|\s+)('[^']*'|\"[^\"]*\"|\S+)")
 _REASON = re.compile(r"\(([^()]*)\)")
@@ -73,11 +84,66 @@ def expands_outside_single_quotes(command):
     return False
 
 
+def single_quoted_removed(command):
+    """`command` with each single-quoted span replaced by '' (bash takes its content literally), or None when the
+    quoting is anything but plain: a backslash anywhere, ANSI-C `$'...'`, an unbalanced quote, any newline or
+    carriage return, or a `#` outside single quotes. Bash ignores quotes inside a `#` comment, so `#'` opens no
+    quote there and the next line runs (security review 2026-11-13: `pico schedule add x #'<newline>rm -rf /
+    <newline>#'` looked like one quoted argument); one line and no `#` keeps every quote where bash sees it."""
+    if "\\" in command or "\n" in command or "\r" in command:
+        return None
+    out = []
+    in_single = in_double = False
+    for i, c in enumerate(command):
+        if in_single:
+            if c == "'":
+                in_single = False
+                out.append("''")
+            continue
+        if c == "'" and not in_double:  # inside double quotes a ' is an ordinary character
+            if i and command[i - 1] == "$":
+                return None
+            in_single = True
+            continue
+        if c == '"':
+            in_double = not in_double
+        out.append(c)
+    if in_single or in_double:
+        return None
+    outside = "".join(out)
+    if "#" in outside:
+        return None
+    return outside
+
+
+def quote_aware(strict):
+    """Pico's contains_shell_metachars, judged outside single quotes for `pico schedule` commands."""
+    if getattr(strict, _QUOTE_MARK, False):
+        return strict
+
+    def contains_shell_metachars(text):
+        # No relaxation when bash would expand anything outside single quotes: inside $[ ], $(( )) or ${ } a single
+        # quote doesn't quote, so `$[ '$(id)' ]` would run id (security review 2026-11-13, second finding).
+        if isinstance(text, str) and _SCHEDULE.match(text) and not expands_outside_single_quotes(text):
+            outside = single_quoted_removed(text)
+            if outside is not None:
+                return strict(outside)
+        return strict(text)
+
+    setattr(contains_shell_metachars, _QUOTE_MARK, True)
+    contains_shell_metachars.__wrapped__ = strict
+    return contains_shell_metachars
+
+
 def install():
+    from pico.tools.func_tool import bash_tool
     from pico.tools.func_tool.bash_tool import BashTool
+    from pico.tools.permission import bash_rules
     from pico.tools.permission.permission_hooks import PermissionHooks
 
     log_denials(PermissionHooks)
+    for module in (bash_rules, bash_tool):  # each looks the function up in its own module globals
+        module.contains_shell_metachars = quote_aware(module.contains_shell_metachars)
     original = BashTool._is_command_allowed
     if getattr(original, _MARK, False):
         return

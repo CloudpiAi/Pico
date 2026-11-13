@@ -65,6 +65,20 @@ def test_session_manager_api():
     assert "session_dir" in inspect.signature(SessionManager.__init__).parameters
 
 
+def test_unanswered_turn_rollback_api():
+    """The guard takes an unanswered attempt back out with Pico's own turn checkpoint (the CLI's mechanism)."""
+    from pico.models.session_manager import SessionManager, SessionTurnCheckpoint
+
+    assert list(inspect.signature(SessionManager.checkpoint_turn).parameters) == ["self", "session_id"]
+    assert list(inspect.signature(SessionManager.rollback_turn).parameters) == ["self", "session_id", "checkpoint"]
+    assert not inspect.iscoroutinefunction(SessionManager.rollback_turn)  # run with asyncio.to_thread
+    src = inspect.getsource(SessionManager.rollback_turn)
+    # both sides of a turn go (pop_item would leave message_structure behind), and a None checkpoint is a no-op
+    assert "DELETE FROM message_structure" in src and "DELETE FROM agent_messages" in src
+    assert "if checkpoint is None:" in src
+    assert {f.name for f in dataclasses.fields(SessionTurnCheckpoint)} >= {"max_message_id", "max_sequence_number"}
+
+
 def test_inbound_message_fields_and_emojis():
     from pico.gateway import models
 
@@ -187,3 +201,42 @@ def test_ctx_line_accepts_the_retry_message_id():
     retry = slack_guard.retry_message_id("1731330000.123456")
     tag = slack_ctx.make_tag(key, "D0AAA00001", "U0AAA00001", "", retry)
     assert slack_ctx.verify(key, tag[len("[slack ctx="):-1]).msg == retry
+
+
+def test_tool_summary_fallback_seam():
+    """install_no_tool_summary_answer blanks ctx.last_tool_summary around Pico's own result builder."""
+    from pico.agent.node.chat_agentic_node import ChatAgenticNode
+
+    fn = ChatAgenticNode._build_success_result
+    fn = getattr(fn, "__wrapped__", fn)
+    assert list(inspect.signature(fn).parameters) == ["self", "ctx"]
+    src = inspect.getsource(fn)
+    assert "if not response_content and ctx.last_tool_summary:" in src
+    assert "response_content = ctx.last_tool_summary" in src
+    from pico.agent.node.stream_run_context import StreamRunContext
+
+    assert "last_tool_summary" in {f.name for f in dataclasses.fields(StreamRunContext)}
+
+
+
+def test_chat_run_inherits_the_guards_context():
+    """The history mode and the llm_log record are contextvars: Pico must start the run as a task in the caller's
+    context (asyncio.create_task copies it), not on another thread or loop."""
+    from pico.api.services.chat_task_manager import ChatTaskManager
+
+    src = inspect.getsource(ChatTaskManager.start_chat)
+    assert "asyncio.create_task(" in src
+    assert "run_in_executor" not in src and "contextvars.Context(" not in src and "new_event_loop" not in src
+
+
+def test_ctx_line_accepts_every_retry_id():
+    from pico_plugin_schedule import slack_ctx
+
+    from pico_finops_agent import slack_guard
+
+    key = "k" * 64
+    second = slack_guard.retry_message_id("1731330000.123456")
+    third = slack_guard.retry_message_id(second)  # attempt 3 since the retries escalate
+    for retry in (second, third):
+        tag = slack_ctx.make_tag(key, "D0AAA00001", "U0AAA00001", "", retry)
+        assert slack_ctx.verify(key, tag[len("[slack ctx="):-1]).msg == retry
