@@ -912,6 +912,8 @@ def test_a_second_message_while_one_is_in_flight_gets_busy_and_is_never_rolled_b
 
     asyncio.run(both())
     assert sg.BUSY_TEXT in h.adapter.texts()  # what Pico itself says while a run is going
+    # and, as Pico's own busy path does, the second message gets the error mark: it is finished, not pending
+    assert ("1731330000.000200", ERROR_EMOJI) in h.adapter.added
     assert len(h.tasks.requests) == 2  # the first question's two attempts; "and S3?" started no run
     assert "and S3?" not in json.dumps(session_items(h.session_dir, SID))
     assert sorted(h.outcomes()) == ["busy", "retried"]

@@ -502,6 +502,15 @@ async def _reply(adapter, conv, text):
         logger.warning("Slack reply failed", exc_info=True)
 
 
+async def _mark_error(adapter, msg):
+    from pico.gateway.models import ERROR_EMOJI
+
+    try:
+        await adapter.add_reaction(msg.conversation_id, msg.message_id, ERROR_EMOJI, msg.thread_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Slack reaction failed", exc_info=True)
+
+
 async def _attempt(original, bridge, msg, proxy, channel_config, timeout):
     """Run the wrapped bridge; True when the deadline stopped it."""
     task = asyncio.ensure_future(original(bridge, msg, proxy, channel_config))
@@ -731,6 +740,7 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             return None
         if session_id in in_flight:  # the same reply Pico gives while a run is going; nothing starts, nothing counted
             await _reply(adapter, conv, BUSY_TEXT)
+            await _mark_error(adapter, msg)  # as Pico's busy path does: this message is finished, not pending
             emit("busy", start)
             return None
         if msg.sender_id and not limiter.allow(msg.sender_id):  # no sender id: no shared bucket for all of them
