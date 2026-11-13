@@ -27,8 +27,8 @@ TIMEOUT_S = 900
 EPHEMERAL_MB = 2048
 DESCRIPTION = "Pico FinOps Agent: loads the AWS FOCUS export into the S3 Table"
 ROLE_RETRIES = 6
-NO_CREDENTIALS_MSG = ("no AWS credentials: attach the EC2 instance role (IMDSv2 hop limit 2 for Docker), "
-                      "or set the AWS_* settings in .env")
+NO_CREDENTIALS_MSG = ("no AWS credentials: attach the EC2 instance role (IMDSv2 hop limit 1 with host "
+                      "networking), or set the AWS_* settings in .env")
 # botocore Credentials.method -> where the credentials come from (for the problem text, problems.credentials)
 _SOURCE_OF_METHOD = {
     "env": "env", "explicit": "env",
