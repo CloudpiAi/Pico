@@ -42,14 +42,18 @@ RUN uv sync --frozen --no-dev --extra pico-finops-agent $SKIP_PACKAGES \
  && rm -rf ./plugins/focus/build ./plugins/schedule/build /tmp/pins.json
 # Trim the third-party packages before they are precompiled below (so no .pyc is made for what is removed). Only
 # /app reaches the runtime stage, so removing here is enough to keep the bytes out of the image:
-#   - their test suites (pandas/tests alone is ~30-40 MB), never anything of Pico's own (/app/pico, /app/plugins)
+#   - their test suites (tests/, test/, _tests/, conftest.py, SQLAlchemy's testing/suite; pandas/tests alone is
+#     ~30-40 MB), never anything of Pico's own (/app/pico, /app/plugins). Kept: pandas/_testing (pandas imports it)
+#     and modules that only have a test-like name (numpy/testing, sqlalchemy/testing, aiohttp/test_utils.py)
 #   - type stubs (*.pyi), Cython headers (*.pxd) and pyarrow's C++ headers: only a compiler or a type checker reads them
 #   - debug symbols in native libraries (strip --strip-unneeded); a file strip cannot handle is left as it is
 # binutils (strip) is installed in this stage only; the runtime stage never gets it.
 RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/* \
  && SP=$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])') \
  && du -sm "$SP" \
- && find "$SP" -mindepth 2 -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + \
+ && find "$SP" -mindepth 2 -type d \( -name tests -o -name test -o -name _tests \) -prune -exec rm -rf {} + \
+ && find "$SP" -type f -name conftest.py -delete \
+ && rm -rf "$SP/sqlalchemy/testing/suite" \
  && find "$SP" -type f \( -name '*.pyi' -o -name '*.pxd' \) -delete \
  && rm -rf "$SP/pyarrow/include" \
  && { find "$SP" -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
