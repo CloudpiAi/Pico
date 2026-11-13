@@ -54,7 +54,10 @@ RUN uv sync --frozen --no-dev --extra pico-finops-agent $SKIP_PACKAGES \
 #     and modules that only have a test-like name (numpy/testing, sqlalchemy/testing, aiohttp/test_utils.py)
 #   - litellm's proxy admin web UI (static files, ~18 MB): Pico calls litellm as a library, never runs its proxy
 #   - type stubs (*.pyi), Cython headers (*.pxd) and pyarrow's C++ headers: only a compiler or a type checker reads them
-#   - debug symbols in native libraries (strip --strip-unneeded); a file strip cannot handle is left as it is
+#   - debug symbols in native libraries (strip --strip-unneeded); a file strip cannot handle is left as it is.
+#     Never the libraries auditwheel vendored into <package>.libs/: patchelf has already rewritten them, and strip
+#     breaks some (numpy 2.5's OpenBLAS: "ELF load command address/offset not page-aligned"). The import line
+#     after it fails the build if a stripped library no longer loads.
 # binutils (strip) is installed in this stage only; the runtime stage never gets it.
 RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/* \
  && SP=$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])') \
@@ -65,8 +68,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm 
  && rm -rf "$SP/litellm/proxy/_experimental/out" \
  && find "$SP" -type f \( -name '*.pyi' -o -name '*.pxd' \) -delete \
  && rm -rf "$SP/pyarrow/include" \
- && { find "$SP" -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
- && du -sm "$SP"
+ && { find "$SP" -type f -name '*.so*' -not -path '*.libs/*' -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
+ && du -sm "$SP" \
+ && /app/.venv/bin/python -c "import numpy, pandas, pyarrow, pyarrow.parquet, duckdb, lancedb, onnxruntime, fastembed, \
+      tantivy, tokenizers, PIL.Image, lxml.etree, cryptography.hazmat.bindings._rust, pydantic_core, sqlalchemy, \
+      tiktoken, aiohttp, botocore, litellm; print('native libraries load after strip')"
 # Precompile everything: the container's disk is read-only, so Python can't write a .pyc cache at run time and every
 # `pico` command (each Slack task, each scheduled question) would recompile ~3,200 files (~5 s). Hash-checked .pyc stay
 # valid however the copy below sets file times. Pico's own code must compile, so a syntax error there fails the
