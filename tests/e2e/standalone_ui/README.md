@@ -19,7 +19,7 @@ Nothing is mocked: real Slack, the real agent, the real model, real data.
 | # | What | How to check |
 |---|---|---|
 | 1 | **The agent is running and connected to Slack** (the container, e.g. `pico-finops-agent`) | `docker ps` shows it `healthy`; the bot answers "hi" in its DM |
-| 2 | **Python 3.12 + this repo's venv + Playwright + Chromium** on the machine that runs the test (the one with the agent container, so the data copy works) | see "First-time setup" below |
+| 2 | **Python 3.13 + this repo's venv + Playwright + Chromium** on the machine that runs the test (the one with the agent container, so the data copy works) | see "First-time setup" below |
 | 3 | **A saved Slack sign-in session** (`E2E_STATE_FILE`) | made once with the login script, see below |
 | 4 | **The settings file** (`.env`) | copy `.env.example`, fill in (section 2) |
 | 5 | **Slack channels** (optional, for the channel cases) | a test channel with you **and the bot** in it (`/invite @<bot name>`); a channel the bot is **not** in |
