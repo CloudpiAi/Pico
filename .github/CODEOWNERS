@@ -1,0 +1,15 @@
+# Code owners are asked to review pull requests that touch these paths.
+# TODO (admin): create the @CloudpiAi/pico-maintainers team with write access; until it exists GitHub ignores this file.
+# See MAINTAINERS.md and GOVERNANCE.md.
+
+*                       @CloudpiAi/pico-maintainers
+
+# Security-sensitive: permissions customers apply in their AWS account, the image, and CI/release.
+/policies/              @CloudpiAi/pico-maintainers
+/pico_finops_agent/iam/ @CloudpiAi/pico-maintainers
+/Dockerfile             @CloudpiAi/pico-maintainers
+/docker-compose*.yml    @CloudpiAi/pico-maintainers
+/.github/               @CloudpiAi/pico-maintainers
+/SECURITY.md            @CloudpiAi/pico-maintainers
+/LICENSE                @CloudpiAi/pico-maintainers
+/NOTICE                 @CloudpiAi/pico-maintainers

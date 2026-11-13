@@ -1,0 +1,116 @@
+name: Pico / CI
+
+# Runs on every pull request and every push to main. "Lint" and "Tests" are the checks the main branch ruleset
+# should require (see docs/maintainers/REPO-SETTINGS.md). No path filter: a required check that is skipped stays
+# pending and blocks the merge.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# Runs on pull requests from forks too: read-only token, no secrets.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+  UV_PYTHON: "3.12"
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      # Keep the version the same as the dev group in pyproject.toml.
+      - name: Ruff
+        run: uvx ruff@0.15.6 check --output-format=github .
+
+      - name: IAM policies are valid JSON
+        run: |
+          for f in policies/aws/*.json pico_finops_agent/iam/*.json; do
+            python3 -m json.tool "$f" >/dev/null || { echo "::error file=$f::not valid JSON"; exit 1; }
+          done
+
+      # The agent reads pico_finops_agent/iam/ (its failure alerts quote it) and the guide tells customers to apply
+      # policies/aws/: the two copies must stay the same.
+      - name: IAM policy copies match
+        run: |
+          for f in pico_finops_agent/iam/*.json; do
+            cmp "$f" "policies/aws/$(basename "$f")" \
+              || { echo "::error file=$f::differs from policies/aws/$(basename "$f"); change both copies"; exit 1; }
+          done
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      # The same packages as the image (Dockerfile): the locked dependencies, the agent extra and the two plugins.
+      - name: Install
+        run: |
+          uv sync --dev --extra pico-finops-agent
+          uv pip install --no-deps ./plugins/focus ./plugins/schedule
+
+      # tests/fork is the agent's suite. The browser end-to-end tests skip themselves without Playwright, and the
+      # markers that need a real LLM or Slack are excluded.
+      - name: Run the tests
+        run: >-
+          uv run --no-sync pytest tests/fork
+          -m "not nightly and not product_e2e and not provider_health and not quarantine"
+          -p no:cacheprovider -q --timeout=300
+          --cov --cov-report=term --cov-report=xml
+
+      - name: Store the coverage report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 14
+          if-no-files-found: ignore
+
+  security:
+    name: Security scan (dependencies and agent code)
+    # Not a required check yet: it reports, it doesn't block a merge. Make it required once the first run is clean.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Known vulnerabilities in the locked dependencies (pip-audit)
+        run: |
+          uv export --no-hashes --no-emit-project --extra pico-finops-agent --format requirements-txt > requirements-audit.txt
+          uvx pip-audit==2.10.1 --disable-pip --no-deps -r requirements-audit.txt
+
+      - name: Bandit (agent, plugins and loader; medium and high severity)
+        if: always()
+        run: uvx bandit[toml]==1.8.6 -r pico_finops_agent plugins loader --severity-level medium --confidence-level medium -q
