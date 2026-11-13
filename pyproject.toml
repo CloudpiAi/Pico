@@ -1,7 +1,7 @@
 # Project basic information configuration, required.
 [project]
 name = "pico-agent"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pico FinOps Agent: answers AWS cost questions in Slack from your own FOCUS billing export (fork of Datus-agent 0.4.1)"
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
