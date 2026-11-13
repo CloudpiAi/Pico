@@ -7,6 +7,7 @@ Tick each item when it's done. Do the **Before launch** ones before Pico is anno
 ## Before launch
 
 - [ ] **Make the image public.** The README and the setup guide tell customers to `docker compose pull` it without logging in.
+  First an org owner allows public packages (Org settings → Member privileges → Package creation → Public), then a package admin sets
   Org → Packages → `pico-finops-agent` → Package settings → Change visibility → Public. Check from a logged-out machine:
   `docker pull ghcr.io/cloudpiai/pico-finops-agent:latest`
 - [ ] **Protect `main` with a ruleset.** Settings → Rules → Rulesets → New branch ruleset, target the default branch, no bypass list:
