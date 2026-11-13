@@ -24,14 +24,11 @@ WORKDIR /app
 RUN pip install --no-cache-dir uv==0.9.12
 COPY ./pyproject.toml ./uv.lock ./README.md ./LICENSE ./NOTICE ./
 # Packages in uv.lock the agent never imports, left out of the image:
-#   sympy + mpmath: required by onnxruntime, but only its optional tools (quantization, transformers) use them
-#   onnx: required by fastembed, which runs models with onnxruntime and does not import onnx
 #   grpcio + the OTLP gRPC exporter: pulled in by opentelemetry-exporter-otlp; Pico exports traces over OTLP/HTTP only
 #     (pico/observability/adapters/otlp.py)
-#   tree-sitter-<language> grammars: textual's optional code highlighting; the agent has no terminal UI, and textual
-#     falls back to plain text without them (tree-sitter itself stays)
-ARG SKIP_PACKAGES="--no-install-package sympy --no-install-package mpmath --no-install-package onnx \
- --no-install-package grpcio --no-install-package opentelemetry-exporter-otlp-proto-grpc \
+#   tree-sitter-<language> grammars: only textual's TextArea code editor uses them (TextArea(language=...) raises
+#     without one); Pico has no such editor (its TextAreas are prompt_toolkit's) and highlights code with rich/Pygments
+ARG SKIP_PACKAGES="--no-install-package grpcio --no-install-package opentelemetry-exporter-otlp-proto-grpc \
  --no-install-package tree-sitter-bash --no-install-package tree-sitter-css --no-install-package tree-sitter-go \
  --no-install-package tree-sitter-html --no-install-package tree-sitter-java --no-install-package tree-sitter-javascript \
  --no-install-package tree-sitter-json --no-install-package tree-sitter-markdown --no-install-package tree-sitter-python \
