@@ -259,7 +259,7 @@ def test_an_expired_profile_says_sign_in_again():
 
 def test_expired_instance_role_credentials_point_at_the_role():
     p = problems.from_exception(_ClientError("ExpiredTokenException"), source_of=lambda: "instance_role")
-    assert "instance role" in p["summary"] + p["action"] and "hop limit 2" in p["action"]
+    assert "instance role" in p["summary"] + p["action"] and "hop limit 1" in p["action"]
 
 
 def test_an_invalid_key_from_env_says_fix_the_key():

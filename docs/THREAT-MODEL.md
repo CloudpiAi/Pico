@@ -197,7 +197,6 @@ on what a query returns.
 | O8 | **Session history is not persisted, and not audited.** | Slack sessions live on tmpfs (`/home/pico/.pico/sessions`) and are lost on restart. The log keeps only metadata per question. That is good for privacy, but there is no record of what was asked. |
 | O9 | **Global LLM spend has no cap.** | The rate limit is per Slack user. Many users together, or many scheduled asks (up to `FOCUS_ASK_MAX_PER_DAY`), can still run up provider cost. Set a budget on the provider account. |
 | O10 | **Unrestricted outbound network.** | The container uses host networking and has no egress filter. The design needs only AWS, Slack and the LLM endpoint. Customers who want more can add an egress rule on the security group or a proxy. |
-| O11 | **Inconsistent hop-limit hint.** | `lambda_ops.py` `NO_CREDENTIALS_MSG` says "IMDSv2 hop limit 2 for Docker". The setup guide and `docker-compose.yml` say hop limit 1 with host networking. The message should be fixed so it doesn't steer customers to the weaker setting. |
 
 ### Not verified
 

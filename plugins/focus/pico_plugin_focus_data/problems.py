@@ -92,7 +92,7 @@ def config(detail):
 
 
 _RESTART = "then restart the agent"
-_ROLE_HINT = "attach the EC2 instance role (IMDSv2 hop limit 2 for Docker)"
+_ROLE_HINT = "attach the EC2 instance role (IMDSv2 hop limit 1 with host networking)"
 _ENV_KEYS = "AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN in .env"
 # (cause, source) -> (summary, action). Seen 2026-11-12: an expired .env session token on a non-EC2 host was reported
 # as "the EC2 has no working AWS credentials. Attach the instance role…", which sent the reader the wrong way.
@@ -103,7 +103,7 @@ _CREDENTIAL_TEXT = {
                              f"Sign in again for the AWS profile (for SSO: aws sso login), {_RESTART}."),
     ("expired", "instance_role"): ("the EC2 instance role's credentials have expired",
                                    "They normally renew by themselves: check the instance role is still attached "
-                                   "(IMDSv2 hop limit 2 for Docker)."),
+                                   "(IMDSv2 hop limit 1 with host networking)."),
     ("expired", None): ("the AWS credentials have expired",
                         f"Renew them (the AWS_* settings in .env or the AWS profile) or {_ROLE_HINT}, {_RESTART}."),
     ("invalid", "env"): ("the AWS access key isn't valid",
