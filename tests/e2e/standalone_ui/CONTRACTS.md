@@ -1,7 +1,7 @@
 # Contracts between the modules (read this first)
 
 Package: `tests/e2e/standalone_ui/`. Tests: `tests/fork/e2e_standalone_ui/` (no network, no real Slack; Playwright
-tests load local HTML with `page.set_content`). Python 3.12, `from playwright.sync_api import ...` (sync API only).
+tests load local HTML with `page.set_content`). Python 3.13, `from playwright.sync_api import ...` (sync API only).
 Imports are absolute: `from tests.e2e.standalone_ui.config import Config`.
 
 Facts from the real Slack web app (walk-through 2026-11-11; see the plan's "Real flow"):
