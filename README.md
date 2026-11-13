@@ -68,7 +68,7 @@ git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
 cd ~/pico-finops-agent
 git checkout v0.3.0                # the latest release (see Releases)
 cp .env.example .env && nano .env  # fill in your worksheet values
-docker compose pull                # the released image, ghcr.io/cloudpiai/pico-finops-agent
+docker compose pull                # the released image, ghcr.io/cloudpiai/pico
 docker compose run --rm agent check    # checks your settings and permissions; posts nothing
 docker compose up -d
 ```
@@ -124,7 +124,7 @@ Rather build the image yourself? Use `docker compose -f docker-compose.yml -f do
 - **No inbound ports.** The server only makes outgoing HTTPS connections to AWS, Slack and your language model.
 - **Hardened container.** It runs as a non-root user on a read-only file system with all Linux capabilities dropped.
 - **Your keys stay on your server.** The Slack tokens and the model API key live in the `.env` file on your EC2 server — keep it readable only by you — never in the code or the image.
-- **Verifiable images.** Release images are built only by this repository's GitHub Actions. From 0.3.0 on, each one has a signed build-provenance attestation and an SBOM: `gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico`
+- **Verifiable images.** Release images are built only by this repository's GitHub Actions. From 0.3.0 on, each one has a signed build-provenance attestation and an SBOM: `gh attestation verify oci://ghcr.io/cloudpiai/pico:<version> -R CloudpiAi/Pico`
 
 More detail: the guide's [security summary](docs/CUSTOMER-SETUP-GUIDE.md#8-security-summary) and the [threat model](docs/THREAT-MODEL.md). **Found a security problem?** Report it privately — see [SECURITY.md](SECURITY.md), not a public issue.
 

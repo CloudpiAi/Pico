@@ -2,8 +2,9 @@ name: Pico / Build Docker Image
 
 # Builds the image exactly as a customer does (`docker compose build` uses the same Dockerfile) and checks it.
 # On a release tag vX.Y.Z (on main), the checked image is published to the GitHub Container Registry:
-#   ghcr.io/cloudpiai/pico-finops-agent:X.Y.Z, :pico_vX.Y.Z and :latest   (no secret: the built-in GITHUB_TOKEN)
-# X.Y.Z and pico_vX.Y.Z are two names for the same image (same digest).
+#   ghcr.io/cloudpiai/pico:X.Y.Z, :vX.Y.Z and :latest   (no secret: the built-in GITHUB_TOKEN)
+# X.Y.Z and vX.Y.Z are two names for the same image (same digest). For the move to the new name, the same image is
+# also pushed to the old name ghcr.io/cloudpiai/pico-finops-agent (:X.Y.Z and :latest) until that name is retired.
 # Pull requests and main only build and check; they never publish.
 on:
   push:
@@ -45,7 +46,10 @@ concurrency:
 
 env:
   IMAGE: "pico-finops-agent:ci"
-  REGISTRY_IMAGE: "ghcr.io/cloudpiai/pico-finops-agent"
+  REGISTRY_IMAGE: "ghcr.io/cloudpiai/pico"
+  # The image's name up to 0.3.0. Still published (same image) so servers pinned to it keep updating; remove this
+  # and its push below once they have moved to ghcr.io/cloudpiai/pico.
+  LEGACY_REGISTRY_IMAGE: "ghcr.io/cloudpiai/pico-finops-agent"
 
 jobs:
   build:
@@ -131,7 +135,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push vX.Y.Z (and latest, when it is the newest release)
+      - name: Push X.Y.Z and vX.Y.Z (and latest, when it is the newest release)
         id: push
         env:
           VERSION: ${{ github.ref_name }}
@@ -139,6 +143,7 @@ jobs:
           set -euo pipefail
           gunzip -c image.tar.gz | docker load
           V="${VERSION#v}"
+          push() { docker tag "$IMAGE" "$1"; docker push "$1"; echo "Published $1" | tee -a "$GITHUB_STEP_SUMMARY"; }
           docker tag "$IMAGE" "$REGISTRY_IMAGE:$V"
           docker push "$REGISTRY_IMAGE:$V" | tee push.log
           # The registry's digest of what was pushed: the attestations below are made for exactly this image.
@@ -146,16 +151,14 @@ jobs:
           [ -n "$DIGEST" ] || { echo "::error::no digest in the docker push output"; exit 1; }
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Published $REGISTRY_IMAGE:$V ($DIGEST)" | tee -a "$GITHUB_STEP_SUMMARY"
-          # The same image under the release name servers pull by: pico_vX.Y.Z (only a tag, the layers are already there).
-          docker tag "$IMAGE" "$REGISTRY_IMAGE:pico_v$V"
-          docker push "$REGISTRY_IMAGE:pico_v$V"
-          echo "Published $REGISTRY_IMAGE:pico_v$V (same image)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The same image as vX.Y.Z (only a tag, the layers are already there), and under the old name.
+          push "$REGISTRY_IMAGE:$VERSION"
+          push "$LEGACY_REGISTRY_IMAGE:$V"
           # :latest only moves forward: a patch tag for an older line (v0.1.5 after v0.2.0) must not roll it back.
           NEWEST=$(git tag -l --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           if [ "$NEWEST" = "$VERSION" ]; then
-            docker tag "$IMAGE" "$REGISTRY_IMAGE:latest"
-            docker push "$REGISTRY_IMAGE:latest"
-            echo "Moved $REGISTRY_IMAGE:latest to $V" | tee -a "$GITHUB_STEP_SUMMARY"
+            push "$REGISTRY_IMAGE:latest"
+            push "$LEGACY_REGISTRY_IMAGE:latest"
           else
             echo "Not moving :latest: the newest release is $NEWEST" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
@@ -170,7 +173,7 @@ jobs:
           # This job can't write to the Release (contents: read); the SBOM is a workflow artifact and an attestation.
           upload-release-assets: false
 
-      # Anyone can check an image with: gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico
+      # Anyone can check an image with: gh attestation verify oci://ghcr.io/cloudpiai/pico:<version> -R CloudpiAi/Pico
       - name: Attest build provenance
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:

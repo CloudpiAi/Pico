@@ -6,7 +6,11 @@ All notable changes to Pico are recorded here. The format follows [Keep a Change
 
 ### Added
 
-- Release images are also tagged `pico_vX.Y.Z` (for example `ghcr.io/cloudpiai/pico-finops-agent:pico_v0.4.0`), the same image as `X.Y.Z`.
+- Release images are also tagged `vX.Y.Z` (for example `ghcr.io/cloudpiai/pico:v0.4.0`), the same image as `X.Y.Z`.
+
+### Changed
+
+- The image is now `ghcr.io/cloudpiai/pico` (was `ghcr.io/cloudpiai/pico-finops-agent`). `docker-compose.yml` pulls the new name. For now each release is also pushed to the old name (`:X.Y.Z` and `:latest`, the same image), so servers on the old name keep updating; move them to the new name, as the old one will stop getting releases.
 
 ## [0.3.0] - 2026-11-13
 

@@ -471,7 +471,7 @@ Actions, public, no login needed):
 git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
 cd ~/pico-finops-agent
 git checkout v0.3.0         # the latest release (Releases page)
-docker compose pull         # ghcr.io/cloudpiai/pico-finops-agent
+docker compose pull         # ghcr.io/cloudpiai/pico
 ```
 
 > **Prefer to build the image yourself?** Everything that runs is in this repository. Instead of `docker compose
