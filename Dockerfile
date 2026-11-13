@@ -3,7 +3,7 @@
 #   (or: docker build -t pico-finops-agent:local .). Released images: ghcr.io/cloudpiai/pico-finops-agent
 # No secret or customer setting goes in the image: they come from the customer's .env (docs/CUSTOMER-SETUP-GUIDE.md).
 # .dockerignore is an allow-list: only the files copied below are sent to the build.
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:73dbd1a2ad74137451593a8ac30f7bdd0f5010fc05fb34644190cffa7696bbf3
+ARG PYTHON_IMAGE=python:3.12.16-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 
 # 1. The loader Lambda's two zips. The DuckDB wheel and extensions are checked against loader/pins.json.
 FROM ${PYTHON_IMAGE} AS zips

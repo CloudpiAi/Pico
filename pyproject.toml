@@ -4,7 +4,7 @@ name = "pico-agent"
 version = "0.2.0"
 description = "Pico FinOps Agent: answers AWS cost questions in Slack from your own FOCUS billing export (fork of Datus-agent 0.4.1)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.13"
 license = "Apache-2.0"
 license-files = ["LICENSE*"]
 authors = [
@@ -33,15 +33,15 @@ dependencies = [
     "pandas==2.1.4",
     "sqlalchemy==2.0.23",
     "sqlglot>=26.12.0,<31",
-    "pyyaml==6.0.1",
+    "pyyaml==6.0.3",
     "packaging>=21.0",
     "structlog>=23.1.0",
-    # Floor: openai-agents 0.13.x requires openai>=2.26. Cap below 2.45.0: openai
+    # Floor: openai-agents 0.14.x requires openai>=2.26. Cap below 2.45.0: openai
     # 2.45.0 made ``InputTokensDetails.cache_write_tokens`` a required field and
     # ``pico/models/claude_model.py`` still constructs ``InputTokensDetails``
     # without it. Lift the cap together with that code.
     "openai>=2.26.0,<2.45.0",
-    "httpx[socks]==0.27.2",
+    "httpx[socks]>=0.28.1,<1",
     "tantivy>=0.22.2",
     "aiohttp>=3.11.16",
     # Pico's Slack gateway (pico/gateway); Socket Mode uses aiohttp above.
@@ -55,17 +55,15 @@ dependencies = [
     # them. xlrd covers legacy .xls, which DuckDB does not support at all.
     "openpyxl>=3.1.5",
     "xlrd>=2.0.1",
-    "openai-agents[litellm]==0.13.4",
+    "openai-agents[litellm]==0.14.8",
     "openinference-instrumentation-openai-agents==1.6.2",
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
-    # Upper bound tracks the ``httpx[socks]==0.27.2`` pin above: litellm 1.83.1+ requires
-    # ``httpx==0.28.1`` / ``httpx>=0.28``, so nothing above 1.83.0 can ever be selected.
-    # Without the bound, pip backtracks from the newest release through ~90 versions and
-    # source-builds the 1.92-1.95 sdists, which ship no macOS or Windows wheels — minutes
-    # stuck on "Preparing metadata". Lift this bound only together with the httpx pin.
-    "litellm>=1.67.4.post1,<1.83.1",
+    # Floor: litellm before 1.95.0 has Critical and known-exploited vulnerabilities (and 1.82.7/1.82.8 were
+    # malicious releases). It needs httpx>=0.28 and pyyaml>=6.0.3. The floor also keeps the resolver away from the
+    # 1.92-1.95 sdists, which ship no macOS or Windows wheels.
+    "litellm>=1.106.5,<2",
     "pydantic>=2.11.7,<3.0",
     "lancedb==0.34.0",
     # This library is required by lancedb
@@ -85,7 +83,7 @@ dependencies = [
     "uvicorn>=0.24.0",
     "pyperclip==1.9.0",
     "wcmatch>=10.0",
-    "fastembed==0.4.2",
+    "fastembed==0.9.1",
     # Optional: install torch manually to enable reranker models.
     "charset-normalizer>=3.4.2",
     "defusedxml>=0.7.1",
