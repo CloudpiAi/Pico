@@ -58,5 +58,5 @@ Tick each item when it's done. Do the **Before launch** ones before Pico is anno
 ## After launch
 
 - [ ] **Register for the OpenSSF Best Practices badge** at <https://www.bestpractices.dev/> and complete the "passing" level, then add its badge to the README. Most answers are in SECURITY.md, CONTRIBUTING.md and the CI workflows.
-- [ ] **Make the "Security scan" CI job a required check** once its first runs are clean.
+- [ ] **Make the "Security scan" CI job a required check** (it is clean and blocking since PR #16).
 - [ ] **Check the OpenSSF Scorecard result** after `scorecard.yml` has run on `main` (the README badge links to it). "Maintained" needs 90 days of history and "Contributors" needs contributors from several organizations, so a perfect score isn't expected at first.

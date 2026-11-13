@@ -94,9 +94,8 @@ jobs:
 
   security:
     name: Security scan (dependencies and agent code)
-    # Report-only for now: both steps continue on findings, so this job doesn't block a merge. The first run found known
-    # vulnerabilities in several locked runtime dependencies and medium-severity bandit findings; once those are
-    # fixed, remove `continue-on-error` from both steps and make this job a required check.
+    # Blocking: a known vulnerability in a locked runtime dependency, or a medium/high bandit finding, fails the job.
+    # Make it a required check in the main ruleset (docs/maintainers/REPO-SETTINGS.md).
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -109,11 +108,9 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Known vulnerabilities in the locked runtime dependencies (pip-audit)
-        continue-on-error: true
         run: |
           uv export --no-dev --no-hashes --no-emit-project --extra pico-finops-agent --format requirements-txt > requirements-audit.txt
           uvx pip-audit==2.10.1 --disable-pip --no-deps -r requirements-audit.txt
 
       - name: Bandit (agent, plugins and loader; medium and high severity)
-        continue-on-error: true
         run: uvx bandit[toml]==1.8.6 -r pico_finops_agent plugins loader --severity-level medium --confidence-level medium -q
