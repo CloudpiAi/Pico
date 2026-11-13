@@ -152,7 +152,8 @@ _TASK_ID = re.compile(
     r"\*t(\d+)\b(?!\.\w)"            # *t7* and, since 2026-11-11 15:21, *t7 — Cost by service daily* (bold over the name)
     r"|`t(\d+)`|\bt(\d+):"
     r"|\btask\s+(?:id\s*:?\s*)?t(\d+)\b(?!\.\w)"  # "task t15", "(task ID: t22)"
-    r"|(?<![\w.*`(])t(\d+)\s*[•·]\s*\**\s*Name\b",  # "t2 • Name: EC2 cost report" (live 2026-11-12), also on its own line
+    r"|(?<![\w.*`(])t(\d+)\s*[•·]\s*\**\s*Name\b"  # "t2 • Name: EC2 cost report" (live 2026-11-12), also on its own line
+    r"|(?:^|[•·\n])\s*t(\d+)\s+[—–-]\s",  # "• t7 — Cost by service daily (active)" (live 2026-11-13); a bullet first
     re.IGNORECASE)
 _NO_TASKS = re.compile(r"\bno (?:scheduled )?tasks\b|\bdon['’]t have any (?:scheduled )?tasks\b", re.IGNORECASE)
 _STATUS_FIELD = re.compile(r"\bstatus\s*[:=]?\s*\**\s*([a-z]+)", re.IGNORECASE)

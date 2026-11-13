@@ -344,3 +344,33 @@ def test_the_sentences_match_the_agent():
     from tests.e2e.standalone_ui.checks import CANT_ANSWER
 
     assert set(CANT_ANSWER) == {slack_guard.SORRY, slack_guard.TOO_LONG}
+
+
+# live 2026-11-13 12:00: plain ids after a bullet, an em dash before the name, status in brackets
+PLAIN_DASH_LIST = (
+    "Here are your scheduled tasks: • t7 — Cost by service daily (active, report) • Schedule: Daily at 12:34 PM "
+    "(Asia/Kolkata) to your DM • t56 — Daily AWS cost report (active, report) • t57 — Amazon S3 cost report "
+    "(paused, ask) • t167 — Daily EC2 cost and usage (active, report) • t183 — Review AWS bill (paused, reminder)"
+)
+
+
+def test_plain_ids_with_a_dash_parse():
+    assert parse_task_list(PLAIN_DASH_LIST) == {"t7": "active", "t56": "active", "t57": "paused",
+                                                "t167": "active", "t183": "paused"}
+
+
+@pytest.mark.parametrize("text", [
+    "You have 5 scheduled tasks:\n• t7 – Cost by service daily (active, report)\n• t183 - Review AWS bill (paused)",
+    "• t7 — Cost by service daily (active)\n• t183 — Review AWS bill (paused)",
+])
+def test_plain_ids_with_any_dash_parse(text):
+    assert parse_task_list(text) == {"t7": "active", "t183": "paused"}
+
+
+@pytest.mark.parametrize("text", [
+    "Your EC2 fleet runs t3 — mostly t3.micro instances (active)",  # an instance family, not a task
+    "We moved from t2 - to t3.micro last month",
+])
+def test_instance_types_are_not_task_ids(text):
+    with pytest.raises(ValueError):
+        parse_task_list(text)
