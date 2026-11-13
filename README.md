@@ -98,7 +98,7 @@ The **agent code** (query execution, Slack integration, LLM interaction) is in t
 - 🔒 **IAM-based access** — EC2 instance assumes roles; no access keys needed
 - 🔒 **Read-only cost data** — Pico only reads FOCUS exports and the cost table, never modifies billing data
 - 🔒 **Encrypted secrets** — API keys and Slack tokens are read from `.env`, not stored in code
-- 🔒 **No telemetry** — Pico sends nothing to Pico FinOps, CloudPi or PurpleData. Outbound traffic goes only to AWS, Slack and the language model you chose (the framework's optional OpenTelemetry tracing is off unless you configure an exporter)
+- 🔒 **No telemetry** — Pico sends nothing to Pico FinOps or any other third party. Outbound traffic goes only to AWS, Slack and the language model you chose (the framework's optional OpenTelemetry tracing is off unless you configure an exporter)
 - 🔒 **Hardened container** — Runs as a non-root user on a read-only file system with all Linux capabilities dropped
 - 🔒 **Verifiable images** — Release images are built only by this repository's GitHub Actions; from the release after 0.2.0 on, each one also has a signed build-provenance attestation and an SBOM (`gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico`)
 

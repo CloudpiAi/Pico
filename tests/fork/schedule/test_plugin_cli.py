@@ -3,6 +3,7 @@ its own, so the plugin must not import the FOCUS plugin or the standalone agent.
 import ast
 import io
 import json
+import re
 import shutil
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -83,7 +84,9 @@ def test_an_unknown_action_says_which_actions_exist(data_dir, capsys):
         cli.main(["create", "--ctx", "x"], {"data_dir": str(data_dir)})
     assert e.value.code == 2
     err = capsys.readouterr().err
-    assert "invalid choice: 'create'" in err and "'add'" in err and "'remove'" in err
+    # Python 3.12.8+ lists the choices without quotes ("choose from add, list, ..."); older versions quote them.
+    assert "invalid choice: 'create'" in err
+    assert re.search(r"choose from '?add'?, '?list'?", err) and re.search(r"'?remove'?", err)
 
 
 @pytest.mark.parametrize("argv", [
