@@ -1,7 +1,7 @@
 # Project basic information configuration, required.
 [project]
 name = "pico-agent"
-version = "0.4.1"
+version = "0.2.0"
 description = "Pico FinOps Agent: answers AWS cost questions in Slack from your own FOCUS billing export (fork of Datus-agent 0.4.1)"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -13,11 +13,15 @@ authors = [
 maintainers = [
     { name = "PurpleData Inc." }
 ]
-keywords = ["sql", "ai", "agent", "database", "nlp", "natural-language"]
+keywords = ["finops", "cloud-cost", "aws", "focus", "billing", "slack", "ai", "agent", "llm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "Topic :: Database",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: System :: Monitoring",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
@@ -114,6 +118,8 @@ Homepage = "https://github.com/CloudpiAi/Pico"
 Documentation = "https://github.com/CloudpiAi/Pico/blob/main/docs/CUSTOMER-SETUP-GUIDE.md"
 Repository = "https://github.com/CloudpiAi/Pico"
 "Bug Tracker" = "https://github.com/CloudpiAi/Pico/issues"
+Changelog = "https://github.com/CloudpiAi/Pico/blob/main/CHANGELOG.md"
+Security = "https://github.com/CloudpiAi/Pico/security/policy"
 
 [project.scripts]
 pico-agent = "pico.entrypoints:agent_main"
@@ -202,7 +208,7 @@ dev = [
     "pytest==8.0.2",
     "pytest-asyncio>=0.23.8",
     "jsonschema>=4.25.1,<5",
-    # Keep consistent with the workflow version of github
+    # Keep the same version in .github/workflows/ci.yml and .pre-commit-config.yaml
     "ruff==0.15.6",
     "mypy==1.8.0",
     "tqdm>=4.27.0",

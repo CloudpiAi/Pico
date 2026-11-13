@@ -1,5 +1,6 @@
 """Settings come from an .env-style file and the environment (tests/e2e/standalone_ui/config.py)."""
 
+import dataclasses
 import os
 
 import pytest
@@ -115,5 +116,5 @@ def test_environ_defaults_to_os_environ(monkeypatch):
 def test_config_is_frozen_and_holds_no_secrets():
     cfg = load_config(environ=dict(_REQUIRED))
     assert cfg.redact_values() == ()
-    with pytest.raises(Exception):
+    with pytest.raises(dataclasses.FrozenInstanceError):
         cfg.bot_name = "other"  # type: ignore[misc]

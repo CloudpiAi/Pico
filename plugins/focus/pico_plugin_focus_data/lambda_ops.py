@@ -158,7 +158,7 @@ def ensure_lambda(cfg, lam, refresh_role=False):
         action = "updated"
     want = {"Layers": [layer_arn], "MemorySize": MEMORY_MB, "Timeout": TIMEOUT_S, "Handler": HANDLER,
             "Role": cfg.lambda_role_arn, "Description": DESCRIPTION}
-    have = {"Layers": [l["Arn"] for l in fn.get("Layers", [])], "MemorySize": fn.get("MemorySize"),
+    have = {"Layers": [layer["Arn"] for layer in fn.get("Layers", [])], "MemorySize": fn.get("MemorySize"),
             "Timeout": fn.get("Timeout"), "Handler": fn.get("Handler"), "Role": fn.get("Role"),
             "Description": fn.get("Description")}
     drift = {k: v for k, v in want.items() if have.get(k) != v}

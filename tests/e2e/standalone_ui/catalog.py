@@ -249,7 +249,7 @@ def expand_channels(cases: list[Case], channels: list[str]) -> list[Case]:
     bound = _channel_bound(cases)
     out = [replace(c, channel=channels[0]) if c.id in bound else c for c in cases]
     for ch in channels[1:]:
-        def rename(cid):
+        def rename(cid, ch=ch):
             return f"{cid}@{ch}" if cid in bound else cid
         for c in cases:
             if c.id in bound:

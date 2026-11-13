@@ -67,6 +67,17 @@ jobs:
       - name: Check the image
         run: sh .github/actions/build-image/check-image.sh "$IMAGE" .
 
+      # Known vulnerabilities in the image (grype). Pull requests and main only report them; a release tag is not
+      # published while a Critical vulnerability with an available fix is in the image.
+      - name: Scan the image for vulnerabilities
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
+        with:
+          image: ${{ env.IMAGE }}
+          only-fixed: true
+          severity-cutoff: critical
+          fail-build: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          output-format: table
+
       # Release tags only: hand the exact image that passed the checks to the publish job.
       - name: Save the checked image
         if: startsWith(github.ref, 'refs/tags/v')
@@ -91,6 +102,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+      # Signed build-provenance and SBOM attestations (Sigstore), stored with the image and on GitHub.
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout (full history, to check the tag is on main)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -117,15 +131,20 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Push vX.Y.Z (and latest, when it is the newest release)
+        id: push
         env:
           VERSION: ${{ github.ref_name }}
         run: |
-          set -eu
+          set -euo pipefail
           gunzip -c image.tar.gz | docker load
           V="${VERSION#v}"
           docker tag "$IMAGE" "$REGISTRY_IMAGE:$V"
-          docker push "$REGISTRY_IMAGE:$V"
-          echo "Published $REGISTRY_IMAGE:$V" | tee -a "$GITHUB_STEP_SUMMARY"
+          docker push "$REGISTRY_IMAGE:$V" | tee push.log
+          # The registry's digest of what was pushed: the attestations below are made for exactly this image.
+          DIGEST=$(grep -oE 'digest: sha256:[0-9a-f]{64}' push.log | tail -1 | cut -d' ' -f2)
+          [ -n "$DIGEST" ] || { echo "::error::no digest in the docker push output"; exit 1; }
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+          echo "Published $REGISTRY_IMAGE:$V ($DIGEST)" | tee -a "$GITHUB_STEP_SUMMARY"
           # :latest only moves forward: a patch tag for an older line (v0.1.5 after v0.2.0) must not roll it back.
           NEWEST=$(git tag -l --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           if [ "$NEWEST" = "$VERSION" ]; then
@@ -135,3 +154,31 @@ jobs:
           else
             echo "Not moving :latest: the newest release is $NEWEST" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
+
+      - name: Make the SBOM (SPDX)
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ env.IMAGE }}
+          format: spdx-json
+          output-file: pico-finops-agent.spdx.json
+          artifact-name: pico-finops-agent-${{ github.ref_name }}.spdx.json
+          # This job can't write to the Release (contents: read); the SBOM is a workflow artifact and an attestation.
+          upload-release-assets: false
+
+      # Anyone can check an image with: gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Attest the SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY_IMAGE }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: pico-finops-agent.spdx.json
+          push-to-registry: true
+          create-storage-record: false

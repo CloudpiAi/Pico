@@ -14,8 +14,8 @@ from tests.e2e.standalone_ui.answer_check import figures, match_figures  # noqa:
 from tests.e2e.standalone_ui.catalog import CatalogError, Expect  # noqa: E402
 from tests.e2e.standalone_ui.checks import judge_reply  # noqa: E402
 from tests.e2e.standalone_ui.ground_truth import Truth  # noqa: E402
-from tests.fork.pico_finops_agent.test_focus_query_flow import CACHE_COLUMNS, fixture_rows  # noqa: E402
 from tests.fork.e2e_standalone_ui.test_catalog import FULL_VARS  # noqa: E402
+from tests.fork.pico_finops_agent.test_focus_query_flow import CACHE_COLUMNS, fixture_rows  # noqa: E402
 
 SHIPPED = str(Path(__file__).resolve().parents[3] / "tests" / "e2e" / "standalone_ui" / "catalog.yaml")
 

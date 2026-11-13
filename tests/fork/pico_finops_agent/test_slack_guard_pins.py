@@ -180,9 +180,8 @@ def test_chat_node_reads_max_turns_from_agentic_nodes_chat():
 
 def test_ctx_line_accepts_the_retry_message_id():
     """The schedule plugin signs the message id into the ctx line; it accepts only digits and _ there."""
-    from pico_plugin_schedule import slack_ctx
-
     from pico_finops_agent import slack_guard
+    from pico_plugin_schedule import slack_ctx
 
     key = "k" * 64
     retry = slack_guard.retry_message_id("1731330000.123456")

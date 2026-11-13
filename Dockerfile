@@ -38,10 +38,11 @@ RUN uv sync --frozen --no-dev --extra pico-finops-agent \
  && rm -rf ./plugins/focus/build ./plugins/schedule/build /tmp/pins.json
 # Precompile everything: the container's disk is read-only, so Python can't write a .pyc cache at run time and every
 # `pico` command (each Slack task, each scheduled question) would recompile ~3,200 files (~5 s). Hash-checked .pyc stay
-# valid however the copy below sets file times. Some third-party test files don't compile; that is expected.
-RUN /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash \
-      /app/pico /app/pico_finops_agent "$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
-      >/dev/null || true
+# valid however the copy below sets file times. Pico's own code must compile, so a syntax error there fails the
+# build; some third-party packages ship test files that don't compile, so only those failures are tolerated.
+RUN /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash /app/pico /app/pico_finops_agent \
+ && { /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash \
+      "$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" >/dev/null || true; }
 
 # 3. What runs.
 FROM ${PYTHON_IMAGE}

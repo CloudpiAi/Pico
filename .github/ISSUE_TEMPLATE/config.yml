@@ -3,3 +3,9 @@ contact_links:
   - name: Setup guide
     url: https://github.com/CloudpiAi/Pico/blob/main/docs/CUSTOMER-SETUP-GUIDE.md
     about: Step-by-step setup, settings and troubleshooting — most questions are answered there.
+  - name: Report a security vulnerability
+    url: https://github.com/CloudpiAi/Pico/security/advisories/new
+    about: Please report security problems privately here, never in a public issue. See SECURITY.md.
+  - name: Ask a question
+    url: https://github.com/CloudpiAi/Pico/discussions
+    about: Questions and ideas that aren't a bug report.
