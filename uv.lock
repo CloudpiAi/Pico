@@ -2342,7 +2342,7 @@ wheels = [
 
 [[package]]
 name = "pico-agent"
-version = "0.4.1"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
