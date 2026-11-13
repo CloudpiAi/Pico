@@ -23,10 +23,20 @@ WORKDIR /app
 # The same uv that wrote uv.lock; an older one may reject or rewrite it.
 RUN pip install --no-cache-dir uv==0.9.12
 COPY ./pyproject.toml ./uv.lock ./README.md ./LICENSE ./NOTICE ./
-# Packages in uv.lock the agent never imports, left out of the image (~165 MB):
-#   sympy + mpmath (~80 MB): required by onnxruntime, but only its optional tools (quantization, transformers) use them
-#   onnx (~79 MB): required by fastembed, which runs models with onnxruntime and does not import onnx
-ARG SKIP_PACKAGES="--no-install-package sympy --no-install-package mpmath --no-install-package onnx"
+# Packages in uv.lock the agent never imports, left out of the image:
+#   sympy + mpmath: required by onnxruntime, but only its optional tools (quantization, transformers) use them
+#   onnx: required by fastembed, which runs models with onnxruntime and does not import onnx
+#   grpcio + the OTLP gRPC exporter: pulled in by opentelemetry-exporter-otlp; Pico exports traces over OTLP/HTTP only
+#     (pico/observability/adapters/otlp.py)
+#   tree-sitter-<language> grammars: textual's optional code highlighting; the agent has no terminal UI, and textual
+#     falls back to plain text without them (tree-sitter itself stays)
+ARG SKIP_PACKAGES="--no-install-package sympy --no-install-package mpmath --no-install-package onnx \
+ --no-install-package grpcio --no-install-package opentelemetry-exporter-otlp-proto-grpc \
+ --no-install-package tree-sitter-bash --no-install-package tree-sitter-css --no-install-package tree-sitter-go \
+ --no-install-package tree-sitter-html --no-install-package tree-sitter-java --no-install-package tree-sitter-javascript \
+ --no-install-package tree-sitter-json --no-install-package tree-sitter-markdown --no-install-package tree-sitter-python \
+ --no-install-package tree-sitter-regex --no-install-package tree-sitter-rust --no-install-package tree-sitter-sql \
+ --no-install-package tree-sitter-toml --no-install-package tree-sitter-xml --no-install-package tree-sitter-yaml"
 RUN uv sync --frozen --no-dev --extra pico-finops-agent --no-install-project $SKIP_PACKAGES
 COPY ./pico ./pico
 COPY ./pico_finops_agent ./pico_finops_agent
@@ -45,6 +55,7 @@ RUN uv sync --frozen --no-dev --extra pico-finops-agent $SKIP_PACKAGES \
 #   - their test suites (tests/, test/, _tests/, conftest.py, SQLAlchemy's testing/suite; pandas/tests alone is
 #     ~30-40 MB), never anything of Pico's own (/app/pico, /app/plugins). Kept: pandas/_testing (pandas imports it)
 #     and modules that only have a test-like name (numpy/testing, sqlalchemy/testing, aiohttp/test_utils.py)
+#   - litellm's proxy admin web UI (static files, ~18 MB): Pico calls litellm as a library, never runs its proxy
 #   - type stubs (*.pyi), Cython headers (*.pxd) and pyarrow's C++ headers: only a compiler or a type checker reads them
 #   - debug symbols in native libraries (strip --strip-unneeded); a file strip cannot handle is left as it is
 # binutils (strip) is installed in this stage only; the runtime stage never gets it.
@@ -54,6 +65,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm 
  && find "$SP" -mindepth 2 -type d \( -name tests -o -name test -o -name _tests \) -prune -exec rm -rf {} + \
  && find "$SP" -type f -name conftest.py -delete \
  && rm -rf "$SP/sqlalchemy/testing/suite" \
+ && rm -rf "$SP/litellm/proxy/_experimental/out" \
  && find "$SP" -type f \( -name '*.pyi' -o -name '*.pxd' \) -delete \
  && rm -rf "$SP/pyarrow/include" \
  && { find "$SP" -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
