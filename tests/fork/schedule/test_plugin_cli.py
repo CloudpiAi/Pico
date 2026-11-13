@@ -138,7 +138,6 @@ def test_every_command_in_the_skill_passes_the_allow_list_and_the_guard():
     _require_installed()
     from pico.plugins.registry import collect_plugin_cli_permissions, invalidate_plugin_cache
     from pico.tools.permission.bash_rules import evaluate_bash_command
-
     from pico_plugin_schedule.hooks.bash_guard import expands_outside_single_quotes
 
     invalidate_plugin_cache()

@@ -6,7 +6,6 @@ discovery reads the installed ``.dist-info`` entry points.
 """
 import ast
 import json
-import subprocess
 import sys
 import tomllib
 from pathlib import Path

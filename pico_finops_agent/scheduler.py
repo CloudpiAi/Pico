@@ -222,7 +222,6 @@ def _after_load(rc, final):
     except (OSError, ValueError):
         return
     alerts = _read_alerts()
-    last = state.get("last_result") or {}
     through = state.get("data_through")
     if rc != 0:
         problem = state.get("problem")

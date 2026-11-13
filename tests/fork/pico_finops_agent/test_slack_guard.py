@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from pico_finops_agent import slack_guard as sg
 from pico.api.models.cli_models import (
     IMessageContent,
     SSEDataType,
@@ -25,6 +24,7 @@ from pico.api.models.cli_models import (
 from pico.gateway.bridge import ChannelBridge
 from pico.gateway.channel.base import ChannelAdapter
 from pico.gateway.models import DONE_EMOJI, ERROR_EMOJI, PROCESSING_EMOJI, ChannelConfig, InboundMessage, Verbose
+from pico_finops_agent import slack_guard as sg
 
 # ======================================================================
 # History cap: trim_to_last_turns

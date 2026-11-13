@@ -15,7 +15,7 @@ sync_api = pytest.importorskip("playwright.sync_api")
 sync_playwright = sync_api.sync_playwright
 
 from tests.e2e.standalone_ui import page as page_mod  # noqa: E402
-from tests.e2e.standalone_ui.page import Msg, PageError, SignedOut, SlackPage
+from tests.e2e.standalone_ui.page import Msg, PageError, SignedOut, SlackPage  # noqa: E402
 
 FIX = Path(__file__).parent / "fixtures"
 DM_HTML = (FIX / "dm.html").read_text(encoding="utf-8")
@@ -414,7 +414,7 @@ def test_thread_open_send_and_replies(dm):
     assert ts == "1700001000.000900"
     # my thread message is in the pane, not in the channel list
     assert ts not in [m.ts for m in sp.messages()]
-    dm.evaluate(f"fx.add({{ts: '1700001001.000100', name: 'Cost Bot', bot: true, text: 'Before: $9'}}, true)")
+    dm.evaluate("fx.add({ts: '1700001001.000100', name: 'Cost Bot', bot: true, text: 'Before: $9'}, true)")
     replies = sp.thread_replies_after(ts)
     assert [(m.ts, m.text) for m in replies] == [("1700001001.000100", "Before: $9")]
     assert sp.thread_replies_after(ts, exclude=frozenset({"1700001001.000100"})) == []
