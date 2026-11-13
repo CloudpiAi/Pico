@@ -128,7 +128,7 @@ pico-mcp = "pico.entrypoints:mcp_main"
 pico-gateway = "pico.entrypoints:gateway_main"
 
 [build-system]
-requires = ["setuptools>=80.9.0", "wheel"]
+requires = ["setuptools>=84.2.1", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
@@ -223,7 +223,7 @@ dev = [
     "pytest-xdist>=3.7.0",
     "pytest-rerunfailures>=14.0",
     "pre-commit>=4.2.0",
-    "setuptools>=80.9.0",
+    "setuptools>=84.2.1",
     "pip>=25.1.1",
     "build>=1.2.0",
     "twine>=6.1.0",
