@@ -8,24 +8,39 @@ bridge posts "(No response generated)". This module, installed by pico_finops_ag
   everything; only the per-call model input is trimmed. Seam: an extra ``call_model_input_filter``, chained after
   Pico's own one, in ``LLMBaseModel._build_run_config``.
 - Answer guard around ``ChannelBridge.handle_message`` (outermost wrapper, so it sees the text the person typed):
-  an empty answer is run once more with a new message id (the bridge dedups by id), then SORRY; a raw
+  an empty answer is run again with a new message id (the bridge dedups by id) and a lighter history: attempt 2
+  sees earlier turns as text only (questions and answers, no tool calls), attempt 3 only the question; then SORRY.
+  Replays of Gemini's MALFORMED_FUNCTION_CALL inputs: same input failed 29/30, text-only 3/30, question-only 0/30.
+  An attempt that
+  ends unanswered (empty or error, once its run has ended; stopped at the deadline, only when the stop is confirmed)
+  is taken back out of the session with Pico's own ``SessionManager.checkpoint_turn``/``rollback_turn``, so no later
+  question carries it (or carries it out). Never an attempt that may have changed something: a tool result seen, a
+  tool call the deadline cut off, or stats that can't be read. That attempt stays in the session and every later
+  attempt keeps the full history, so the model sees what was already done instead of doing it again. A raw
   "❌ Error: ..." text becomes SORRY; a question running past the deadline is stopped with TOO_LONG; more than
   AGENT_QUESTIONS_PER_HOUR per person gets SLOW_DOWN; a whole-message reset phrase clears that DM's/thread's session.
-- One ``slack_question`` log line per message: outcome, seconds, tool calls, tokens, history turns sent. Never the
-  question or the answer text.
+- No stand-in answer: when the model ends a Slack turn with no text, Pico would post the last tool's one-line summary
+  ("2×2 rows"); for ``gateway_`` sessions that fallback is skipped, so the turn counts as empty and is retried.
+  Seam: ``ChatAgenticNode._build_success_result``.
+- One ``slack_question`` log line per message: outcome, seconds, tool calls, tokens, history turns sent, and the
+  ``qid`` + ``finish_reasons`` of its model calls (each also logged as ``llm_call`` by pico_finops_agent.llm_log). Never
+  the question or the answer text.
 
 No change to pico/: every internal used is pinned by tests/fork/pico_finops_agent/test_slack_guard_pins.py.
 """
 import asyncio
+import contextvars
 import dataclasses
 import inspect
 import logging
 import os
 import re
 import time
+import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
 
+from pico_finops_agent import llm_log
 from pico_finops_agent.log import describe, log_event
 
 logger = logging.getLogger(__name__)
@@ -48,6 +63,9 @@ OUTCOMES = frozenset({"answered", "retried", "empty", "error", "too_long", "rate
 SESSION_PREFIX = "gateway_"  # ChannelBridge.build_session_id
 
 _MAX_REMEMBERED = 1000
+# The history an attempt's model calls see: the guard sets it around each attempt; its tasks inherit it.
+HISTORY_MODES = ("full", "text", "none")  # attempt 1, 2, 3
+_HISTORY_MODE = contextvars.ContextVar("pico_finops_agent_history_mode", default="full")
 _TURNS_SENT: "OrderedDict[str, tuple]" = OrderedDict()  # session id -> (user turns sent, monotonic time)
 
 
@@ -125,15 +143,13 @@ def count_user_turns(items):
     return sum(1 for it in items if _is_user(it)) if isinstance(items, list) else 0
 
 
-def trim_to_last_turns(items, n):
-    """Items from the Nth-last user message on, plus any earlier system/developer items. A tool call is never split
-    from its output (the cut moves back to the call). Returns ``items`` itself when nothing is cut, n <= 0, or the
-    input isn't a list with user messages. Never mutates ``items``."""
+def _turn_cut(items, n):
+    """Index where the last ``n`` user turns start (moved back so a tool call keeps its output); None: no cut."""
     if not isinstance(items, list) or isinstance(n, bool) or not isinstance(n, int) or n <= 0:
-        return items
+        return None
     users = [i for i, it in enumerate(items) if _is_user(it)]
-    if len(users) <= n:
-        return items
+    if len(users) < n or not users:
+        return None
     cut = users[-n]
     first_call = {}
     for i, it in enumerate(items):
@@ -150,9 +166,47 @@ def trim_to_last_turns(items, n):
                     if j > 0 and _field(items[j - 1], "type") == "reasoning":
                         j -= 1  # the reasoning item that produced the call stays with it
                     cut, moved = j, True
-    if cut == 0:
+    return cut or None
+
+
+def trim_to_last_turns(items, n):
+    """Items from the Nth-last user message on, plus any earlier system/developer items. A tool call is never split
+    from its output (the cut moves back to the call). Returns ``items`` itself when nothing is cut, n <= 0, or the
+    input isn't a list with user messages. Never mutates ``items``."""
+    if not isinstance(items, list) or isinstance(n, bool) or not isinstance(n, int) or n <= 0:
+        return items
+    if sum(1 for it in items if _is_user(it)) <= n:
+        return items
+    cut = _turn_cut(items, n)
+    if cut is None:
         return items
     return [it for it in items[:cut] if _is_system(it)] + items[cut:]
+
+
+def current_turn_only(items):
+    """System/developer items and the question being answered (with this run's own tool calls)."""
+    return trim_to_last_turns(items, 1)
+
+
+def text_only_history(items):
+    """Earlier turns as text only: system/developer and user messages, assistant answers with text; no tool calls,
+    tool outputs or reasoning items. The question being answered stays whole. ``items`` itself when nothing to do."""
+    cut = _turn_cut(items, 1)
+    if cut is None:
+        return items
+    kept = []
+    for it in items[:cut]:
+        if _field(it, "type") not in (None, "message"):
+            continue
+        role = _field(it, "role")
+        if role in ("system", "developer", "user") or (role == "assistant" and (_text_of(it) or "").strip()):
+            kept.append(it)
+    return kept + items[cut:]
+
+
+_LIGHTER = {"full": lambda items: items, "text": text_only_history, "none": current_turn_only}
+if set(_LIGHTER) != set(HISTORY_MODES):  # a renamed mode must never fall back to the full history unnoticed
+    raise RuntimeError(f"history modes {HISTORY_MODES} and their filters {sorted(_LIGHTER)} differ")
 
 
 def _remember_turns(session_id, count):
@@ -183,6 +237,7 @@ def _make_filter(inner, n, session_id):
 
             items = list(result.input)
             trimmed = trim_to_last_turns(items, n)
+            trimmed = _LIGHTER[_HISTORY_MODE.get()](trimmed)
             _remember_turns(session_id, count_user_turns(trimmed))
             if trimmed is items:
                 return result
@@ -223,6 +278,32 @@ def install_history_cap(n):
     _build_run_config.pico_finops_agent_history_cap = True
     _build_run_config.__wrapped__ = original
     LLMBaseModel._build_run_config = _build_run_config
+
+
+def install_no_tool_summary_answer():
+    """Slack sessions only: a tool's one-line summary (``ctx.last_tool_summary``, e.g. "2×2 rows") is not an answer."""
+    from pico.agent.node.chat_agentic_node import ChatAgenticNode
+
+    original = ChatAgenticNode._build_success_result
+    if getattr(original, "pico_finops_agent_no_summary", False):
+        return
+
+    def _build_success_result(self, ctx):
+        session_id = getattr(self, "session_id", None)
+        if not (isinstance(session_id, str) and session_id.startswith(SESSION_PREFIX)):
+            return original(self, ctx)
+        if getattr(ctx, "response_content", None) or not getattr(ctx, "last_tool_summary", None):
+            return original(self, ctx)
+        saved = ctx.last_tool_summary
+        ctx.last_tool_summary = ""
+        try:
+            return original(self, ctx)
+        finally:
+            ctx.last_tool_summary = saved
+
+    _build_success_result.pico_finops_agent_no_summary = True
+    _build_success_result.__wrapped__ = original
+    ChatAgenticNode._build_success_result = _build_success_result
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +368,7 @@ def turn_stats(events):
     if not isinstance(events, list):
         return {}
     tool_ids = set()
+    results = 0
     stats = {}
     for event in events:
         kind = getattr(event, "event", None)
@@ -296,12 +378,14 @@ def turn_stats(events):
                 payload = getattr(item, "payload", None)
                 if getattr(item, "type", None) == "call-tool" and isinstance(payload, dict):
                     tool_ids.add(payload.get("callToolId", ""))
+                elif getattr(item, "type", None) == "call-tool-result":
+                    results += 1
         elif kind == "end":
             for name in ("requests", "input_tokens", "output_tokens"):
                 stats[name] = int(getattr(data, name, 0) or 0)
         elif kind == "error":
             stats["error_type"] = str(getattr(data, "error_type", "") or "")[:80]
-    return {"tool_calls": len(tool_ids), **stats}
+    return {"tool_calls": len(tool_ids), "tool_results": results, **stats}
 
 
 def _add_stats(total, more):
@@ -439,11 +523,15 @@ async def _attempt(original, bridge, msg, proxy, channel_config, timeout):
 
 
 def _task_stats(bridge, session_id):
+    """This attempt's stats from its chat task's events; None when they can't be read (then nothing is undone)."""
     try:
-        task = bridge._task_manager.get_task(session_id)
-        return turn_stats(getattr(task, "events", None))
+        events = getattr(bridge._task_manager.get_task(session_id), "events", None)
     except Exception:  # noqa: BLE001
-        return {}
+        logger.warning("attempt stats unreadable (session %s)", session_id, exc_info=True)
+        return None
+    if not isinstance(events, list):
+        return None
+    return turn_stats(events)
 
 
 def _task_running(bridge, session_id):
@@ -454,12 +542,46 @@ def _task_running(bridge, session_id):
     return getattr(task, "status", None) == "running"
 
 
+def _sessions(bridge):
+    from pico.models.session_manager import SessionManager
+
+    return SessionManager(session_dir=bridge._agent_config.session_dir)
+
+
+async def _checkpoint(bridge, session_id):
+    """The session's boundary before an attempt; None when it can't be read (then nothing is ever rolled back)."""
+    try:
+        return await asyncio.to_thread(_sessions(bridge).checkpoint_turn, session_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("session checkpoint failed", exc_info=True)
+        return None
+
+
+async def _run_finished(bridge, session_id, timeout):
+    """True once the attempt's agent run has ended (it writes the session until then)."""
+    try:
+        run = getattr(bridge._task_manager.get_task(session_id), "asyncio_task", None)
+    except Exception:  # noqa: BLE001
+        logger.warning("run state unreadable (session %s): no rollback", session_id, exc_info=True)
+        return False
+    if run is not None and not run.done():
+        await asyncio.wait({run}, timeout=timeout)
+    return run is None or run.done()
+
+
+def _record_fields(record):
+    return {"qid": record.qid, "finish_reasons": list(record.finishes)}
+
+
 def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=None, stop_wait_s=5.0):
     """The wrapper for ChannelBridge.handle_message (``original`` is what was there: Pico's or the ctx wrapper)."""
     log = log or (lambda event, **fields: log_event(event, **fields))
     limiter = limiter or RateLimiter(settings.questions_per_hour, clock=clock)
     seen = OrderedDict()
     starters = OrderedDict()  # group thread session id -> the Slack user who started it (seen in this process)
+    # Sessions with a question in flight: from its first checkpoint to its last rollback no other message may start a
+    # run there (a rollback would take that run's rows too). Checked and set with no await in between: one event loop.
+    in_flight = set()
 
     def emit(outcome, start, stats=None, session_id=None, since=None, **extra):
         try:
@@ -486,42 +608,91 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             logger.error("timed-out Slack answer still running after stop (session %s)", session_id)
         return confirmed
 
-    async def stopped_too_long(bridge, adapter, conv, session_id, stats):
+    async def roll_back(bridge, session_id, checkpoint, stats):
+        """Take an unanswered attempt (empty or error) back out of the session, once its run has ended. Skipped
+        (rollback_skipped) while the run is still going; a rollback that itself fails is logged, never raised."""
+        if checkpoint is None:
+            return
+        if not await _run_finished(bridge, session_id, stop_wait_s):
+            logger.warning("unanswered-turn rollback skipped: the run is still going (session %s)", session_id)
+            stats["rollback_skipped"] = stats.get("rollback_skipped", 0) + 1
+            return
+        try:
+            await asyncio.to_thread(_sessions(bridge).rollback_turn, session_id, checkpoint)
+        except Exception:  # noqa: BLE001 - the answer (or SORRY) still goes out
+            logger.warning("unanswered-turn rollback failed", exc_info=True)
+            return
+        stats["rolled_back"] = stats.get("rolled_back", 0) + 1
+
+    async def stopped_too_long(bridge, adapter, conv, session_id, stats, checkpoint):
         stats["stop_confirmed"] = await stop_run(bridge, session_id)
+        if stats["stop_confirmed"]:  # a run that didn't stop may still be writing: leave its session alone
+            await roll_back(bridge, session_id, checkpoint, stats)
         await _reply(adapter, conv, TOO_LONG)
         return "too_long", stats
 
     def add_attempt_stats(stats, proxy, bridge, session_id):
-        if not proxy.busy:  # a busy reply started no task: the running one belongs to another message
-            _add_stats(stats, _task_stats(bridge, session_id))
+        """Adds this attempt's stats to the question's; returns this attempt's alone (None: unreadable)."""
+        if proxy.busy:  # a busy reply started no task: the running one belongs to another message
+            return {}
+        attempt = _task_stats(bridge, session_id)
+        if attempt is None:
+            logger.warning("attempt stats unreadable (session %s): kept as if a tool ran", session_id)
+            stats["stats_unreadable"] = stats.get("stats_unreadable", 0) + 1
+            return None
+        _add_stats(stats, attempt)
+        return attempt
 
-    async def answer(bridge, msg, conv, adapter, channel_config, session_id, start):
+    async def answer(bridge, msg, conv, adapter, channel_config, session_id, start, record):
+        """Up to len(HISTORY_MODES) attempts; each empty one is rolled back and the next sees a lighter history."""
         deadline = start + settings.deadline_s
         stats = {}
-        proxy = _Proxy(adapter, retry_allowed=True)
-        timed_out = await _attempt(original, bridge, msg, proxy, channel_config, deadline - clock())
-        add_attempt_stats(stats, proxy, bridge, session_id)
-        if timed_out:
-            return await stopped_too_long(bridge, adapter, conv, session_id, stats)
-        if not proxy.empty:
-            return ("busy" if proxy.busy else "error" if proxy.error else "answered"), stats
-        if deadline - clock() <= 0:  # no time left for the retry: finish the held reactions here
-            await _reply(adapter, conv, SORRY)
-            for call in (adapter.remove_reaction(msg.conversation_id, msg.message_id, proxy._processing, msg.thread_id),
-                         adapter.add_reaction(msg.conversation_id, msg.message_id, proxy._err, msg.thread_id)):
-                try:
-                    await call
-                except Exception:  # noqa: BLE001
-                    pass
-            return "empty", stats
-        retry_id = retry_message_id(msg.message_id)
-        retry_msg = msg.model_copy(update={"message_id": retry_id, "thread_id": conv.thread_id})
-        proxy = _Proxy(adapter, retry_allowed=False, remap={retry_id: msg.message_id}, skip_first_processing=True)
-        timed_out = await _attempt(original, bridge, retry_msg, proxy, channel_config, deadline - clock())
-        add_attempt_stats(stats, proxy, bridge, session_id)
-        if timed_out:
-            return await stopped_too_long(bridge, adapter, conv, session_id, stats)
-        return ("busy" if proxy.busy else "error" if proxy.error else "empty" if proxy.empty else "retried"), stats
+        attempt_msg, proxy = msg, None
+        tool_ran = False  # once a tool has run, every later attempt sees the full history (and nothing is undone)
+        for n, mode in enumerate(HISTORY_MODES, start=1):
+            mode = "full" if tool_ran else mode
+            last = n == len(HISTORY_MODES)
+            if n > 1:
+                if deadline - clock() <= 0:  # no time left for another attempt: finish the held reactions here
+                    await _reply(adapter, conv, SORRY)
+                    for call in (adapter.remove_reaction(msg.conversation_id, msg.message_id, proxy._processing,
+                                                         msg.thread_id),
+                                 adapter.add_reaction(msg.conversation_id, msg.message_id, proxy._err, msg.thread_id)):
+                        try:
+                            await call
+                        except Exception:  # noqa: BLE001
+                            pass
+                    return "empty", stats
+                record.attempt = n
+                retry_id = retry_message_id(attempt_msg.message_id)
+                attempt_msg = msg.model_copy(update={"message_id": retry_id, "thread_id": conv.thread_id})
+                proxy = _Proxy(adapter, retry_allowed=not last, remap={retry_id: msg.message_id},
+                               skip_first_processing=True)
+            else:
+                proxy = _Proxy(adapter, retry_allowed=True)
+            checkpoint = await _checkpoint(bridge, session_id)
+            if checkpoint is None:  # no boundary, so this attempt can't be undone: say so in the question line
+                stats["checkpoint_failed"] = stats.get("checkpoint_failed", 0) + 1
+            token = _HISTORY_MODE.set(mode)  # _attempt's task copies the context: its model calls see the mode
+            try:
+                timed_out = await _attempt(original, bridge, attempt_msg, proxy, channel_config, deadline - clock())
+            finally:
+                _HISTORY_MODE.reset(token)
+            stats["attempts"] = n
+            attempt = add_attempt_stats(stats, proxy, bridge, session_id)
+            # Unknown (None) counts as "a tool may have run": keep the attempt rather than risk doing it twice.
+            ran = attempt is None or attempt.get("tool_results", 0) > 0
+            tool_ran = tool_ran or ran
+            if timed_out:  # a tool call the deadline cut off (no result yet) may have done its work too
+                cut_off = attempt is not None and attempt.get("tool_calls", 0) > 0
+                return await stopped_too_long(bridge, adapter, conv, session_id, stats,
+                                              None if (ran or cut_off) else checkpoint)
+            if not proxy.busy and not ran and (proxy.empty or proxy.error):  # busy: another run's session
+                await roll_back(bridge, session_id, checkpoint, stats)
+            if not proxy.empty:
+                done = "answered" if n == 1 else "retried"
+                return ("busy" if proxy.busy else "error" if proxy.error else done), stats
+        return "empty", stats
 
     async def handle_message(self, msg, adapter, channel_config=None):
         key = f"{msg.channel_id}_{msg.message_id}"
@@ -547,7 +718,7 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
                     await _reply(adapter, conv, RESET_NOT_YOURS)
                     emit("reset_refused", start, **extra)
                     return None
-            if _task_running(self, session_id):
+            if _task_running(self, session_id) or session_id in in_flight:
                 await _reply(adapter, conv, RESET_WHILE_BUSY)  # never clear a session under a running answer
                 emit("busy", start, **extra)
                 return None
@@ -558,6 +729,10 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             await _reply(adapter, conv, RESET_DONE)
             emit("reset", start, **extra)
             return None
+        if session_id in in_flight:  # the same reply Pico gives while a run is going; nothing starts, nothing counted
+            await _reply(adapter, conv, BUSY_TEXT)
+            emit("busy", start)
+            return None
         if msg.sender_id and not limiter.allow(msg.sender_id):  # no sender id: no shared bucket for all of them
             await _reply(adapter, conv, SLOW_DOWN)
             emit("rate_limited", start)
@@ -566,15 +741,20 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             starters[session_id] = msg.sender_id  # a top-level channel message starts its thread
             while len(starters) > _MAX_REMEMBERED:
                 starters.popitem(last=False)
+        in_flight.add(session_id)
+        record = llm_log.Record(uuid.uuid4().hex[:12])
         try:
-            outcome, stats = await answer(self, msg, conv, adapter, channel_config, session_id, start)
+            with llm_log.recording(record):  # the attempts' tasks inherit it: their model calls land in `record`
+                outcome, stats = await answer(self, msg, conv, adapter, channel_config, session_id, start, record)
         except asyncio.CancelledError:
             raise
         except Exception as e:
             await _reply(adapter, conv, SORRY)  # no silent failure and no raw error text in Slack
-            emit("error", start, {"error_type": type(e).__name__}, session_id, since)
+            emit("error", start, {"error_type": type(e).__name__, **_record_fields(record)}, session_id, since)
             raise
-        emit(outcome, start, stats, session_id, since)
+        finally:
+            in_flight.discard(session_id)
+        emit(outcome, start, {**stats, **_record_fields(record)}, session_id, since)
         return None
 
     return handle_message
@@ -587,6 +767,7 @@ def install(settings=None):
 
     settings = settings or settings_from_env()
     install_history_cap(settings.history_turns)  # if this fails the caller logs slack_guard_off
+    install_no_tool_summary_answer()
     original = bridge.ChannelBridge.handle_message
     if getattr(original, "pico_finops_agent_guard", False):
         return

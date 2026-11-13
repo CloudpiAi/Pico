@@ -138,6 +138,10 @@ fi
 if opt_set AGENT_QUESTIONS_PER_HOUR; then
     match AGENT_QUESTIONS_PER_HOUR '^(0|[1-9][0-9]{0,4})$' "must be a whole number (0 = no limit)"
 fi
+# Model-call log (pico_finops_agent/llm_log.py): keep failed requests on the data volume (default 0).
+if opt_set AGENT_SAVE_FAILED_CALLS; then
+    match AGENT_SAVE_FAILED_CALLS '^(0|1)$' "must be 0 or 1"
+fi
 
 # 3. The LLM (pico_finops_agent/llm.py, same names): AGENT_LLM_PROVIDER picks it (default gemini); its key must be set.
 provider=gemini

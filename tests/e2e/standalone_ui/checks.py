@@ -11,6 +11,12 @@ from typing import Any, Mapping, Optional, Sequence
 from tests.e2e.standalone_ui.answer_check import match_figures
 
 EMPTY_ANSWERS = ("(No response generated)",)
+# The agent's own "no answer" sentences (pico_finops_agent/slack_guard.py SORRY, TOO_LONG): a reply, but not an answer.
+# sch_ask_not_met passed on 2026-11-13 with only SORRY (a task appeared by accident). Pinned in test_checks.py.
+CANT_ANSWER = (
+    "Sorry, I couldn't answer that just now. Please ask again in a moment.",
+    "That took too long to work out. Please try a narrower question, for example one service or one month.",
+)
 
 FAIL_PHRASES = re.compile(
     r"\b(?:couldn['’]t|could not|can['’]t|cannot|not found|no such|doesn['’]t exist|unable|failed)\b",
@@ -55,6 +61,9 @@ def _reply(case_id: str, expect: Any, texts: Sequence[str]) -> Check:
         if real:
             return Check("FAIL", name, f"expected no reply, got: {real[0][:120]!r}")
         return Check("PASS", name, "no reply, as expected")
+    if real and all(t in CANT_ANSWER for t in real) and getattr(expect, "reaction", None) != "any":
+        # reaction "any" (the refusal cases): only the forbidden thing must not happen, so SORRY is fine there
+        return Check("FAIL", name, "the bot couldn't answer: " + repr(real[0][:60]))
     if real:
         return Check("PASS", name, f"{len(real)} message(s)")
     if any(t.strip() in EMPTY_ANSWERS for t in texts):
