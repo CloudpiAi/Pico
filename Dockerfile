@@ -47,7 +47,9 @@ RUN /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash
 # 3. What runs.
 FROM ${PYTHON_IMAGE}
 # /data is the volume (cache, state, logs); /pico-workspace is the agent's working folder.
-RUN useradd --create-home --uid 10001 pico \
+# The base image's pip is never used at run time (the container is read-only and installs nothing), so it goes.
+RUN python -m pip uninstall -y -q pip \
+ && useradd --create-home --uid 10001 pico \
  && mkdir -p /data /pico-workspace /home/pico/.pico/conf /opt/pico-finops-agent-loader \
  && chown -R pico:pico /data /pico-workspace /home/pico/.pico
 WORKDIR /app
