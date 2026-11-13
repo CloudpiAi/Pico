@@ -328,10 +328,14 @@ Write down the key (worksheet #7) and which provider it's for.
        bot:
          - chat:write
          - channels:history
+         - channels:read
          - groups:history
+         - groups:read
          - im:history
+         - im:write
          - mpim:history
          - reactions:write
+         - users:read
    settings:
      event_subscriptions:
        bot_events:
@@ -369,7 +373,7 @@ Write down the key (worksheet #7) and which provider it's for.
 3. **OAuth & Permissions → Bot Token Scopes:** `chat:write`, `channels:history`, `groups:history`, `im:history`,
    `reactions:write`, and optionally `mpim:history`.
 4. **Event Subscriptions:** turn it on. Under **Subscribe to bot events**, add `message.channels`, `message.groups`,
-   `message.im`, and optionally `message.mpim`.
+   `message.im`, and optionally `mpim:history`. Forscheduled taks also add `channels:read` , `groups:read` , `im:write' and     `users:write` - the manifest in 5a already includes them.
 5. **App Home:** turn on the **Messages tab** and tick **Allow users to send messages**.
 6. **Install App:** install it and copy the bot token (`xoxb-…`).
 
@@ -471,7 +475,7 @@ Actions, public, no login needed):
 git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
 cd ~/pico-finops-agent
 git checkout v0.3.0         # the latest release (Releases page)
-docker compose pull         # ghcr.io/cloudpiai/pico
+docker compose pull         # ghcr.io/cloudpiai/pico-finops-agent
 ```
 
 > **Prefer to build the image yourself?** Everything that runs is in this repository. Instead of `docker compose
@@ -616,6 +620,7 @@ The agent tells you in Slack (and in `docker logs`) what's wrong. Find the messa
 | "the loader Lambda's role isn't allowed to …" | Re-apply `loader-role-policy.json` to `pico-finops-agent-loader-role` (step 3d) |
 | "the loader Lambda's role is missing or can't be used" | Recreate the role exactly as in step 3d, and check `FOCUS_LAMBDA_ROLE_ARN` |
 | "the state bucket doesn't exist" | Create it (step 2b), or fix `FOCUS_STATE_BUCKET` in `.env` |
+| "I don't have permission to post messages there" / `missing_scope` from a scheduled task | An admin must add `channels:read`, `groups:read`, `im:write` and `users:read` to the Slack app (step 5a's manifest has them), then   ││ reinstall it |   
 | "the EC2 has no working AWS credentials" | The instance profile isn't attached. Attach the `pico-finops-agent-ec2-role` instance profile: **EC2 → Actions → Security → Modify IAM role** (step 6). Check that hop limit is 1 and IMDSv2 is required |
 | `FOCUS_… is not set` when the agent starts | That line is missing or empty in `.env`. Fix it and run `docker compose up -d` |
 | "No new AWS cost data for N days" | Check **Billing and Cost Management → Data Exports**. The export may be paused or deleted. |
