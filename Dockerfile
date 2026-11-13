@@ -73,13 +73,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm 
  && /app/.venv/bin/python -c "import numpy, pandas, pyarrow, pyarrow.parquet, duckdb, lancedb, onnxruntime, fastembed, \
       tantivy, tokenizers, PIL.Image, lxml.etree, cryptography.hazmat.bindings._rust, pydantic_core, sqlalchemy, \
       tiktoken, aiohttp, botocore, litellm; print('native libraries load after strip')"
-# Precompile everything: the container's disk is read-only, so Python can't write a .pyc cache at run time and every
+# Precompile: the container's disk is read-only, so Python can't write a .pyc cache at run time and every
 # `pico` command (each Slack task, each scheduled question) would recompile ~3,200 files (~5 s). Hash-checked .pyc stay
 # valid however the copy below sets file times. Pico's own code must compile, so a syntax error there fails the
 # build; some third-party packages ship test files that don't compile, so only those failures are tolerated.
+# Third-party packages: only the modules Pico loads are precompiled (~65 MB of .pyc instead of ~135 MB). The list
+# comes from importing every module of pico, pico_finops_agent and both plugins here; a module outside it still
+# works at run time, Python compiles it in memory when it is first imported.
 RUN /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash /app/pico /app/pico_finops_agent \
- && { /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash \
-      "$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" >/dev/null || true; }
+ && PYTHONPATH=/app /app/.venv/bin/python -c "$(printf '%s\n' \
+      'import importlib, os, pkgutil, sys, sysconfig' \
+      'for name in ("pico", "pico_finops_agent", "pico_plugin_focus_data", "pico_plugin_schedule"):' \
+      '    pkg = importlib.import_module(name)' \
+      '    for m in pkgutil.walk_packages(pkg.__path__, name + ".", onerror=lambda n: None):' \
+      '        try: importlib.import_module(m.name)' \
+      '        except BaseException: pass' \
+      'sp = sysconfig.get_paths()["purelib"]' \
+      'files = sorted({f for f in (getattr(m, "__file__", None) for m in list(sys.modules.values()))' \
+      '                if f and f.endswith(".py") and f.startswith(sp)})' \
+      'open("/tmp/loaded.txt", "w").write("\n".join(files) + "\n")' \
+      'print(len(files), "third-party modules loaded")')" \
+ && /app/.venv/bin/python -m compileall -q --invalidation-mode checked-hash -i /tmp/loaded.txt \
+ && rm /tmp/loaded.txt
 
 # 3. What runs.
 FROM ${PYTHON_IMAGE}
