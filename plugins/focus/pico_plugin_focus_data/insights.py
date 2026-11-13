@@ -3,8 +3,9 @@
 Only usage rows count (tax rows would distort a day), and only full days are compared: the newest day in
 an export is usually incomplete (AWS delivers hours late). That partial day is reported on its own (`partial_day`:
 its date, hours in, cost so far) so the notice can say it is partly in, never as a day to compare. "Sudden increase" = the last full day is at least FOCUS_ALERT_INCREASE_PCT
-above the 7-day average before it AND at least FOCUS_ALERT_MIN_SERVICE_USD (per service) or
+above the daily average of the 7 days before it AND at least FOCUS_ALERT_MIN_SERVICE_USD (per service) or
 FOCUS_ALERT_MIN_RESOURCE_USD (per resource) above it. Unset, empty or invalid settings use the defaults.
+Averages divide by the days the export actually covers: a new export's missing days are not days of $0 spend.
 """
 import os
 from dataclasses import dataclass
@@ -51,14 +52,21 @@ _MOVERS_SQL = """
                FROM focus WHERE chargecategory = 'Usage' GROUP BY 1, 2)
     SELECT k,
            coalesce(sum(cost) FILTER (WHERE dt = ?), 0) AS today,
-           coalesce(sum(cost) FILTER (WHERE dt BETWEEN ? AND ?), 0) / 7 AS avg7
+           coalesce(sum(cost) FILTER (WHERE dt BETWEEN ? AND ?), 0) / ? AS avg7
     FROM s WHERE k IS NOT NULL GROUP BY 1"""
 
 
-def _movers(c, key, day, minimum, pct):
+def _days_with_data(c, first, last):
+    """How many days from first to last have usage rows in the export."""
+    return c.execute("SELECT count(DISTINCT CAST(chargeperiodstart AS DATE)) FROM focus WHERE chargecategory = 'Usage' "
+                     "AND CAST(chargeperiodstart AS DATE) BETWEEN ? AND ?", [first, last]).fetchone()[0]
+
+
+def _movers(c, key, day, minimum, pct, week_days):
     if key not in _MOVER_KEYS:
         raise ValueError(f"unknown grouping {key!r}; expected one of {_MOVER_KEYS}")
-    rows = c.execute(_MOVERS_SQL, [key, day, day - timedelta(days=7), day - timedelta(days=1)]).fetchall()
+    rows = c.execute(_MOVERS_SQL, [key, day, day - timedelta(days=7), day - timedelta(days=1),
+                                   max(week_days, 1)]).fetchall()
     spikes = [(k, t, a) for k, t, a in rows
               if a > 0 and t - a >= minimum and (t - a) / a * 100 >= pct]
     stopped = [(k, t, a) for k, t, a in rows if t == 0 and a >= minimum]
@@ -86,14 +94,18 @@ def compute(cache_path, thresholds):
         except ValueError:  # e.g. Mar 31 -> Feb has no 31st
             prev_same_end = month_start - timedelta(days=1)
 
-        svc_spikes, svc_stopped = _movers(c, "servicename", day, thresholds.min_service_usd, thresholds.increase_pct)
-        res_spikes, _ = _movers(c, "resourceid", day, thresholds.min_resource_usd, thresholds.increase_pct)
-        new = c.execute("""
-            WITH s AS (SELECT resourceid, CAST(chargeperiodstart AS DATE) AS dt, sum(billedcost) AS cost
-                       FROM focus WHERE chargecategory = 'Usage' AND resourceid IS NOT NULL GROUP BY 1, 2)
-            SELECT count(*), coalesce(sum(cost), 0) FROM s
-            WHERE dt = ? AND resourceid NOT IN (SELECT resourceid FROM s WHERE dt BETWEEN ? AND ?)""",
-                        [day, day - timedelta(days=30), day - timedelta(days=1)]).fetchone()
+        week_days = _days_with_data(c, day - timedelta(days=7), day - timedelta(days=1))
+        svc_spikes, svc_stopped = _movers(c, "servicename", day, thresholds.min_service_usd, thresholds.increase_pct,
+                                          week_days)
+        res_spikes, _ = _movers(c, "resourceid", day, thresholds.min_resource_usd, thresholds.increase_pct, week_days)
+        new = (0, 0)  # on the export's first day every resource would look new
+        if _days_with_data(c, day - timedelta(days=30), day - timedelta(days=1)):
+            new = c.execute("""
+                WITH s AS (SELECT resourceid, CAST(chargeperiodstart AS DATE) AS dt, sum(billedcost) AS cost
+                           FROM focus WHERE chargecategory = 'Usage' AND resourceid IS NOT NULL GROUP BY 1, 2)
+                SELECT count(*), coalesce(sum(cost), 0) FROM s
+                WHERE dt = ? AND resourceid NOT IN (SELECT resourceid FROM s WHERE dt BETWEEN ? AND ?)""",
+                            [day, day - timedelta(days=30), day - timedelta(days=1)]).fetchone()
         partial = None
         if (max_end.hour, max_end.minute, max_end.second) != (0, 0, 0):  # the data stops inside a day
             pday = max_end.date()
@@ -102,7 +114,7 @@ def compute(cache_path, thresholds):
             "last_full_day": day.isoformat(),
             "partial_day": partial,
             "latest_day_cost": round(total(day, day), 2),
-            "avg7": round(total(day - timedelta(days=7), day - timedelta(days=1)) / 7, 2),
+            "avg7": round(total(day - timedelta(days=7), day - timedelta(days=1)) / max(week_days, 1), 2),
             "mtd": {"cost": round(total(month_start, day), 2),
                     "prev_same_days": round(total(prev_month_start, prev_same_end), 2)},
             "spikes": [{"kind": "service", "name": k, "today": round(t, 2), "avg7": round(a, 2)} for k, t, a in svc_spikes]
