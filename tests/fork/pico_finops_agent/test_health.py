@@ -158,12 +158,18 @@ def test_the_default_heartbeat_is_in_a_private_folder(monkeypatch, tmp_path):
 
 
 @posix_only
-def test_a_folder_others_can_enter_is_refused(monkeypatch, tmp_path):
-    """Any access for the group or others is refused; read and enter for the group is enough to show it."""
+@pytest.mark.parametrize("mode", [0o750, 0o705, 0o777])
+def test_a_folder_others_can_enter_is_refused(monkeypatch, tmp_path, mode):
+    """Any access for the group or others is refused. The folder's mode is faked, so no test file is ever opened up."""
     monkeypatch.setattr(health.tempfile, "gettempdir", lambda: str(tmp_path))
-    folder = tmp_path / f"pico-finops-agent-{os.getuid()}"
-    folder.mkdir(mode=0o700)
-    os.chmod(folder, 0o750)
+    (tmp_path / f"pico-finops-agent-{os.getuid()}").mkdir(mode=0o700)
+    real_lstat = os.lstat
+
+    def lstat(path):
+        st = real_lstat(path)
+        return os.stat_result((stat.S_IFDIR | mode,) + tuple(st)[1:])
+
+    monkeypatch.setattr(health.os, "lstat", lstat)
     with pytest.raises(PermissionError):
         health.private_dir()
 
