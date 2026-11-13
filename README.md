@@ -1,5 +1,11 @@
 # Pico — AI FinOps Analyst
 
+[![CI](https://github.com/CloudpiAi/Pico/actions/workflows/ci.yml/badge.svg)](https://github.com/CloudpiAi/Pico/actions/workflows/ci.yml)
+[![Image](https://github.com/CloudpiAi/Pico/actions/workflows/docker-build.yml/badge.svg)](https://github.com/CloudpiAi/Pico/actions/workflows/docker-build.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/CloudpiAi/Pico/badge)](https://scorecard.dev/viewer/?uri=github.com/CloudpiAi/Pico)
+[![Release](https://img.shields.io/github/v/release/CloudpiAi/Pico)](https://github.com/CloudpiAi/Pico/releases)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 Pico is an **open-source AI FinOps analyst** for startups and teams. Ask Pico about your AWS costs in Slack, and it answers your questions and monitors for unexpected spending.
 
 **Your data stays in your AWS account.** Pico runs on a single EC2 instance in your account. It reads your AWS billing data (FOCUS exports) and keeps everything in your own S3 buckets. Nothing is sent to Pico FinOps or any third party — only questions and answers go to your chosen language model (Gemini by default, or OpenAI, Anthropic Claude, or DeepSeek).
@@ -92,36 +98,64 @@ The **agent code** (query execution, Slack integration, LLM interaction) is in t
 - 🔒 **IAM-based access** — EC2 instance assumes roles; no access keys needed
 - 🔒 **Read-only cost data** — Pico only reads FOCUS exports and the cost table, never modifies billing data
 - 🔒 **Encrypted secrets** — API keys and Slack tokens are read from `.env`, not stored in code
+- 🔒 **No telemetry** — Pico sends nothing to Pico FinOps, CloudPi or PurpleData. Outbound traffic goes only to AWS, Slack and the language model you chose (the framework's optional OpenTelemetry tracing is off unless you configure an exporter)
+- 🔒 **Hardened container** — Runs as a non-root user on a read-only file system with all Linux capabilities dropped
+- 🔒 **Verifiable images** — Release images are built only by this repository's GitHub Actions; from the release after 0.2.0 on, each one also has a signed build-provenance attestation and an SBOM (`gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico`)
 
-See [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) for a detailed privacy and data flow diagram.
+See [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) for a detailed privacy and data flow diagram, and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for the threats we considered.
+
+**Found a security problem?** Please report it privately — see [SECURITY.md](SECURITY.md). Don't open a public issue.
 
 ## Directory structure
 
 ```
 .
 ├── README.md                          # This file
-├── CONTRIBUTING.md                    # How to contribute
-├── CLAUDE.md                          # Guidelines for Claude Code
+├── CONTRIBUTING.md                    # How to contribute (DCO sign-off, running the tests)
+├── SECURITY.md                        # How to report a vulnerability
+├── CHANGELOG.md                       # What changed in each release
 ├── docker-compose.yml                 # Runs the released image (docker compose pull)
 ├── docker-compose.build.yml           # Add it to build the image yourself
 ├── Dockerfile                         # The image recipe (used by GitHub Actions and by you)
 ├── .env.example                       # Configuration template
-├── policies/aws/                      # IAM role policies
+├── policies/aws/                      # IAM role policies (apply these in your account)
 │   ├── ec2-role-policy.json          # Permissions for EC2 instance
 │   ├── ec2-role-trust.json           # Who can assume EC2 role
 │   ├── loader-role-policy.json       # Permissions for Lambda loader
 │   └── loader-role-trust.json        # Who can assume Lambda role
+├── pico_finops_agent/                 # The agent: Slack, scheduler, guards, health check
+├── plugins/                           # focus (cost data, loader) and schedule (Slack tasks) plugins
+├── loader/                            # Builds the loader Lambda and pins its DuckDB version
+├── pico/                              # The Pico framework (fork of Datus-agent, see NOTICE)
+├── tests/                             # Test suites (tests/fork is the agent's)
 ├── docs/
-│   └── CUSTOMER-SETUP-GUIDE.md       # Complete setup instructions
-└── LICENSE                            # Apache 2.0
+│   ├── CUSTOMER-SETUP-GUIDE.md       # Complete setup instructions
+│   ├── ARCHITECTURE.md               # How the code fits together
+│   └── THREAT-MODEL.md               # Threats and mitigations
+├── .github/                           # CI workflows, issue forms, Dependabot, CODEOWNERS
+├── LICENSE                            # Apache 2.0
+└── NOTICE                             # Attribution
 ```
+
+## Running the tests
+
+```bash
+uv sync --dev --extra pico-finops-agent
+uv pip install --no-deps ./plugins/focus ./plugins/schedule
+uv run ruff check .
+uv run pytest tests/fork -m "not nightly and not product_e2e and not provider_health and not quarantine"
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md#running-the-tests) for details.
 
 ## Contributing
 
 We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
 - How to propose changes or report bugs
 - Guidelines for documentation, IAM policies, and configurations
-- Commit message format and submission checklist
+- Commit message format, DCO sign-off and submission checklist
+
+Please read our [Code of Conduct](CODE_OF_CONDUCT.md). The project's roles and decision making are described in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## Common questions
 
@@ -141,7 +175,7 @@ A: Currently, Pico supports AWS. Support for other clouds is tracked as a future
 A: Primarily the EC2 instance cost (t3.medium recommended). S3 storage and Lambda invocations are minimal. LLM costs depend on your choice and usage.
 
 **Q: How do I get help?**  
-A: Check [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md), open a GitHub issue, or join the community discussions.
+A: Check [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md), then see [SUPPORT.md](SUPPORT.md) for where to ask questions and report bugs.
 
 ## License
 
