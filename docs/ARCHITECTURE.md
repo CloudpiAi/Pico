@@ -198,7 +198,7 @@ The base image is pinned by digest. `.dockerignore` is an allow-list, and it als
   string is in the image; the DuckDB extensions load offline on a read-only filesystem; the health check passes
   only on a fresh healthy heartbeat; the image runs as uid 10001.
 - On a release tag `vX.Y.Z` that is on `main`, in this repository only, the publish job pushes the exact image that
-  passed the checks to `ghcr.io/cloudpiai/pico-finops-agent`. `:latest` only moves forward.
+  passed the checks to `ghcr.io/cloudpiai/pico`. `:latest` only moves forward.
 - Third-party actions are pinned by commit SHA. The workflow's default token is read-only; only the publish job
   gets `packages: write`.
 - Other workflows: `ci.yml` (lint, tests, security scan; see section 5), `codeql.yml`, `scorecard.yml` and

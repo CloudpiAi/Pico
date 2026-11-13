@@ -39,7 +39,7 @@ Security fixes go into the newest release line. Please upgrade to the latest rel
 In scope:
 
 - The agent and framework code in this repository (`pico_finops_agent/`, `pico/`, `plugins/`, `loader/`)
-- The container image `ghcr.io/cloudpiai/pico-finops-agent` and its `Dockerfile` / `docker-compose.yml`
+- The container image `ghcr.io/cloudpiai/pico` and its `Dockerfile` / `docker-compose.yml`
 - The IAM policies in `policies/aws/` — for example a permission that is broader than the docs say it needs to be
 
 Out of scope:
@@ -57,5 +57,5 @@ Pico sends a question, and the rows it read to answer it, to the language model 
 Release images are built and published only by this repository's GitHub Actions. From 0.3.0 on, each image also has a signed build-provenance attestation and an SBOM (0.1.0 and 0.2.0 were published before this and have neither). To check an image before you run it:
 
 ```bash
-gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico
+gh attestation verify oci://ghcr.io/cloudpiai/pico:<version> -R CloudpiAi/Pico
 ```

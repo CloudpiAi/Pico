@@ -7,7 +7,7 @@ services:
     # The released image, built and checked by this repo's GitHub Actions: `docker compose pull`, then
     # `docker compose up -d`. Pin a release with AGENT_IMAGE_TAG in .env (for example 0.2.0); default: latest.
     # To build it yourself from this folder instead, add docker-compose.build.yml (see that file).
-    image: ghcr.io/cloudpiai/pico-finops-agent:${AGENT_IMAGE_TAG:-latest}
+    image: ghcr.io/cloudpiai/pico:${AGENT_IMAGE_TAG:-latest}
     container_name: pico-finops-agent
     # The agent exits for a restart when Slack has been down 10 minutes or the scheduler is stuck (see the README's
     # health table); this brings it back.
