@@ -23,7 +23,11 @@ WORKDIR /app
 # The same uv that wrote uv.lock; an older one may reject or rewrite it.
 RUN pip install --no-cache-dir uv==0.9.12
 COPY ./pyproject.toml ./uv.lock ./README.md ./LICENSE ./NOTICE ./
-RUN uv sync --frozen --no-dev --extra pico-finops-agent --no-install-project
+# Packages in uv.lock the agent never imports, left out of the image (~165 MB):
+#   sympy + mpmath (~80 MB): required by onnxruntime, but only its optional tools (quantization, transformers) use them
+#   onnx (~79 MB): required by fastembed, which runs models with onnxruntime and does not import onnx
+ARG SKIP_PACKAGES="--no-install-package sympy --no-install-package mpmath --no-install-package onnx"
+RUN uv sync --frozen --no-dev --extra pico-finops-agent --no-install-project $SKIP_PACKAGES
 COPY ./pico ./pico
 COPY ./pico_finops_agent ./pico_finops_agent
 COPY ./plugins/focus ./plugins/focus
@@ -31,11 +35,25 @@ COPY ./plugins/schedule ./plugins/schedule
 COPY ./loader/pins.json /tmp/pins.json
 # The plugins' packages (boto3, duckdb) come from uv.lock, not resolved again; the lock's DuckDB must be the one
 # the Lambda and the extensions are pinned to (loader/pins.json), or the local copy can't load them.
-RUN uv sync --frozen --no-dev --extra pico-finops-agent \
+RUN uv sync --frozen --no-dev --extra pico-finops-agent $SKIP_PACKAGES \
  && uv pip install --python /app/.venv/bin/python --no-deps ./plugins/focus ./plugins/schedule \
  && /app/.venv/bin/python -c "import json, boto3, duckdb; want = json.load(open('/tmp/pins.json'))['duckdb_version']; \
       assert duckdb.__version__ == want, (duckdb.__version__, want)" \
  && rm -rf ./plugins/focus/build ./plugins/schedule/build /tmp/pins.json
+# Trim the third-party packages before they are precompiled below (so no .pyc is made for what is removed). Only
+# /app reaches the runtime stage, so removing here is enough to keep the bytes out of the image:
+#   - their test suites (pandas/tests alone is ~30-40 MB), never anything of Pico's own (/app/pico, /app/plugins)
+#   - type stubs (*.pyi), Cython headers (*.pxd) and pyarrow's C++ headers: only a compiler or a type checker reads them
+#   - debug symbols in native libraries (strip --strip-unneeded); a file strip cannot handle is left as it is
+# binutils (strip) is installed in this stage only; the runtime stage never gets it.
+RUN apt-get update && apt-get install -y --no-install-recommends binutils && rm -rf /var/lib/apt/lists/* \
+ && SP=$(/app/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])') \
+ && du -sm "$SP" \
+ && find "$SP" -mindepth 2 -type d \( -name tests -o -name test \) -prune -exec rm -rf {} + \
+ && find "$SP" -type f \( -name '*.pyi' -o -name '*.pxd' \) -delete \
+ && rm -rf "$SP/pyarrow/include" \
+ && { find "$SP" -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true; } \
+ && du -sm "$SP"
 # Precompile everything: the container's disk is read-only, so Python can't write a .pyc cache at run time and every
 # `pico` command (each Slack task, each scheduled question) would recompile ~3,200 files (~5 s). Hash-checked .pyc stay
 # valid however the copy below sets file times. Pico's own code must compile, so a syntax error there fails the
