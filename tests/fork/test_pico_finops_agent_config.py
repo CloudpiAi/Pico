@@ -227,7 +227,9 @@ NON_PROFILE_ENV = {"FOCUS_SCHEDULE", "SLACK_NOTIFY_CHANNEL", "FOCUS_ALERT_INCREA
                    "FOCUS_ASK_MAX_PER_DAY",
                    "FOCUS_REPORT_ALLOW_MENTIONS",
                    # Slack answer hardening (read by pico_finops_agent/slack_guard.py, checked by the entrypoint)
-                   "AGENT_HISTORY_TURNS", "AGENT_ANSWER_DEADLINE_S", "AGENT_QUESTIONS_PER_HOUR"}
+                   "AGENT_HISTORY_TURNS", "AGENT_ANSWER_DEADLINE_S", "AGENT_QUESTIONS_PER_HOUR",
+                   # model-call log (pico_finops_agent/llm_log.py): keep failed requests on the data volume
+                   "AGENT_SAVE_FAILED_CALLS"}
 
 
 def test_env_example_matches_profile():

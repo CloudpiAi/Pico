@@ -313,3 +313,64 @@ def test_bare_ids_on_their_own_lines_are_read():
 def test_a_bare_id_in_prose_or_an_instance_type_is_not_a_task():
     text = "I've scheduled a reminder (t58) for you. It checks t3.micro costs. • *t7*: Cost by service • Status: Active"
     assert parse_task_list(text) == {"t7": "active"}
+
+
+SORRY_TEXT = "Sorry, I couldn't answer that just now. Please ask again in a moment."
+TOO_LONG_TEXT = "That took too long to work out. Please try a narrower question, for example one service or one month."
+
+
+@pytest.mark.parametrize("text", [SORRY_TEXT, TOO_LONG_TEXT])
+def test_the_agents_cant_answer_sentence_is_a_failed_reply(text):
+    """sch_ask_not_met passed on 2026-11-13 although the bot only said SORRY (a task appeared by accident)."""
+    reply = _by_name(judge_reply("c", Expect(), "done", [text]))["reply"]
+    assert reply.status == "FAIL"
+    assert "couldn't answer" in reply.detail and text[:40] in reply.detail
+
+
+def test_a_refusal_case_may_end_in_sorry():
+    # reaction "any": the refusal cases only need the bad thing not to happen
+    assert _by_name(judge_reply("c", Expect(reaction="any"), "done", [SORRY_TEXT]))["reply"].status == "PASS"
+
+
+def test_sorry_plus_a_real_answer_passes():
+    checks = _by_name(judge_reply("c", Expect(), "done", [SORRY_TEXT, "EC2 cost $72.80 in October."]))
+    assert checks["reply"].status == "PASS"
+
+
+def test_the_sentences_match_the_agent():
+    from pico_finops_agent import slack_guard
+
+    assert (SORRY_TEXT, TOO_LONG_TEXT) == (slack_guard.SORRY, slack_guard.TOO_LONG)
+    from tests.e2e.standalone_ui.checks import CANT_ANSWER
+
+    assert set(CANT_ANSWER) == {slack_guard.SORRY, slack_guard.TOO_LONG}
+
+
+# live 2026-11-13 12:00: plain ids after a bullet, an em dash before the name, status in brackets
+PLAIN_DASH_LIST = (
+    "Here are your scheduled tasks: • t7 — Cost by service daily (active, report) • Schedule: Daily at 12:34 PM "
+    "(Asia/Kolkata) to your DM • t56 — Daily AWS cost report (active, report) • t57 — Amazon S3 cost report "
+    "(paused, ask) • t167 — Daily EC2 cost and usage (active, report) • t183 — Review AWS bill (paused, reminder)"
+)
+
+
+def test_plain_ids_with_a_dash_parse():
+    assert parse_task_list(PLAIN_DASH_LIST) == {"t7": "active", "t56": "active", "t57": "paused",
+                                                "t167": "active", "t183": "paused"}
+
+
+@pytest.mark.parametrize("text", [
+    "You have 5 scheduled tasks:\n• t7 – Cost by service daily (active, report)\n• t183 - Review AWS bill (paused)",
+    "• t7 — Cost by service daily (active)\n• t183 — Review AWS bill (paused)",
+])
+def test_plain_ids_with_any_dash_parse(text):
+    assert parse_task_list(text) == {"t7": "active", "t183": "paused"}
+
+
+@pytest.mark.parametrize("text", [
+    "Your EC2 fleet runs t3 — mostly t3.micro instances (active)",  # an instance family, not a task
+    "We moved from t2 - to t3.micro last month",
+])
+def test_instance_types_are_not_task_ids(text):
+    with pytest.raises(ValueError):
+        parse_task_list(text)

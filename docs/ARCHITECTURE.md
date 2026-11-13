@@ -131,7 +131,7 @@ The repository has four areas. Each one has a clear job.
 | File | What is in it |
 |---|---|
 | `.env` (from `.env.example`) | Every customer value: AWS buckets and ARNs, schedule, alert thresholds, LLM provider and key, Slack tokens. Read by Docker Compose (`env_file`). Never committed, never in the image. |
-| `pico_finops_agent/.env.example` | The full list of settings, including optional ones the root `.env.example` doesn't show (`AGENT_HISTORY_TURNS`, `AGENT_ANSWER_DEADLINE_S`, `AGENT_QUESTIONS_PER_HOUR`, `FOCUS_REPORT_*`). |
+| `pico_finops_agent/.env.example` | The full list of settings, including optional ones the root `.env.example` doesn't show (`AGENT_HISTORY_TURNS`, `AGENT_ANSWER_DEADLINE_S`, `AGENT_QUESTIONS_PER_HOUR`, `AGENT_SAVE_FAILED_CALLS`, `FOCUS_REPORT_*`). |
 | `deploy/pico-finops-agent.yml` | Pico's `agent.yml` profile. It is copied into the image as `/home/pico/.pico/conf/agent.yml`. It holds no secrets: every customer value is a `${VAR}` placeholder. It sets the read-only datasource, the tool permissions, the bash allow-list, the plugins and the Slack channel. |
 | `docker-compose.yml` | The container: image, host networking, read-only root, tmpfs mounts, dropped capabilities, resource limits. |
 | `docker-compose.build.yml` | Add this to build the image locally instead of pulling it. |
