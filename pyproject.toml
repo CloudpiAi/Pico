@@ -4,7 +4,7 @@ name = "pico-agent"
 version = "0.2.0"
 description = "Pico FinOps Agent: answers AWS cost questions in Slack from your own FOCUS billing export (fork of Datus-agent 0.4.1)"
 readme = "README.md"
-requires-python = ">=3.12,<3.13"
+requires-python = ">=3.13,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE*"]
 authors = [
@@ -24,13 +24,13 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "datus-db-core>=0.1.7",
     "datus-storage-base>=0.1.5,<0.2.0",
     "python-dotenv==1.2.2",
-    "pandas==2.1.4",
+    "pandas==2.3.3",
     "sqlalchemy==2.0.23",
     "sqlglot>=26.12.0,<31",
     "pyyaml==6.0.3",
@@ -60,10 +60,10 @@ dependencies = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
-    # Floor: litellm before 1.95.0 has Critical and known-exploited vulnerabilities (and 1.82.7/1.82.8 were
-    # malicious releases). It needs httpx>=0.28 and pyyaml>=6.0.3. The floor also keeps the resolver away from the
-    # 1.92-1.95 sdists, which ship no macOS or Windows wheels.
-    "litellm>=1.106.5,<2",
+    # Floor: litellm before 1.95.0 has Critical and known-exploited vulnerabilities, and 1.109 is the first that allows
+    # filelock 4 (see [tool.uv] constraint-dependencies). 1.82.7, 1.82.8 and 1.107.0 were malicious releases
+    # (docs.litellm.ai incident reports) and are excluded. It needs httpx>=0.28 and pyyaml>=6.0.3.
+    "litellm>=1.109.1,<2,!=1.107.0",
     "pydantic>=2.11.7,<3.0",
     "lancedb==0.34.0",
     # This library is required by lancedb
@@ -155,9 +155,18 @@ exclude = ["benchmark*", "docs*", "plugins.focus*", "plugins.schedule*", "pico_f
 "pico.prompts.prompt_templates" = ["*.j2"]
 
 # Ruff: replaces black + isort + flake8
+# Security floors for transitive dependencies (not direct dependencies of Pico): each one is the first release
+# without a known vulnerability that the image scan (grype) or pip-audit reports. Raise, never lower.
+[tool.uv]
+constraint-dependencies = [
+    "filelock>=4.2.1",
+    "pygments>=2.20.0",
+    "soupsieve>=4.0.0",
+]
+
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py313"
 extend-exclude = ["mcp/"]
 
 [tool.ruff.format]
