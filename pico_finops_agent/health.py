@@ -18,7 +18,9 @@ The limit is down_limit(): 10 minutes, or PICO_FINOPS_AGENT_DOWN_LIMIT_S.
 """
 import json
 import os
+import stat
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -27,7 +29,6 @@ DOWN_LIMIT_S = 600  # the default limit: 10 minutes
 HEARTBEAT_MAX_AGE_S = 30
 EXIT_SLACK = 70
 EXIT_SCHEDULER = 71
-DEFAULT_PATH = "/tmp/pico-finops-agent-health.json"
 _FROZEN_STATES = ("connecting", "connected", "disconnected", "unreachable", "rejected")  # the thread samples these
 
 
@@ -88,8 +89,25 @@ def _slack_verdict(now, slack, limit):
     return Verdict("healthy", "")
 
 
+def private_dir():
+    """The agent's own folder in the temp folder: <tmp>/pico-finops-agent-<uid>, mode 0700.
+
+    The temp folder is shared (mode 1777), so a fixed file name there could be pre-created or symlinked by another
+    user. This folder is created by this user only, and is refused unless it is a real directory (not a link) that
+    this user owns and nobody else can enter."""
+    path = os.path.join(tempfile.gettempdir(), f"pico-finops-agent-{os.getuid()}")
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077:
+        raise PermissionError(f"{path} is not a private folder of this user (owner, link or mode is wrong)")
+    return path
+
+
 def heartbeat_path():
-    return os.environ.get("PICO_FINOPS_AGENT_HEALTH_FILE") or DEFAULT_PATH
+    return os.environ.get("PICO_FINOPS_AGENT_HEALTH_FILE") or os.path.join(private_dir(), "health.json")
 
 
 def write_heartbeat(path, payload):
@@ -101,9 +119,9 @@ def write_heartbeat(path, payload):
 
 def check(path=None, now=None):
     """0 when the heartbeat is fresh and healthy; else 1, printing why (Docker shows it in `docker inspect`)."""
-    path = path or heartbeat_path()
     now = time.time() if now is None else now
     try:
+        path = path or heartbeat_path()
         with open(path, encoding="utf-8") as fh:
             beat = json.load(fh)
     except (OSError, ValueError) as e:

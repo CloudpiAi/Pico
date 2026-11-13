@@ -4,7 +4,7 @@ name = "pico-agent"
 version = "0.2.0"
 description = "Pico FinOps Agent: answers AWS cost questions in Slack from your own FOCUS billing export (fork of Datus-agent 0.4.1)"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.13,<3.14"
 license = "Apache-2.0"
 license-files = ["LICENSE*"]
 authors = [
@@ -24,24 +24,24 @@ classifiers = [
     "Topic :: System :: Monitoring",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
     "datus-db-core>=0.1.7",
     "datus-storage-base>=0.1.5,<0.2.0",
-    "python-dotenv==1.0.0",
-    "pandas==2.1.4",
-    "sqlalchemy==2.0.23",
+    "python-dotenv==1.2.2",
+    "pandas==2.3.3",
+    "sqlalchemy==2.0.55",
     "sqlglot>=26.12.0,<31",
-    "pyyaml==6.0.1",
+    "pyyaml==6.0.3",
     "packaging>=21.0",
     "structlog>=23.1.0",
-    # Floor: openai-agents 0.13.x requires openai>=2.26. Cap below 2.45.0: openai
+    # Floor: openai-agents 0.14.x requires openai>=2.26. Cap below 2.45.0: openai
     # 2.45.0 made ``InputTokensDetails.cache_write_tokens`` a required field and
     # ``pico/models/claude_model.py`` still constructs ``InputTokensDetails``
     # without it. Lift the cap together with that code.
     "openai>=2.26.0,<2.45.0",
-    "httpx[socks]==0.27.2",
+    "httpx[socks]>=0.28.1,<1",
     "tantivy>=0.22.2",
     "aiohttp>=3.11.16",
     # Pico's Slack gateway (pico/gateway); Socket Mode uses aiohttp above.
@@ -55,21 +55,19 @@ dependencies = [
     # them. xlrd covers legacy .xls, which DuckDB does not support at all.
     "openpyxl>=3.1.5",
     "xlrd>=2.0.1",
-    "openai-agents[litellm]==0.13.4",
+    "openai-agents[litellm]==0.14.8",
     "openinference-instrumentation-openai-agents==1.6.2",
     "opentelemetry-api>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
-    # Upper bound tracks the ``httpx[socks]==0.27.2`` pin above: litellm 1.83.1+ requires
-    # ``httpx==0.28.1`` / ``httpx>=0.28``, so nothing above 1.83.0 can ever be selected.
-    # Without the bound, pip backtracks from the newest release through ~90 versions and
-    # source-builds the 1.92-1.95 sdists, which ship no macOS or Windows wheels — minutes
-    # stuck on "Preparing metadata". Lift this bound only together with the httpx pin.
-    "litellm>=1.67.4.post1,<1.83.1",
+    # Floor: litellm before 1.95.0 has Critical and known-exploited vulnerabilities, and 1.109 is the first that allows
+    # filelock 4 (see [tool.uv] constraint-dependencies). 1.82.7, 1.82.8 and 1.107.0 were malicious releases
+    # (docs.litellm.ai incident reports) and are excluded. It needs httpx>=0.28 and pyyaml>=6.0.3.
+    "litellm>=1.109.1,<2,!=1.107.0",
     "pydantic>=2.11.7,<3.0",
     "lancedb==0.34.0",
     # This library is required by lancedb
-    "pyarrow<19.0.0",
+    "pyarrow>=23.0.1,<24",
     "rich==14.0.0",
     "prompt_toolkit>=3.0.51",
     "pygments>=2.18.0",
@@ -85,7 +83,7 @@ dependencies = [
     "uvicorn>=0.24.0",
     "pyperclip==1.9.0",
     "wcmatch>=10.0",
-    "fastembed==0.4.2",
+    "fastembed==0.9.1",
     # Optional: install torch manually to enable reranker models.
     "charset-normalizer>=3.4.2",
     "defusedxml>=0.7.1",
@@ -157,9 +155,18 @@ exclude = ["benchmark*", "docs*", "plugins.focus*", "plugins.schedule*", "pico_f
 "pico.prompts.prompt_templates" = ["*.j2"]
 
 # Ruff: replaces black + isort + flake8
+# Security floors for transitive dependencies (not direct dependencies of Pico): each one is the first release
+# without a known vulnerability that the image scan (grype) or pip-audit reports. Raise, never lower.
+[tool.uv]
+constraint-dependencies = [
+    "filelock>=4.2.1",
+    "pygments>=2.20.0",
+    "soupsieve>=4.0.0",
+]
+
 [tool.ruff]
 line-length = 120
-target-version = "py312"
+target-version = "py313"
 extend-exclude = ["mcp/"]
 
 [tool.ruff.format]

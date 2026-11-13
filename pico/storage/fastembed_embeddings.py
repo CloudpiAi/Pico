@@ -93,7 +93,12 @@ class FastEmbedEmbeddings(BaseModel, EmbeddingFunction):
                 self._dim_size = dims
             else:
                 logger.info("Use model description to resolve dim size")
-                self._dim_size = TextEmbedding._get_model_description(self.name).get("dim")
+                # Pico patch: fastembed 0.5+ returns a description object; older releases returned a dict.
+                description = TextEmbedding._get_model_description(self.name)
+                if isinstance(description, dict):
+                    self._dim_size = description.get("dim")
+                else:
+                    self._dim_size = getattr(description, "dim", None)
         return int(self._dim_size)
 
     def generate_embeddings(self, texts: Union[List[str], np.ndarray], *args, **kwargs) -> List[List[float]]:

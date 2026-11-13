@@ -12,13 +12,11 @@ A post (chat.postMessage) is tried again only when Slack surely didn't take it (
 connection never opened); a timeout or reset while talking may have posted it, so it is `slack_unsure` and never
 sent again (at most once). Notices pass tries=1, so a Slack outage can't hold the caller for long.
 """
-import json
 import os
 import re
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+
+import httpx
 
 API = "https://slack.com/api/"
 TIMEOUT_S = 15
@@ -63,12 +61,12 @@ class SlackError(Exception):
 
 
 def _http(token):
+    """The real transport: one form POST to the Slack Web API with httpx (as the rest of Pico uses), the token in the
+    Authorization header only. An error status raises httpx.HTTPStatusError."""
     def transport(method, params):
-        req = urllib.request.Request(API + method, data=urllib.parse.urlencode(params).encode(),
-                                     headers={"Authorization": f"Bearer {token}",
-                                              "Content-Type": "application/x-www-form-urlencoded"})
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as r:
-            return json.loads(r.read() or b"{}"), {k.lower(): v for k, v in r.headers.items()}
+        r = httpx.post(API + method, data=params, headers={"Authorization": f"Bearer {token}"}, timeout=TIMEOUT_S)
+        r.raise_for_status()
+        return (r.json() if r.content else {}), {k.lower(): v for k, v in r.headers.items()}
 
     return transport
 
@@ -90,13 +88,12 @@ class Client:
         for attempt in range(tries):
             try:
                 body, headers = self._t(method, params)
-            except urllib.error.HTTPError as e:  # 429 / 5xx: temporary; another status: Slack refused it
-                status, after = e.code, (e.headers.get("Retry-After") if e.headers else None)
-                e.close()
+            except httpx.HTTPStatusError as e:  # 429 / 5xx: temporary; another status: Slack refused it
+                status, after = e.response.status_code, e.response.headers.get("Retry-After")
                 if status != 429 and status < 500:
                     raise SlackError("slack_error", method) from None
                 wait = _retry_after(after, attempt)
-            except urllib.error.URLError:  # the connection never opened: nothing was sent
+            except (httpx.ConnectError, httpx.ConnectTimeout):  # the connection never opened: nothing was sent
                 wait = _retry_after(None, attempt)
             except Exception:  # timeout / reset while talking; `from None` so no traceback can carry the token
                 if method in _POSTS:

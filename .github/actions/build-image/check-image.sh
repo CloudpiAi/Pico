@@ -17,7 +17,7 @@ if run sh "$IMG" -c '
   ! find /app /home/pico -path "*/plugins/cloudpi" | grep -q . &&
   test ! -e /app/.venv/bin/pico-cloudpi && test ! -e /app/deploy/agent.yml &&
   ! grep -rqsE "^[[:space:]]*(from|import) plugins[.]cloudpi" --include="*.py" /app &&
-  ! grep -rqs "plugins.cloudpi" /app/.venv/lib/python3.12/site-packages/*.dist-info/entry_points.txt'; then
+  ! grep -rqs "plugins.cloudpi" /app/.venv/lib/python3.13/site-packages/*.dist-info/entry_points.txt'; then
   ok "no CloudPi platform code"
 else bad "CloudPi platform code is in the image"; fi
 

@@ -8,8 +8,8 @@ import io
 import json
 import subprocess
 import sys
-import urllib.error
 
+import httpx
 import pytest
 
 from pico_finops_agent import agent, cli, health
@@ -133,20 +133,20 @@ def test_slack_check_off_without_tokens(monkeypatch):
     ([{"ok": True, "user": "pico_finops_agent", "team": "Acme"}, {"ok": True}], True, "@pico_finops_agent"),
     ([{"ok": False, "error": "invalid_auth"}, {"ok": True}], False, "bot token"),
     ([{"ok": True, "user": "b", "team": "t"}, {"ok": False, "error": "invalid_auth"}], False, "app-level token"),
-    (OSError("no route"), False, "unreachable"),
+    (httpx.ConnectError("no route"), False, "unreachable"),
 ])
 def test_slack_check(monkeypatch, answers, ok, word):
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-1-x")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-x")
     calls = []
 
-    def fake_urlopen(req, timeout=None):
-        calls.append(req)
+    def fake_post(url, headers=None, timeout=None):
+        calls.append(url)
         if isinstance(answers, Exception):
             raise answers
-        return Resp(json.dumps(answers[len(calls) - 1]).encode())
+        return httpx.Response(200, json=answers[len(calls) - 1], request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(agent.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(agent.httpx, "post", fake_post)
     got_ok, line = cli.slack_check()
     assert got_ok is ok and word in line
     assert "xoxb-x" not in line and "xapp-1-x" not in line
@@ -163,6 +163,17 @@ LLM_ENV = ("GEMINI_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "DEEPSEEK_AP
            "AGENT_LLM_PROVIDER", "AGENT_LLM_MODEL")
 
 
+def _fake_get(seen, outcome):
+    """A stand-in for httpx.get: records the request; answers 200, the given status, or raises the given error."""
+    def get(url, headers=None, timeout=None):
+        req = httpx.Request("GET", url, headers=headers)
+        seen.append(req)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return httpx.Response(200 if outcome == "ok" else outcome, json={"data": []}, request=req)
+    return get
+
+
 @pytest.fixture
 def no_llm_env(monkeypatch):
     for name in LLM_ENV:
@@ -173,30 +184,24 @@ def no_llm_env(monkeypatch):
 @pytest.mark.parametrize("provider,key_env,host,header", PROVIDERS)
 @pytest.mark.parametrize("outcome,ok,word", [
     ("ok", True, "accepted"),
-    (urllib.error.HTTPError("u", 400, "Bad Request", {}, None), False, "refused"),
-    (urllib.error.HTTPError("u", 401, "Unauthorized", {}, None), False, "refused"),
-    (urllib.error.HTTPError("u", 403, "Forbidden", {}, None), False, "refused"),
-    (urllib.error.HTTPError("u", 500, "Server Error", {}, None), False, "unexpected"),
-    (urllib.error.URLError("no route"), False, "unreachable"),
+    (400, False, "refused"),
+    (401, False, "refused"),
+    (403, False, "refused"),
+    (500, False, "unexpected"),
+    (httpx.ConnectError("no route"), False, "unreachable"),
 ])
 def test_llm_check(no_llm_env, provider, key_env, host, header, outcome, ok, word):
     no_llm_env.setenv("AGENT_LLM_PROVIDER", provider)
     no_llm_env.setenv(key_env, "secret-llm-key")
     seen = []
 
-    def fake_urlopen(req, timeout=None):
-        seen.append(req)
-        if outcome != "ok":
-            raise outcome
-        return Resp(b'{"data": []}')
-
-    no_llm_env.setattr(cli.urllib.request, "urlopen", fake_urlopen)
+    no_llm_env.setattr(cli.httpx, "get", _fake_get(seen, outcome))
     got_ok, line = cli.llm_check()
     assert got_ok is ok and word in line and "secret-llm-key" not in line
     req = seen[0]
-    assert req.host == host
-    assert "secret-llm-key" not in req.full_url  # the key goes in a header, never in the URL
-    assert "secret-llm-key" in req.get_header(header)
+    assert req.url.host == host
+    assert "secret-llm-key" not in str(req.url)  # the key goes in a header, never in the URL
+    assert "secret-llm-key" in req.headers[header]
     if word == "refused":
         assert key_env in line
 
@@ -205,7 +210,7 @@ def test_llm_check_names_the_model(no_llm_env):
     no_llm_env.setenv("AGENT_LLM_PROVIDER", "openai")
     no_llm_env.setenv("AGENT_LLM_MODEL", "gpt-5.4-mini")
     no_llm_env.setenv("OPENAI_API_KEY", "k")
-    no_llm_env.setattr(cli.urllib.request, "urlopen", lambda req, timeout=None: Resp(b'{"data": []}'))
+    no_llm_env.setattr(cli.httpx, "get", _fake_get([], "ok"))
     ok, line = cli.llm_check()
     assert ok and "OpenAI" in line and "gpt-5.4-mini" in line
 
@@ -226,10 +231,10 @@ def test_llm_check_unknown_provider(no_llm_env):
 def test_llm_check_default_is_gemini(no_llm_env):
     no_llm_env.setenv("GEMINI_API_KEY", "k")
     seen = []
-    no_llm_env.setattr(cli.urllib.request, "urlopen", lambda req, timeout=None: seen.append(req) or Resp(b"{}"))
+    no_llm_env.setattr(cli.httpx, "get", _fake_get(seen, "ok"))
     ok, line = cli.llm_check()
     assert ok and "Gemini" in line and "gemini-3.8-flash" in line
-    assert seen[0].host == "generativelanguage.googleapis.com"
+    assert seen[0].url.host == "generativelanguage.googleapis.com"
 
 
 def test_focus_status_reads_the_plugins_json(monkeypatch):

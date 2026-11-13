@@ -113,7 +113,7 @@ Types:
 
 ## Running the tests
 
-You need Python 3.12 and [uv](https://docs.astral.sh/uv/).
+You need Python 3.13 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 # Install the locked dependencies, the agent extra and the two plugins (the same set as the image)

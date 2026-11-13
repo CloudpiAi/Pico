@@ -1,6 +1,7 @@
 """loader/build_zip.py: reproducible zips and pinned downloads (offline parts; the real build runs in the Docker image build)."""
 import hashlib
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -38,3 +39,9 @@ def test_update_pins_records_the_hash():
     pins = {}
     build_zip._checked("y", b"data", pins, update=True)
     assert pins == {"y": hashlib.sha256(b"data").hexdigest()}
+
+
+@pytest.mark.parametrize("url", ["file:///etc/passwd", "http://pypi.org/pypi/duckdb/json", "ftp://example.com/x"])
+def test_downloads_refuse_anything_but_https(url):
+    with pytest.raises(urllib.error.URLError, match="unknown url type"):
+        build_zip._fetch(url)

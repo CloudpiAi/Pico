@@ -3,7 +3,7 @@
 #   (or: docker build -t pico-finops-agent:local .). Released images: ghcr.io/cloudpiai/pico-finops-agent
 # No secret or customer setting goes in the image: they come from the customer's .env (docs/CUSTOMER-SETUP-GUIDE.md).
 # .dockerignore is an allow-list: only the files copied below are sent to the build.
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:73dbd1a2ad74137451593a8ac30f7bdd0f5010fc05fb34644190cffa7696bbf3
+ARG PYTHON_IMAGE=python:3.13.18-slim-bookworm@sha256:a5a7017efc5969e00ae2b91c8eb0631049a569652aa4ffc4501769049ae45c72
 
 # 1. The loader Lambda's two zips. The DuckDB wheel and extensions are checked against loader/pins.json.
 FROM ${PYTHON_IMAGE} AS zips
@@ -47,7 +47,9 @@ RUN /app/.venv/bin/python -m compileall -q -j 3 --invalidation-mode checked-hash
 # 3. What runs.
 FROM ${PYTHON_IMAGE}
 # /data is the volume (cache, state, logs); /pico-workspace is the agent's working folder.
-RUN useradd --create-home --uid 10001 pico \
+# The base image's pip is never used at run time (the container is read-only and installs nothing), so it goes.
+RUN python -m pip uninstall -y -q pip \
+ && useradd --create-home --uid 10001 pico \
  && mkdir -p /data /pico-workspace /home/pico/.pico/conf /opt/pico-finops-agent-loader \
  && chown -R pico:pico /data /pico-workspace /home/pico/.pico
 WORKDIR /app

@@ -1,7 +1,7 @@
 """pico_finops_agent/entrypoint.sh: start-time check of the .env values, then exec the command.
 
 Runs the script with POSIX ``sh`` and a controlled environment (nothing inherited from the runner
-except PATH). Linux only (dash on python:3.12-slim); run the tests on Linux.
+except PATH). Linux only (dash on python:3.13-slim); run the tests on Linux.
 """
 import os
 import subprocess

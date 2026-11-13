@@ -9,7 +9,7 @@ description = "Scheduled Slack tasks for a Pico agent: reminders, reports, saved
 requires-python = ">=3.12"
 license = "Apache-2.0"
 authors = [{ name = "PurpleData Inc." }]
-dependencies = ["apscheduler>=3.10,<4"]  # no DuckDB: only a data source (e.g. FocusSource) needs it
+dependencies = ["apscheduler>=3.10,<4", "httpx>=0.28.1,<1"]  # no DuckDB: only a data source (e.g. FocusSource) needs it
 
 [project.urls]
 Homepage = "https://github.com/CloudpiAi/Pico"

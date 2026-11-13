@@ -45,6 +45,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -497,20 +498,22 @@ def table_exists(tables, arn, namespace, name):
 
 
 def _load_extensions(c):
-    """Load the bundled extensions; /var/task is read-only, so fall back to a copy in /tmp."""
+    """Load the bundled extensions; /var/task is read-only, so fall back to a copy in the temp folder (Lambda's
+    /tmp is private to this function's sandbox)."""
     root = os.environ.get("LAMBDA_TASK_ROOT", os.path.dirname(os.path.abspath(__file__)))
     bundled = os.path.join(root, "duckdb_ext")
-    for ext_dir in (bundled, "/tmp/duckdb_ext"):
+    copy = os.path.join(tempfile.gettempdir(), "duckdb_ext")
+    for ext_dir in (bundled, copy):
         try:
-            if ext_dir.startswith("/tmp") and not os.path.isdir(ext_dir):
-                shutil.copytree(bundled, ext_dir)
+            if ext_dir == copy and not os.path.isdir(copy):
+                shutil.copytree(bundled, copy)
             c.sql(f"SET extension_directory = {q_str(ext_dir)}")
             for ext in EXTENSIONS:
                 c.sql(f"LOAD {ext}")
             return
-        except Exception as e:  # noqa: BLE001 - try the /tmp copy before giving up
+        except Exception as e:  # noqa: BLE001 - try the temp-folder copy before giving up
             _log("extensions_load_retry", dir=ext_dir, error=f"{type(e).__name__}: {str(e)[:200]}")
-    raise RuntimeError("could not load DuckDB extensions from the bundle or /tmp")
+    raise RuntimeError("could not load DuckDB extensions from the bundle or the temp folder")
 
 
 def connect(ev):
@@ -518,8 +521,9 @@ def connect(ev):
 
     c = duckdb.connect()
     c.sql("SET TimeZone = 'UTC'")  # a delivery TIMESTAMP without a zone is cast to the table's TIMESTAMPTZ as UTC
-    c.sql("SET home_directory = '/tmp'")
-    c.sql("SET temp_directory = '/tmp/duck'")
+    tmp = tempfile.gettempdir()  # the only writable folder in Lambda
+    c.sql(f"SET home_directory = {q_str(tmp)}")
+    c.sql(f"SET temp_directory = {q_str(os.path.join(tmp, 'duck'))}")
     c.sql("SET autoinstall_known_extensions = false")
     c.sql("SET autoload_known_extensions = false")
     _load_extensions(c)

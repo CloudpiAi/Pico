@@ -230,9 +230,8 @@ def test_chat_run_inherits_the_guards_context():
 
 
 def test_ctx_line_accepts_every_retry_id():
-    from pico_plugin_schedule import slack_ctx
-
     from pico_finops_agent import slack_guard
+    from pico_plugin_schedule import slack_ctx
 
     key = "k" * 64
     second = slack_guard.retry_message_id("1731330000.123456")

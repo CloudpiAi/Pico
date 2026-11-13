@@ -18,9 +18,9 @@ import shlex
 import subprocess
 import threading
 import time
-import urllib.request
 from datetime import date, datetime, timedelta, timezone
 
+import httpx
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.schedulers.base import SchedulerNotRunningError
 from apscheduler.triggers.cron import CronTrigger
@@ -137,13 +137,10 @@ def notice_text(months, insights=None):
 
 
 def _post_slack(token, channel, text):
-    req = urllib.request.Request(
-        "https://slack.com/api/chat.postMessage",
-        data=json.dumps({"channel": channel, "text": text}).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-    )
-    with urllib.request.urlopen(req, timeout=15) as r:
-        body = json.loads(r.read() or b"{}")
+    r = httpx.post("https://slack.com/api/chat.postMessage", json={"channel": channel, "text": text},
+                   headers={"Authorization": f"Bearer {token}"}, timeout=15)
+    r.raise_for_status()
+    body = r.json() if r.content else {}
     if not body.get("ok"):
         raise RuntimeError(f"Slack said: {body.get('error', 'unknown error')}")
 

@@ -40,8 +40,18 @@ def sha256_b64(path):
     return base64.b64encode(h.digest()).decode()
 
 
+# Downloads go to fixed https:// hosts (pypi.org, files.pythonhosted.org, extensions.duckdb.org). This opener has the
+# HTTPS handler only, so a file://, plain http:// or other URL is refused instead of opened; HTTPS_PROXY still works.
+_HTTPS_ONLY = urllib.request.OpenerDirector()
+# UnknownHandler is what raises URLError("unknown url type") for every other scheme (without it, open() returns None).
+for _handler in (urllib.request.ProxyHandler(), urllib.request.UnknownHandler(), urllib.request.HTTPSHandler(),
+                 urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPRedirectHandler(),
+                 urllib.request.HTTPErrorProcessor()):
+    _HTTPS_ONLY.add_handler(_handler)
+
+
 def _fetch(url):
-    with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=180) as r:
+    with _HTTPS_ONLY.open(urllib.request.Request(url, headers=UA), timeout=180) as r:
         return r.read()
 
 

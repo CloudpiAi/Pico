@@ -1,8 +1,13 @@
 """One `llm_call` log line per model call: why the model stopped, tokens, which tools it called.
 
 Pico keeps a model's finish reason only on an OpenTelemetry span (pico/models/openai_compatible.py), which nothing
-collects here, so an empty Slack answer was logged as just `outcome "empty"`. With this, Gemini's
-`malformed_function_call` (it began a tool call and sent an empty one) is in `docker logs` for every call.
+collects here, so an empty Slack answer was logged as just `outcome "empty"`. With this, every call is in
+`docker logs` with its finish reason and whether the answer was empty (no text and no tool call).
+
+- Finish reason: litellm maps each provider's reason to an OpenAI one; Gemini's MALFORMED_FUNCTION_CALL (it began a
+  tool call and sent an empty one) becomes "stop" (litellm >= 1.106). Where litellm keeps the provider's own reason
+  (``provider_specific_fields["native_finish_reason"]``, non-streamed Gemini answers) that is logged instead; a
+  streamed Gemini answer doesn't carry it, so there the ``empty`` flag is the signal, and it is what the guard uses.
 
 - Seam: a wrapper around ``litellm.acompletion``, installed over Pico's own patch (pico/models/sdk_patches.py). The
   OpenAI Agents SDK calls it for every Slack model request. A streamed reply is watched as the caller reads it; the
@@ -81,9 +86,10 @@ class _Summary:
                 name = _get(_get(call, "function"), "name")
                 if name:
                     self.tools.append(name)
-            finish = _get(choice, "finish_reason")
+            native = _get(_get(choice, "provider_specific_fields"), "native_finish_reason")
+            finish = native or _get(choice, "finish_reason")
             if finish:
-                self.finish = str(finish)
+                self.finish = str(finish).lower()
         usage = _get(resp, "usage")
         if usage is not None:
             for field, name in (("prompt_tokens", "prompt_tokens"), ("output_tokens", "completion_tokens")):

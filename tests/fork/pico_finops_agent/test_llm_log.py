@@ -77,13 +77,15 @@ def run_stream(**extra):
     return asyncio.run(go())
 
 
-def test_streamed_malformed_call_is_logged_with_its_reason(wired):
+def test_a_streamed_empty_answer_is_logged_as_empty(wired):
+    """Gemini's MALFORMED_FUNCTION_CALL arrives from litellm (>= 1.106) as finish "stop" with no text and no tool call:
+    the call is logged as empty, which is what the guard acts on."""
     logs, set_reply, _ = wired
-    set_reply([chunk(finish="malformed_function_call", usage={"prompt_tokens": 16482, "completion_tokens": 0})])
+    set_reply([chunk(finish="stop", usage={"prompt_tokens": 16482, "completion_tokens": 0})])
     run_stream()
     assert [e for e, _ in logs] == ["llm_call"]
     f = logs[0][1]
-    assert f["finish"] == "malformed_function_call"
+    assert f["finish"] == "stop"
     assert f["empty"] is True
     assert f["prompt_tokens"] == 16482 and f["output_tokens"] == 0
     assert f["tools_called"] == [] and f["text_chars"] == 0
@@ -111,6 +113,16 @@ def test_non_streamed_answer(wired):
     assert f["finish"] == "stop" and f["text_chars"] == 14 and f["empty"] is False and f["output_tokens"] == 7
 
 
+def test_the_providers_own_finish_reason_is_logged_when_litellm_keeps_it(wired):
+    """A non-streamed Gemini answer carries the provider's reason in provider_specific_fields; that is logged."""
+    logs, set_reply, _ = wired
+    set_reply(litellm.ModelResponse(choices=[{"message": {"role": "assistant", "content": None}, "finish_reason": "stop",
+                                              "provider_specific_fields": {"native_finish_reason": "MALFORMED_FUNCTION_CALL"}}]))
+    asyncio.run(litellm.acompletion(**REQUEST))
+    f = logs[0][1]
+    assert f["finish"] == "malformed_function_call" and f["empty"] is True
+
+
 def test_a_failed_call_is_logged_and_still_raises(wired):
     logs, set_reply, _ = wired
     set_reply(litellm.RateLimitError("429 quota for key AIzaSECRET", llm_provider="gemini", model="m"))
@@ -135,7 +147,7 @@ def test_calls_inside_a_question_are_recorded_for_the_guard(wired):
 
     async def question():
         with llm_log.recording(rec):
-            set_reply([chunk(finish="malformed_function_call")])
+            set_reply([chunk(finish="stop")])  # an empty answer (no text, no tool call)
             await asyncio.ensure_future(_consume())  # a child task, like Pico's chat task
             rec.attempt = 2
             set_reply([chunk(tool="execute_sql"), chunk(finish="stop")])
@@ -147,8 +159,8 @@ def test_calls_inside_a_question_are_recorded_for_the_guard(wired):
             pass
 
     asyncio.run(question())
-    assert rec.finishes == ["malformed_function_call", "stop"]
-    assert [(f["qid"], f["attempt"]) for _, f in logs] == [("q1", 1), ("q1", 2)]
+    assert rec.finishes == ["stop", "stop"]
+    assert [(f["qid"], f["attempt"], f["empty"]) for _, f in logs] == [("q1", 1, True), ("q1", 2, False)]
 
 
 def test_outside_a_question_qid_is_none(wired):
@@ -168,7 +180,7 @@ def test_failed_call_request_saved_only_when_asked(monkeypatch, tmp_path):
     saved = tmp_path / "llm-failures"
 
     async def fake_acompletion(*args, **kwargs):
-        return FakeStream([chunk(finish="malformed_function_call")])
+        return FakeStream([chunk(finish="stop")])  # an empty answer
 
     monkeypatch.setattr(litellm, "acompletion", fake_acompletion)
     llm_log.install(log=lambda *a, **k: None, save_dir=str(saved), keep=2)
@@ -183,7 +195,7 @@ def test_failed_call_request_saved_only_when_asked(monkeypatch, tmp_path):
     files = sorted(saved.iterdir())
     assert len(files) == 2  # only the newest `keep`
     data = json.loads(files[-1].read_text())
-    assert data["finish"] == "malformed_function_call"
+    assert data["finish"] == "stop"
     assert data["messages"] == REQUEST["messages"]
     assert data["tools"] == ["execute_sql", "bash"]  # names only
     assert "AIzaSECRET" not in files[-1].read_text()

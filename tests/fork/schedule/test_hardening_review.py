@@ -11,9 +11,9 @@
 8. A question that couldn't finish gives its daily slot back.
 10. A task closed before closed_at existed is kept 30 days from now, not purged at once.
 13. Data tasks run on their own small pool, so they never hold up reminders."""
-import urllib.error
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -85,7 +85,7 @@ def test_a_post_whose_connection_never_opened_is_tried_again():
     def t(method, params):
         calls.append(method)
         if len(calls) == 1:
-            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+            raise httpx.ConnectError("refused")
         return {"ok": True, "ts": "1"}, {}
 
     assert slack_api.Client("xoxb-x", transport=t)._call("chat.postMessage")[0]["ok"] and len(calls) == 2
@@ -112,7 +112,7 @@ def test_a_failure_to_record_the_send_never_posts_again(rv, monkeypatch):
 # ---------- 3 ----------
 
 def test_a_notice_is_one_slack_try(rv):
-    rv["post"] = _raise(urllib.error.URLError(ConnectionRefusedError("refused")))
+    rv["post"] = _raise(httpx.ConnectError("refused"))
     runner._tell_owner(None, {"id": "t1", "owner": RAVI}, "hello")
     assert len(rv["posts"]()) == 2                                  # the owner once, then the admin once
 
