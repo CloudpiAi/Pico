@@ -12,6 +12,12 @@ All notable changes to Pico are recorded here. The format follows [Keep a Change
 
 - The image is now `ghcr.io/cloudpiai/pico` (was `ghcr.io/cloudpiai/pico-finops-agent`). `docker-compose.yml` pulls the new name. For now each release is also pushed to the old name (`:X.Y.Z` and `:latest`, the same image), so servers on the old name keep updating; move them to the new name, as the old one will stop getting releases.
 
+### Fixed
+
+- The 📊 notice no longer reports a sudden increase in the first week of a new AWS export: the usual daily cost is
+  averaged over the days the export covers, not over 7 days with the missing ones counted as $0. On the export's
+  first day no resource is reported as new.
+
 ## [0.3.0] - 2026-11-13
 
 **Upgrade notes:** the image now runs Python 3.13 (the loader Lambda keeps python3.12). Pull the new image and run

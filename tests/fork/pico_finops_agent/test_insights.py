@@ -109,3 +109,52 @@ def test_no_partial_day_when_the_data_ends_at_midnight(tmp_path):
     c.close()
     out = insights.compute(str(path), insights.Thresholds())
     assert out["last_full_day"] == "2026-11-09" and out["partial_day"] is None
+
+
+# ---------- a new export has less than a week of history: days without data are not days of zero spend ----------
+
+def _flat_cache(tmp_path, days, cost_per_day=100.0):
+    """An account that spends the same every day, with data for `days` full days ending on LAST."""
+    path = tmp_path / "focus.duckdb"
+    c = duckdb.connect(str(path))
+    c.sql("CREATE TABLE focus (chargeperiodstart TIMESTAMP, chargeperiodend TIMESTAMP, billedcost DOUBLE, "
+          "chargecategory VARCHAR, servicename VARCHAR, resourceid VARCHAR)")
+    for i in range(days):
+        d = LAST - timedelta(days=i)
+        for hour in range(24):
+            start = datetime(d.year, d.month, d.day, hour)
+            c.execute("INSERT INTO focus VALUES (?, ?, ?, 'Usage', 'Amazon EC2', 'i-1')",
+                      (start, start + timedelta(hours=1), cost_per_day / 24))
+    c.close()
+    return str(path)
+
+
+def test_flat_spend_with_three_days_of_history_is_not_an_increase(tmp_path):
+    out = insights.compute(_flat_cache(tmp_path, days=4), insights.Thresholds())
+
+    assert out["latest_day_cost"] == pytest.approx(100.0)
+    assert out["avg7"] == pytest.approx(100.0)                      # 3 days of $100, not $300 / 7
+    assert out["spikes"] == []
+
+
+def test_the_first_day_of_data_has_no_baseline_and_no_new_resources(tmp_path):
+    out = insights.compute(_flat_cache(tmp_path, days=1), insights.Thresholds())
+
+    assert out["avg7"] == 0
+    assert out["spikes"] == [] and out["stopped"] == []
+    assert out["new_resources"] == {"count": 0, "cost": 0}         # nothing to compare with, so nothing is "new"
+
+
+def test_a_service_that_started_mid_week_still_counts_as_an_increase(tmp_path):
+    path = _flat_cache(tmp_path, days=8, cost_per_day=10.0)
+    c = duckdb.connect(path)
+    for i in range(3):  # Amazon S3 only in the last 3 days, $20 each
+        d = LAST - timedelta(days=i)
+        c.execute("INSERT INTO focus VALUES (?, ?, 20.0, 'Usage', 'Amazon S3', 'bucket-1')",
+                  (datetime(d.year, d.month, d.day, 12), datetime(d.year, d.month, d.day, 13)))
+    c.close()
+
+    out = insights.compute(path, insights.Thresholds())
+
+    s3 = [s for s in out["spikes"] if s["name"] == "Amazon S3"]
+    assert s3 and s3[0]["avg7"] == pytest.approx(40.0 / 7, abs=0.01)       # the account has a full week: S3 was $0 on 5 days
