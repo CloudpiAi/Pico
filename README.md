@@ -6,181 +6,157 @@
 [![Release](https://img.shields.io/github/v/release/CloudpiAi/Pico)](https://github.com/CloudpiAi/Pico/releases)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Pico is an **open-source AI FinOps analyst** for startups and teams. Ask Pico about your AWS costs in Slack, and it answers your questions and monitors for unexpected spending.
+**Ask about your AWS costs in Slack, and get an answer in plain words.** Pico is an open-source FinOps analyst that runs in your own AWS account, reads your AWS billing export, answers questions, and tells you when spending jumps.
 
-**Your data stays in your AWS account.** Pico runs on a single EC2 instance in your account. It reads your AWS billing data (FOCUS exports) and keeps everything in your own S3 buckets. Nothing is sent to Pico FinOps or any third party — only questions and answers go to your chosen language model (Gemini by default, or OpenAI, Anthropic Claude, or DeepSeek).
+<!-- TODO: add a screenshot or short GIF of a Slack answer and the 📊 summary, e.g.
+     ![Pico answering a cost question in Slack](docs/images/slack-answer.png) -->
 
-## What can Pico do?
+- **Your data stays in your AWS account.** Pico runs on one EC2 server you own and keeps the cost data in your S3 buckets.
+- **It lives in Slack.** Ask in a channel or a direct message; summaries and alerts arrive where your team already works.
+- **Open source and self-hosted.** Apache 2.0, no account to sign up for, no access keys to hand over.
 
-Ask Pico questions about your costs — **right in Slack:**
+## What you can do
 
-```
-@Pico what did I spend on AWS in October?
-@Pico which service grew the most this week?
-@Pico show me EC2 costs by region for September
-```
-
-Pico also **watches your costs automatically:**
-
-- **Twice daily summaries** — Posts what changed yesterday, the month so far, and any sudden increases
-- **Cost alerts** — Warns you about unexpected spikes or unusual patterns
-- **Data stays local** — All cost data lives in your S3, not in a third-party database
-
-## Architecture
-
-Everything inside the dashed box runs **in your AWS account**. Only Slack and the language model are external.
+**Ask questions** — mention the bot in a channel it's in, or send it a direct message:
 
 ```
-┌─────────────────────────────────────────────┐
-│            Your AWS Account                 │
-│                                             │
-│  AWS Billing ──┐                           │
-│                ├─→ S3 (FOCUS export)       │
-│                │                           │
-│                └─→ Lambda (loader)         │
-│                    ├─→ S3 (cost table)     │
-│                    └─→ S3 (state/progress) │
-│                                             │
-│  EC2 (Docker container)                     │
-│  ├─ Data loader (runs 2x daily)             │
-│  ├─ Local cost data cache                   │
-│  ├─ Slack bot (listens for questions)       │
-│  └─ Query executor                          │
-│                                             │
-└─────────────────────────────────────────────┘
-         ↓                        ↑
-       Slack                     LLM
-   (questions/answers)    (Gemini, OpenAI, Claude, DeepSeek)
+@Pico FinOps Agent what did I spend on AWS in October?
+@Pico FinOps Agent top 5 services this month
+@Pico FinOps Agent why did EC2 cost go up yesterday?
+@Pico FinOps Agent when was the cost data last updated?
 ```
 
-### Data flow
+**Get told automatically** — after each data load (06:00 and 18:00 UTC by default) Pico posts in its channel:
 
-1. **AWS Billing** writes FOCUS cost exports to your S3 export bucket once daily
-2. **Pico loader Lambda** runs at 06:00 and 18:00 UTC, reads new export files, and writes rows to a cost table in S3
-3. **Pico on EC2** syncs the cost table into a fast local copy and posts a daily summary in Slack
-4. **Slack user asks** `@Pico what did I spend?`
-5. **Pico queries** its local copy and sends the results + question to the LLM
-6. **LLM writes** a short answer; Pico posts it back in Slack
+| Message | What it tells you |
+|---|---|
+| 📊 **Fresh cost data is in…** | Yesterday vs. usual, the month so far, sudden increases, new resources |
+| ⚠️ **No new AWS cost data for N days** | Your AWS export may have stopped |
+| ⚠️ **I couldn't refresh the cost data: …** | Something broke, and what to fix (sent once per problem) |
 
-### What's included
+**Schedule things** — just ask in Slack:
 
-| Component | Purpose | Runs where |
-|-----------|---------|------------|
-| Docker Compose config | Define the Pico container, volumes, environment | Your EC2 |
-| IAM policies | EC2 and Lambda role definitions with minimal permissions | AWS IAM |
-| Customer setup guide | Step-by-step to get Pico running | This repository |
-| `.env.example` | Configuration template (Slack tokens, LLM choice, etc.) | Your EC2 |
+```
+@Pico FinOps Agent every Monday at 9 send this channel the cost by service
+@Pico FinOps Agent every day check EC2 cost; only tell me if it's over $200
+@Pico FinOps Agent remind me on Friday at 4 to stop the dev instances
+```
 
-The **agent code** (query execution, Slack integration, LLM interaction) is in this repository. Each release's image is built and checked by this repository's GitHub Actions and published as `ghcr.io/cloudpiai/pico-finops-agent` (public, no login). You can also build it yourself from this repository with `docker-compose.build.yml`.
+Anyone can schedule tasks to their own DM. To let people post tasks in a channel, list their Slack user IDs in `FOCUS_REPORT_CREATORS` in `.env` (see the scheduled-task settings in [`.env.example`](.env.example)).
 
-## Getting started
+## Quick start
 
-1. **Read the [setup guide](docs/CUSTOMER-SETUP-GUIDE.md)** — Step-by-step instructions to run Pico on your EC2
-2. **Prepare your AWS account** — Create S3 buckets, set up IAM roles (use the policies in `policies/aws/`)
-3. **Pull the image** (`docker compose pull`, or build it yourself) and start the container with your `.env` configuration
-4. **Ask Pico a question in Slack** and get an answer
+**You need:**
 
-**Estimated setup time:** 20–30 minutes for first-time AWS users
+- [ ] Admin access to an AWS account (for the one-time setup)
+- [ ] A Slack workspace where you can create apps
+- [ ] An API key for one language model: Google Gemini (default), OpenAI, Anthropic Claude or DeepSeek
+- [ ] A web browser — you run every command in AWS CloudShell or on the EC2 server, so nothing is installed on your computer
 
-## Features
+Pick **one AWS Region** and use it for everything. Setup takes about an hour the first time. The [setup guide](docs/CUSTOMER-SETUP-GUIDE.md) walks through each step and has a [worksheet](docs/CUSTOMER-SETUP-GUIDE.md#3-your-setup-worksheet) for the values you collect on the way.
 
-- ✅ **AI-powered cost analysis** — Ask natural language questions about your AWS spending
-- ✅ **Self-hosted** — Runs on your EC2, all data in your account
-- ✅ **Zero databases** — Uses S3 as the data store (no RDS, no separate DB)
-- ✅ **Multiple LLM options** — Gemini (default), OpenAI, Anthropic Claude, DeepSeek
-- ✅ **Automatic monitoring** — Daily summaries and alerts for cost anomalies
-- ✅ **Minimal IAM permissions** — Follows principle of least privilege
-- ✅ **Open source** — Apache 2.0 license; contribute improvements
+| Part | Steps |
+|---|---|
+| **A. Prepare AWS** | 1. [Turn on the AWS cost export](docs/CUSTOMER-SETUP-GUIDE.md#step-1-turn-on-the-aws-cost-export) · 2. [Create two storage buckets](docs/CUSTOMER-SETUP-GUIDE.md#step-2-create-two-storage-buckets) · 3. [Create the two permission roles](docs/CUSTOMER-SETUP-GUIDE.md#step-3-create-the-two-permission-roles) |
+| **B. Get your keys** | 4. [Get a language model API key](docs/CUSTOMER-SETUP-GUIDE.md#step-4-get-a-language-model-api-key) · 5. [Create the Slack app](docs/CUSTOMER-SETUP-GUIDE.md#step-5-create-the-slack-app) |
+| **C. Start the agent** | 6. [Launch the EC2 server](docs/CUSTOMER-SETUP-GUIDE.md#step-6-launch-the-ec2-server) · 7. [Configure and start the agent](docs/CUSTOMER-SETUP-GUIDE.md#step-7-configure-and-start-the-agent) · 8. [Confirm it works](docs/CUSTOMER-SETUP-GUIDE.md#step-8-confirm-it-works) |
+
+Step 7 on the EC2 server comes down to this:
+
+```bash
+git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
+cd ~/pico-finops-agent
+git checkout v0.2.0                # the latest release (see Releases)
+cp .env.example .env && nano .env  # fill in your worksheet values
+docker compose pull                # the released image, ghcr.io/cloudpiai/pico-finops-agent
+docker compose run --rm agent check    # checks your settings and permissions; posts nothing
+docker compose up -d
+```
+
+**It worked when** `docker compose ps` shows **healthy**, a 📊 **Fresh cost data is in…** message appears in Slack, and `@Pico FinOps Agent what did I spend this month?` gets an answer within about a minute.
+
+Rather build the image yourself? Use `docker compose -f docker-compose.yml -f docker-compose.build.yml build` instead of `docker compose pull`; everything that runs is in this repository.
+
+## How it works
+
+```
+                     Your AWS account
+ ┌──────────────────────────────────────────────────────────┐
+ │                                                          │
+ │  AWS Billing ──► S3 export bucket (daily FOCUS files)    │
+ │                        │                                 │
+ │                        ▼  1. new files                   │
+ │                  Loader Lambda (the agent creates it)    │
+ │                        │                                 │
+ │                        ▼  2. new rows                    │
+ │                  S3 table bucket (cost table)            │
+ │                        │                                 │
+ │                        ▼  3. synced copy                 │
+ │                  Pico agent on your EC2 (Docker)         │
+ │                                                          │
+ └───────────────────┬──────────────────────┬───────────────┘
+                     │                      │
+      4. question /  │                      │  5. question +
+         answer      ▼                      ▼     result rows
+                   Slack            Language model
+                                    (Gemini, OpenAI, Claude or DeepSeek)
+```
+
+1. **Every day** AWS writes your cost data (the [FOCUS](https://focus.finops.org/) export) into your export bucket.
+2. **Twice a day** the agent runs its loader Lambda, which adds only the new files to a cost table in S3.
+3. The agent copies the new rows to a fast local copy on its server and posts the 📊 summary in Slack.
+4. **When someone asks**, the agent sends the question to the language model, runs the read-only query it writes on the local copy, and posts the answer.
+
+**What leaves your AWS account:**
+
+| Data | Where it goes |
+|---|---|
+| Your full cost data | **Stays in your AWS account** |
+| AWS credentials | **None are created** — the agent uses IAM roles |
+| One question and the few rows that answer it | Your language model provider, to write the answer |
+| Answers and summaries | Your Slack |
+| Anything to the Pico maintainers | **Nothing** — no telemetry |
 
 ## Security and privacy
 
-- 🔒 **Your data, your infrastructure** — Nothing leaves your AWS account except questions sent to the LLM
-- 🔒 **IAM-based access** — EC2 instance assumes roles; no access keys needed
-- 🔒 **Read-only cost data** — Pico only reads FOCUS exports and the cost table, never modifies billing data
-- 🔒 **Encrypted secrets** — API keys and Slack tokens are read from `.env`, not stored in code
-- 🔒 **No telemetry** — Pico sends nothing to Pico FinOps or any other third party. Outbound traffic goes only to AWS, Slack and the language model you chose (the framework's optional OpenTelemetry tracing is off unless you configure an exporter)
-- 🔒 **Hardened container** — Runs as a non-root user on a read-only file system with all Linux capabilities dropped
-- 🔒 **Verifiable images** — Release images are built only by this repository's GitHub Actions; from the release after 0.2.0 on, each one also has a signed build-provenance attestation and an SBOM (`gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico`)
+- **No access keys.** The EC2 server and the loader each use an IAM role with [least-privilege policies](policies/aws/) that you can read before you apply them.
+- **Read-only on your costs.** Pico reads the export and its own cost table; it never changes billing data, and the queries the model writes run read-only.
+- **No inbound ports.** The server only makes outgoing HTTPS connections to AWS, Slack and your language model.
+- **Hardened container.** It runs as a non-root user on a read-only file system with all Linux capabilities dropped.
+- **Your keys stay on your server.** The Slack tokens and the model API key live in the `.env` file on your EC2 server — keep it readable only by you — never in the code or the image.
+- **Verifiable images.** Release images are built only by this repository's GitHub Actions. From the release after 0.2.0, each one has a signed build-provenance attestation and an SBOM: `gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico`
 
-See [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md) for a detailed privacy and data flow diagram, and [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for the threats we considered.
+More detail: the guide's [security summary](docs/CUSTOMER-SETUP-GUIDE.md#8-security-summary) and the [threat model](docs/THREAT-MODEL.md). **Found a security problem?** Report it privately — see [SECURITY.md](SECURITY.md), not a public issue.
 
-**Found a security problem?** Please report it privately — see [SECURITY.md](SECURITY.md). Don't open a public issue.
+## What it costs to run
 
-## Directory structure
-
-```
-.
-├── README.md                          # This file
-├── CONTRIBUTING.md                    # How to contribute (DCO sign-off, running the tests)
-├── SECURITY.md                        # How to report a vulnerability
-├── CHANGELOG.md                       # What changed in each release
-├── docker-compose.yml                 # Runs the released image (docker compose pull)
-├── docker-compose.build.yml           # Add it to build the image yourself
-├── Dockerfile                         # The image recipe (used by GitHub Actions and by you)
-├── .env.example                       # Configuration template
-├── policies/aws/                      # IAM role policies (apply these in your account)
-│   ├── ec2-role-policy.json          # Permissions for EC2 instance
-│   ├── ec2-role-trust.json           # Who can assume EC2 role
-│   ├── loader-role-policy.json       # Permissions for Lambda loader
-│   └── loader-role-trust.json        # Who can assume Lambda role
-├── pico_finops_agent/                 # The agent: Slack, scheduler, guards, health check
-├── plugins/                           # focus (cost data, loader) and schedule (Slack tasks) plugins
-├── loader/                            # Builds the loader Lambda and pins its DuckDB version
-├── pico/                              # The Pico framework (fork of Datus-agent, see NOTICE)
-├── tests/                             # Test suites (tests/fork is the agent's)
-├── docs/
-│   ├── CUSTOMER-SETUP-GUIDE.md       # Complete setup instructions
-│   ├── ARCHITECTURE.md               # How the code fits together
-│   └── THREAT-MODEL.md               # Threats and mitigations
-├── .github/                           # CI workflows, issue forms, Dependabot, CODEOWNERS
-├── LICENSE                            # Apache 2.0
-└── NOTICE                             # Attribution
-```
-
-## Running the tests
-
-```bash
-uv sync --dev --extra pico-finops-agent
-uv pip install --no-deps ./plugins/focus ./plugins/schedule
-uv run ruff check .
-uv run pytest tests/fork -m "not nightly and not product_e2e and not provider_health and not quarantine"
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md#running-the-tests) for details.
-
-## Contributing
-
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for:
-- How to propose changes or report bugs
-- Guidelines for documentation, IAM policies, and configurations
-- Commit message format, DCO sign-off and submission checklist
-
-Please read our [Code of Conduct](CODE_OF_CONDUCT.md). The project's roles and decision making are described in [GOVERNANCE.md](GOVERNANCE.md).
+| Item | Typical cost |
+|---|---|
+| EC2 server | One `t3.medium` (2 vCPU, 4 GB) or larger — the main cost |
+| S3 storage and the loader Lambda | Small: a few months of cost data and two short runs a day |
+| Language model | Depends on your provider, model and how many questions you ask |
+| Pico itself | Free and open source |
 
 ## Common questions
 
-**Q: Does Pico have access to my AWS credentials?**  
-A: No. Pico uses IAM roles; no access keys are created. The EC2 instance's IAM role is the only credential needed.
+**Can I use Pico with Azure or GCP?** Not yet — Pico supports AWS today. Other clouds are a future enhancement.
 
-**Q: Where does my cost data go?**  
-A: Entirely to your S3 buckets in your AWS account. The only data sent outside AWS is the question and result rows (to the LLM).
+**Which language model should I pick?** Gemini is the default and works well for cost questions. Switch with `AGENT_LLM_PROVIDER` (and optionally `AGENT_LLM_MODEL`) in `.env`.
 
-**Q: What language model should I use?**  
-A: Gemini is the default and works well for cost analysis. You can switch to OpenAI, Anthropic Claude, or DeepSeek in `.env`.
+**How much history does it keep?** Four months by default; change it with `FOCUS_MONTHS`. See the guide's [optional settings](docs/CUSTOMER-SETUP-GUIDE.md#5-using-the-agent).
 
-**Q: Can I use Pico with Azure or GCP?**  
-A: Currently, Pico supports AWS. Support for other clouds is tracked as a future enhancement.
+**Can I load the newest data right now?** Ask `@Pico FinOps Agent set up the cost agent`.
 
-**Q: How much does it cost to run?**  
-A: Primarily the EC2 instance cost (t3.medium recommended). S3 storage and Lambda invocations are minimal. LLM costs depend on your choice and usage.
+## Update, troubleshoot, get help
 
-**Q: How do I get help?**  
-A: Check [CUSTOMER-SETUP-GUIDE.md](docs/CUSTOMER-SETUP-GUIDE.md), then see [SUPPORT.md](SUPPORT.md) for where to ask questions and report bugs.
+- **Something isn't working?** The guide's [troubleshooting](docs/CUSTOMER-SETUP-GUIDE.md#6-troubleshooting) section lists the common messages and fixes.
+- **Update, stop or remove Pico:** see [updating, stopping and removing](docs/CUSTOMER-SETUP-GUIDE.md#7-updating-stopping-and-removing). What changed in each release is in the [changelog](CHANGELOG.md).
+- **Questions and bugs:** see [SUPPORT.md](SUPPORT.md).
+
+## Contributing
+
+Contributions are welcome — docs, IAM policies, deployment setups and code. Start with [CONTRIBUTING.md](CONTRIBUTING.md) (how to run the tests, DCO sign-off) and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) (how the code fits together). Everyone taking part follows our [Code of Conduct](CODE_OF_CONDUCT.md); how decisions are made is in [GOVERNANCE.md](GOVERNANCE.md).
 
 ## License
 
-Apache License 2.0 — See [LICENSE](LICENSE) for details.
-
----
-
-**Ready to get started?** → [Customer Setup Guide](docs/CUSTOMER-SETUP-GUIDE.md)
+[Apache License 2.0](LICENSE). Pico includes software derived from Datus-agent — see [NOTICE](NOTICE).
