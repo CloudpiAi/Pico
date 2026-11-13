@@ -470,7 +470,7 @@ Actions, public, no login needed):
 ```bash
 git clone https://github.com/CloudpiAi/Pico.git ~/pico-finops-agent
 cd ~/pico-finops-agent
-git checkout v0.2.0         # the latest release (Releases page)
+git checkout v0.3.0         # the latest release (Releases page)
 docker compose pull         # ghcr.io/cloudpiai/pico-finops-agent
 ```
 
@@ -649,7 +649,7 @@ please read the output before you share it.
 ```bash
 cd ~/pico-finops-agent
 git fetch --tags
-git checkout v0.2.0         # the release you want
+git checkout v0.3.0         # the release you want
 docker compose pull         # if you pin AGENT_IMAGE_TAG in .env, set it to the same version first
 docker compose run --rm agent check
 docker compose up -d

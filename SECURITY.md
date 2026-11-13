@@ -31,8 +31,8 @@ Security fixes go into the newest release line. Please upgrade to the latest rel
 
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | ✅ |
-| < 0.2   | ❌ |
+| 0.3.x   | ✅ |
+| < 0.3   | ❌ |
 
 ## Scope
 
@@ -54,7 +54,7 @@ Pico sends a question, and the rows it read to answer it, to the language model 
 
 ## Verifying a release image
 
-Release images are built and published only by this repository's GitHub Actions. From the release after 0.2.0 on, each image also has a signed build-provenance attestation and an SBOM (0.1.0 and 0.2.0 were published before this and have neither). To check an image before you run it:
+Release images are built and published only by this repository's GitHub Actions. From 0.3.0 on, each image also has a signed build-provenance attestation and an SBOM (0.1.0 and 0.2.0 were published before this and have neither). To check an image before you run it:
 
 ```bash
 gh attestation verify oci://ghcr.io/cloudpiai/pico-finops-agent:<version> -R CloudpiAi/Pico
