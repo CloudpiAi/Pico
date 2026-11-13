@@ -68,7 +68,7 @@ dependencies = [
     "lancedb==0.34.0",
     # This library is required by lancedb
     "pyarrow>=23.0.1,<24",
-    "rich==14.0.0",
+    "rich==15.0.0",
     "prompt_toolkit>=3.0.51",
     "pygments>=2.18.0",
     "textual[syntax]==5.1.1",
