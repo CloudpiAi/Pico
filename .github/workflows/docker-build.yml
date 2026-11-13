@@ -2,7 +2,8 @@ name: Pico / Build Docker Image
 
 # Builds the image exactly as a customer does (`docker compose build` uses the same Dockerfile) and checks it.
 # On a release tag vX.Y.Z (on main), the checked image is published to the GitHub Container Registry:
-#   ghcr.io/cloudpiai/pico-finops-agent:X.Y.Z and :latest   (no secret: the built-in GITHUB_TOKEN)
+#   ghcr.io/cloudpiai/pico-finops-agent:X.Y.Z, :pico_vX.Y.Z and :latest   (no secret: the built-in GITHUB_TOKEN)
+# X.Y.Z and pico_vX.Y.Z are two names for the same image (same digest).
 # Pull requests and main only build and check; they never publish.
 on:
   push:
@@ -145,6 +146,10 @@ jobs:
           [ -n "$DIGEST" ] || { echo "::error::no digest in the docker push output"; exit 1; }
           echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
           echo "Published $REGISTRY_IMAGE:$V ($DIGEST)" | tee -a "$GITHUB_STEP_SUMMARY"
+          # The same image under the release name servers pull by: pico_vX.Y.Z (only a tag, the layers are already there).
+          docker tag "$IMAGE" "$REGISTRY_IMAGE:pico_v$V"
+          docker push "$REGISTRY_IMAGE:pico_v$V"
+          echo "Published $REGISTRY_IMAGE:pico_v$V (same image)" | tee -a "$GITHUB_STEP_SUMMARY"
           # :latest only moves forward: a patch tag for an older line (v0.1.5 after v0.2.0) must not roll it back.
           NEWEST=$(git tag -l --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
           if [ "$NEWEST" = "$VERSION" ]; then

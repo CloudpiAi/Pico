@@ -4,6 +4,10 @@ All notable changes to Pico are recorded here. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- Release images are also tagged `pico_vX.Y.Z` (for example `ghcr.io/cloudpiai/pico-finops-agent:pico_v0.4.0`), the same image as `X.Y.Z`.
+
 ## [0.3.0] - 2026-11-13
 
 **Upgrade notes:** the image now runs Python 3.13 (the loader Lambda keeps python3.12). Pull the new image and run
