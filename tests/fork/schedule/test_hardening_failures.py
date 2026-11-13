@@ -5,10 +5,9 @@ didn't answer, the cost data couldn't be read) must not pause a task for good: S
 call, and a run that still fails is tried again in 5 minutes, at most 3 times, before the task is paused. Problems
 that a retry can't fix (bot not in the channel, channel archived, the person has left) pause at once with a clear
 message; when the owner can't be reached, the report admins are told instead."""
-import io
-import urllib.error
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -81,7 +80,8 @@ def _transport(answers):
 
 def _http_error(code, retry_after=None):
     headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
-    return urllib.error.HTTPError("https://slack.com/api/x", code, "err", headers, io.BytesIO(b""))
+    request = httpx.Request("POST", "https://slack.com/api/x")
+    return httpx.HTTPStatusError("err", request=request, response=httpx.Response(code, headers=headers, request=request))
 
 
 def test_a_429_is_retried_after_retry_after(no_sleep):
@@ -123,7 +123,7 @@ def test_a_permanent_error_is_not_retried(no_sleep):
 # ---------- a run that still fails is tried again, then paused ----------
 
 def _slack_down(p):
-    raise urllib.error.URLError(ConnectionRefusedError("connection refused"))  # surely not sent
+    raise httpx.ConnectError("connection refused")  # surely not sent
 
 
 def test_slack_down_during_a_send_keeps_the_task_and_retries_in_5_minutes(hw):

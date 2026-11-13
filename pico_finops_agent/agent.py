@@ -16,14 +16,14 @@ tests/fork/pico_finops_agent/test_agent.py::test_pico_gateway_internals_the_agen
 """
 import argparse
 import asyncio
-import json
 import logging
 import os
 import signal
 import sys
 import threading
 import time
-import urllib.request
+
+import httpx
 
 from pico_finops_agent import bash_guard, health, llm, scheduler
 from pico_finops_agent.log import describe
@@ -89,9 +89,12 @@ def _gateway_factory(agent_config):
 
 
 def slack_api(url, token, timeout=10):
-    """POST one Slack Web API call with a token in the header; the JSON answer (raises OSError/ValueError)."""
-    req = urllib.request.Request(url, data=b"", method="POST", headers={"Authorization": f"Bearer {token}"})
-    return json.load(urllib.request.urlopen(req, timeout=timeout))
+    """POST one Slack Web API call with a token in the header; the JSON answer.
+
+    Raises httpx.HTTPError (no connection, a timeout or an error status) or ValueError (an answer that isn't JSON)."""
+    r = httpx.post(url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
 
 
 def slack_token_probe(timeout=10):
@@ -102,7 +105,7 @@ def slack_token_probe(timeout=10):
     for url, token in calls:
         try:
             body = slack_api(url, token, timeout)
-        except (OSError, ValueError):
+        except (httpx.HTTPError, ValueError):
             return "unreachable"
         if not body.get("ok") and body.get("error") in TOKEN_ERRORS:
             return "rejected"

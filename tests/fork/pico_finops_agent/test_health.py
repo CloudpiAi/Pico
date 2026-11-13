@@ -5,6 +5,8 @@ thread died, or the scheduler hasn't ticked for 10 minutes; Slack tokens rejecte
 no restart loop; no Slack tokens -> healthy (data collection only).
 """
 import json
+import os
+import stat
 import subprocess
 import sys
 
@@ -138,3 +140,46 @@ def test_slack_restart_waits_for_a_running_load():
 def test_stuck_scheduler_is_not_deferred_by_a_load():
     v = health.evaluate(NOW, slack("connected"), NOW - LIMIT, load_running=True)
     assert v.exit_code == health.EXIT_SCHEDULER
+
+
+# ---------- the heartbeat lives in a private folder, not at a fixed name in the shared temp folder ----------
+
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX file ownership and modes")
+
+
+@posix_only
+def test_the_default_heartbeat_is_in_a_private_folder(monkeypatch, tmp_path):
+    monkeypatch.delenv("PICO_FINOPS_AGENT_HEALTH_FILE", raising=False)
+    monkeypatch.setattr(health.tempfile, "gettempdir", lambda: str(tmp_path))
+    path = health.heartbeat_path()
+    folder = os.path.dirname(path)
+    assert folder == str(tmp_path / f"pico-finops-agent-{os.getuid()}")
+    assert stat.S_IMODE(os.lstat(folder).st_mode) == 0o700
+
+
+@posix_only
+def test_a_folder_others_can_enter_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(health.tempfile, "gettempdir", lambda: str(tmp_path))
+    folder = tmp_path / f"pico-finops-agent-{os.getuid()}"
+    folder.mkdir(mode=0o777)
+    os.chmod(folder, 0o777)
+    with pytest.raises(PermissionError):
+        health.private_dir()
+
+
+@posix_only
+def test_a_symlink_in_place_of_the_folder_is_refused(monkeypatch, tmp_path):
+    monkeypatch.setattr(health.tempfile, "gettempdir", lambda: str(tmp_path))
+    target = tmp_path / "elsewhere"
+    target.mkdir(mode=0o700)
+    (tmp_path / f"pico-finops-agent-{os.getuid()}").symlink_to(target)
+    with pytest.raises(PermissionError):
+        health.private_dir()
+
+
+@posix_only
+def test_the_check_reports_a_bad_folder_as_unhealthy(monkeypatch, tmp_path, capsys):
+    monkeypatch.delenv("PICO_FINOPS_AGENT_HEALTH_FILE", raising=False)
+    monkeypatch.setattr(health.tempfile, "gettempdir", lambda: str(tmp_path))
+    (tmp_path / f"pico-finops-agent-{os.getuid()}").symlink_to(tmp_path)
+    assert health.check() == 1 and "unhealthy" in capsys.readouterr().out

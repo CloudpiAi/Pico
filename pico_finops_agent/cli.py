@@ -13,8 +13,8 @@ import json
 import os
 import subprocess
 import sys
-import urllib.error
-import urllib.request
+
+import httpx
 
 from pico_finops_agent import agent, health, llm
 
@@ -48,7 +48,7 @@ def slack_check():
         if not sock.get("ok"):
             return False, (f"Slack: the app-level token was refused ({sock.get('error')}): fix SLACK_APP_TOKEN in "
                            ".env (scope connections:write, Socket Mode on)")
-    except (OSError, ValueError) as e:
+    except (httpx.HTTPError, ValueError) as e:
         return False, f"Slack: unreachable ({type(e).__name__}): check the EC2's outbound HTTPS to slack.com"
     return True, f"Slack: tokens accepted (bot @{me.get('user')} in {me.get('team')})"
 
@@ -62,15 +62,15 @@ def llm_check(timeout=15):
     key = os.environ.get(provider.key_env, "")
     if not key:
         return False, f"LLM: {provider.key_env} is not set (the agent's LLM is {provider.label})"
-    req = urllib.request.Request(provider.probe_url, headers=provider.headers(key))  # header: never in a URL
     try:
-        urllib.request.urlopen(req, timeout=timeout).read()
-    except urllib.error.HTTPError as e:
-        if e.code in (400, 401, 403):
-            return False, f"LLM: the {provider.label} key was refused (HTTP {e.code}): fix {provider.key_env} in .env"
-        return False, f"LLM: unexpected answer from {provider.label} (HTTP {e.code})"
-    except (urllib.error.URLError, OSError) as e:
-        return False, f"LLM: {provider.label} unreachable ({type(e).__name__}): check outbound HTTPS to {req.host}"
+        r = httpx.get(provider.probe_url, headers=provider.headers(key), timeout=timeout)  # header: never in a URL
+    except httpx.HTTPError as e:
+        host = httpx.URL(provider.probe_url).host
+        return False, f"LLM: {provider.label} unreachable ({type(e).__name__}): check outbound HTTPS to {host}"
+    if r.status_code in (400, 401, 403):
+        return False, f"LLM: the {provider.label} key was refused (HTTP {r.status_code}): fix {provider.key_env} in .env"
+    if r.is_error:
+        return False, f"LLM: unexpected answer from {provider.label} (HTTP {r.status_code})"
     return True, f"LLM: {provider.label} key accepted (model {model})"
 
 

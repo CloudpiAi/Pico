@@ -14,6 +14,7 @@ import threading
 import time
 from pathlib import Path  # noqa: E402
 
+import httpx
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "plugins" / "schedule"))
@@ -367,22 +368,20 @@ def test_slack_unreachable_is_not_called_rejected():
     ([{"ok": False, "error": "token_revoked"}, {"ok": True}], "rejected"),
     ([{"ok": True}, {"ok": True}], "unreachable"),
     ([{"ok": False, "error": "ratelimited"}, {"ok": True}], "unreachable"),
-    (OSError("network is unreachable"), "unreachable"),
+    (httpx.ConnectError("network is unreachable"), "unreachable"),
 ])
 def test_token_probe(monkeypatch, answers, expected):
-    import io
-
     monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-1-x")
     monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-x")
     calls = []
 
-    def fake_urlopen(req, timeout=None):
-        calls.append(req.full_url)
+    def fake_post(url, headers=None, timeout=None):
+        calls.append(url)
         if isinstance(answers, Exception):
             raise answers
-        return io.BytesIO(json.dumps(answers[len(calls) - 1]).encode())
+        return httpx.Response(200, json=answers[len(calls) - 1], request=httpx.Request("POST", url))
 
-    monkeypatch.setattr(agent.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(agent.httpx, "post", fake_post)
     assert agent.slack_token_probe() == expected
 
 

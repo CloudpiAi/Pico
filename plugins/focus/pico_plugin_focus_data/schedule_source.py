@@ -60,32 +60,45 @@ def _data_day(c):
     return _last_full_day(max_end) if max_end is not None else None
 
 
-def _where(flt):
-    cols = {"service": "servicename", "account": "subaccountid", "region": "regionid"}
-    parts, args = [], []
-    for k, col in cols.items():
-        if (flt or {}).get(k):
-            parts.append(f"{col} = ?")
-            args.append(flt[k])
-    return "".join(f" AND {p}" for p in parts), args
+# The queries below are fixed text: filters and the grouping column are bound parameters, never pasted into SQL.
+# Each optional filter is "(? IS NULL OR col = ?)": an unset filter (NULL) matches every row; see _filter_args.
+_BY_COLUMNS = ("servicename", "resourceid", "subaccountid")
+_TOTAL_SQL = """
+    SELECT coalesce(sum(billedcost), 0) FROM focus
+    WHERE chargecategory = 'Usage' AND CAST(chargeperiodstart AS DATE) BETWEEN ? AND ?
+      AND (?::VARCHAR IS NULL OR servicename = ?) AND (?::VARCHAR IS NULL OR subaccountid = ?)
+      AND (?::VARCHAR IS NULL OR regionid = ?)"""
+_BY_SQL = """
+    SELECT CASE ? WHEN 'servicename' THEN servicename WHEN 'resourceid' THEN resourceid
+                  WHEN 'subaccountid' THEN subaccountid END AS k,
+           coalesce(sum(billedcost) FILTER (WHERE CAST(chargeperiodstart AS DATE) = ?), 0) AS d,
+           coalesce(sum(billedcost) FILTER (WHERE CAST(chargeperiodstart AS DATE) BETWEEN ? AND ?), 0) AS m
+    FROM focus
+    WHERE chargecategory = 'Usage'
+      AND (?::VARCHAR IS NULL OR servicename = ?) AND (?::VARCHAR IS NULL OR subaccountid = ?)
+      AND (?::VARCHAR IS NULL OR regionid = ?)
+    GROUP BY 1 HAVING k IS NOT NULL AND m > 0 ORDER BY d DESC, m DESC LIMIT ?"""
+
+
+def _filter_args(flt):
+    """The six filter values: each filter twice (the NULL test, then the match), None when it isn't set."""
+    flt = flt or {}
+    args = []
+    for k in ("service", "account", "region"):
+        v = flt.get(k) or None
+        args += [v, v]
+    return args
 
 
 def _total(c, a, b, flt):
-    w, args = _where(flt)
-    return c.execute("SELECT coalesce(sum(billedcost), 0) FROM focus WHERE chargecategory = 'Usage' "
-                     f"AND CAST(chargeperiodstart AS DATE) BETWEEN ? AND ?{w}", [a, b, *args]).fetchone()[0]
+    return c.execute(_TOTAL_SQL, [a, b, *_filter_args(flt)]).fetchone()[0]
 
 
 def _by(c, col, day, flt, limit=10):
     """[(key, last-day cost, month-to-date cost)], biggest last day first."""
-    w, args = _where(flt)
-    return c.execute(f"""
-        SELECT {col} AS k,
-               coalesce(sum(billedcost) FILTER (WHERE CAST(chargeperiodstart AS DATE) = ?), 0) AS d,
-               coalesce(sum(billedcost) FILTER (WHERE CAST(chargeperiodstart AS DATE) BETWEEN ? AND ?), 0) AS m
-        FROM focus WHERE chargecategory = 'Usage' AND {col} IS NOT NULL{w}
-        GROUP BY 1 HAVING m > 0 ORDER BY d DESC, m DESC LIMIT {int(limit)}""",
-                     [day, day.replace(day=1), day, *args]).fetchall()
+    if col not in _BY_COLUMNS:
+        raise ValueError(f"unknown grouping {col!r}; expected one of {_BY_COLUMNS}")
+    return c.execute(_BY_SQL, [col, day, day.replace(day=1), day, *_filter_args(flt), int(limit)]).fetchall()
 
 
 DATABRICKS_NOTE = ("_Databricks here means the charges billed through AWS Marketplace; usage billed by Databricks "

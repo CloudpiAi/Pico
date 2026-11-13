@@ -35,7 +35,7 @@ The repository has four areas. Each one has a clear job.
 | `slack_guard.py` | Slack answer hardening: history cap, answer deadline, per-person hourly limit, empty-answer retry, reset phrases, and one log line per question (never the question or answer text). |
 | `bash_guard.py` | Refuses `$` and backticks outside single quotes in allow-listed bash commands, so secrets in the environment are never expanded. It uses the schedule plugin's guard when that plugin is installed. |
 | `llm.py` | Picks the LLM provider and model from `AGENT_LLM_PROVIDER` / `AGENT_LLM_MODEL`. Gemini is the default. |
-| `health.py` | The health decision table, the heartbeat file (`/tmp/pico-finops-agent-health.json`) and the check Docker runs. |
+| `health.py` | The health decision table, the heartbeat file (`health.json` in a private `0700` folder, `<tmp>/pico-finops-agent-<uid>/`) and the check Docker runs. |
 | `cache_reconnect.py` | Lets Slack answers see the new local cache after a load without a restart. It closes DuckDB connections when the file's inode changes. |
 | `log.py` | One JSON object per log line on stdout. |
 | `entrypoint.sh` | Runs before every command. It checks the `.env` values (names only, never values are printed) and stops the start if one is missing or malformed. |

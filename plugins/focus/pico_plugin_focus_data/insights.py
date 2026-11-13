@@ -43,14 +43,22 @@ def _last_full_day(max_end):
     return max_end.date() - timedelta(days=1)
 
 
+# One fixed query for both groupings: the column is chosen by a bound parameter, so no SQL text is ever built.
+_MOVER_KEYS = ("servicename", "resourceid")
+_MOVERS_SQL = """
+    WITH s AS (SELECT CASE ? WHEN 'servicename' THEN servicename WHEN 'resourceid' THEN resourceid END AS k,
+                      CAST(chargeperiodstart AS DATE) AS dt, sum(billedcost) AS cost
+               FROM focus WHERE chargecategory = 'Usage' GROUP BY 1, 2)
+    SELECT k,
+           coalesce(sum(cost) FILTER (WHERE dt = ?), 0) AS today,
+           coalesce(sum(cost) FILTER (WHERE dt BETWEEN ? AND ?), 0) / 7 AS avg7
+    FROM s WHERE k IS NOT NULL GROUP BY 1"""
+
+
 def _movers(c, key, day, minimum, pct):
-    rows = c.execute(f"""
-        WITH s AS (SELECT {key} AS k, CAST(chargeperiodstart AS DATE) AS dt, sum(billedcost) AS cost
-                   FROM focus WHERE chargecategory = 'Usage' AND {key} IS NOT NULL GROUP BY 1, 2)
-        SELECT k,
-               coalesce(sum(cost) FILTER (WHERE dt = ?), 0) AS today,
-               coalesce(sum(cost) FILTER (WHERE dt BETWEEN ? AND ?), 0) / 7 AS avg7
-        FROM s GROUP BY 1""", [day, day - timedelta(days=7), day - timedelta(days=1)]).fetchall()
+    if key not in _MOVER_KEYS:
+        raise ValueError(f"unknown grouping {key!r}; expected one of {_MOVER_KEYS}")
+    rows = c.execute(_MOVERS_SQL, [key, day, day - timedelta(days=7), day - timedelta(days=1)]).fetchall()
     spikes = [(k, t, a) for k, t, a in rows
               if a > 0 and t - a >= minimum and (t - a) / a * 100 >= pct]
     stopped = [(k, t, a) for k, t, a in rows if t == 0 and a >= minimum]
