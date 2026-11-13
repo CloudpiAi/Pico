@@ -371,6 +371,6 @@ def test_plain_ids_with_any_dash_parse(text):
     "Your EC2 fleet runs t3 — mostly t3.micro instances (active)",  # an instance family, not a task
     "We moved from t2 - to t3.micro last month",
 ])
-def test_instance_types_are_not_task_ids(text):
+def test_a_text_with_only_instance_types_is_not_a_task_list(text):
     with pytest.raises(ValueError):
         parse_task_list(text)
