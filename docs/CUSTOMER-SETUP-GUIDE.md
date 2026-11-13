@@ -332,6 +332,10 @@ Write down the key (worksheet #7) and which provider it's for.
          - im:history
          - mpim:history
          - reactions:write
+         - channels:read
+         - groups:read
+         - im:write
+         - users:read
    settings:
      event_subscriptions:
        bot_events:
@@ -354,6 +358,8 @@ Write down the key (worksheet #7) and which provider it's for.
 **5c. Install the app and get the bot token** (worksheet #9):
 1. Open **Install App → Install to Workspace → Allow**.
 2. Copy the **Bot User OAuth Token**. It starts with **`xoxb-`**.
+3. If you change the app's scopes or events later, open **Install App → Reinstall to Workspace**, or the change has
+   no effect.
 
 **5d. Create the summary channel:**
 1. In Slack, create a channel, for example **#pico-finops-agent**.
@@ -367,7 +373,8 @@ Write down the key (worksheet #7) and which provider it's for.
 1. **Create New App → From scratch**, name it **Pico FinOps Agent**.
 2. **Socket Mode:** turn it on and create an app-level token with `connections:write` (`xapp-…`).
 3. **OAuth & Permissions → Bot Token Scopes:** `chat:write`, `channels:history`, `groups:history`, `im:history`,
-   `reactions:write`, and optionally `mpim:history`.
+   `reactions:write`, and optionally `mpim:history`. For scheduled tasks (reminders, reports), also add
+   `channels:read`, `groups:read`, `im:write` and `users:read`.
 4. **Event Subscriptions:** turn it on. Under **Subscribe to bot events**, add `message.channels`, `message.groups`,
    `message.im`, and optionally `message.mpim`.
 5. **App Home:** turn on the **Messages tab** and tick **Allow users to send messages**.
