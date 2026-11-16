@@ -14,6 +14,11 @@ from pathlib import Path
 # bundled backup. User can opt back in by setting the env var to "false".
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "true")
 
+# Pico patch: ONNX Runtime's official builds (1.2x+ on Linux) send usage telemetry to Microsoft by default (its
+# docs/Privacy.md), starting when `onnxruntime` is imported (fastembed imports it). Pico promises no telemetry, so
+# it is off unless the user sets the variable themselves. Must run before anything imports onnxruntime.
+os.environ.setdefault("ORT_DISABLE_TELEMETRY", "1")
+
 _DISTRIBUTION_NAME = "pico-agent"
 
 

@@ -133,12 +133,14 @@ def _describe(changes):
         parts.append("place to " + (f"<#{t['id']}>" if t["type"] == "channel" else f"<@{t['id']}>'s DM"))
     if "name" in changes:
         parts.append(f"name to \"{changes['name']}\"")
+    if "kind" in changes:
+        parts.append(f"kind to {changes['kind']}")
     if "payload" in changes:
         parts.append("content to: " + json.dumps(changes["payload"])[:300])
     return ": " + "; ".join(parts)
 
 
-def _cmd_add(a, d, channel, user, settings, client, now):
+def _cmd_add(a, d, channel, user, settings, client, now, message=None):
     target = tasks.check_target(_target(a.to, channel, user, client, settings), settings, user)
     code = client.check_target(target)
     if code != "ok":
@@ -156,19 +158,31 @@ def _cmd_add(a, d, channel, user, settings, client, now):
         except Exception as e:  # noqa: BLE001 - a query that fails now would fail every day
             return _out(False, "bad_sql", f"That query doesn't run on the cost data: {str(e)[:200]}")
     task = tasks.add(d, owner=user, where=channel, kind=a.kind, name=a.name, target=target, schedule=schedule,
-                     payload=payload, now=now, settings=settings)
+                     payload=payload, now=now, settings=settings, message=message)
     when = _when(schedule, now)
     place = "you by DM" if target["type"] == "user" else f"<#{target['id']}>"
     repeat = "once" if "at" in schedule else "repeating"
+    if task.pop("reused", False):
+        return _out(True, "already_saved", f"Task {task['id']} ({repeat}) for {place} is already saved for this "
+                                           f"message; nothing new was added. First run: {when}.",
+                    task=task, next_run=when, preview=preview)
     return _out(True, "ok", f"Saved task {task['id']} ({repeat}) for {place}. First run: {when}.",
                 task=task, next_run=when, preview=preview)
 
 
-def _cmd_change(a, d, channel, user, settings, client, now):
+def _cmd_change(a, d, channel, user, settings, client, now, message=None):
     changes = None
+    here = tasks.message_key(channel, message)
+    if a.action == "remove" and here and tasks.get(d, a.id).get("created_for") == here:
+        return _out(False, "made_for_this_message",
+                    f"Task {a.id} was set up in answer to this message. Keep it and change what isn't right with "
+                    f"`pico schedule edit {a.id}` (time, place, name, kind or content) instead of removing it.")
     if a.action == "edit":
         current = tasks.get(d, a.id)
         changes = {}
+        if a.kind and a.kind != current["kind"]:  # a new kind needs its own content (--text/--question/--sql/--template)
+            changes["kind"] = a.kind
+            changes["payload"] = _payload(a, a.kind)
         if a.cron or a.at or a.in_ is not None:
             changes["schedule"] = _schedule(a, a.tz or current["schedule"].get("tz"), now)
         elif a.tz:
@@ -181,7 +195,7 @@ def _cmd_change(a, d, channel, user, settings, client, now):
         if a.name:
             changes["name"] = a.name
         given = {"reminder": a.text, "ask": a.question, "query": a.sql, "report": a.template}[current["kind"]]
-        if given:
+        if given and "kind" not in changes:
             changes["payload"] = _payload(a, current["kind"])
         if not changes:
             return _out(False, "nothing_to_change", "Tell me what to change: the time, the place, the name or the "
@@ -271,9 +285,9 @@ def run(argv, data_dir, source):
         if a.action == "add":
             if not a.kind:
                 return _out(False, "bad_kind", "Which kind: reminder, report, query or ask?")
-            return _cmd_add(a, d, channel, user, settings, client, now)
+            return _cmd_add(a, d, channel, user, settings, client, now, message=ctx.msg)
         if a.action in ("confirm", "decline"):
             return _cmd_resolve(a, d, channel, user, settings, client, now)
-        return _cmd_change(a, d, channel, user, settings, client, now)
+        return _cmd_change(a, d, channel, user, settings, client, now, message=ctx.msg)
     except tasks.TaskError as e:
         return _out(False, e.code, e.message)

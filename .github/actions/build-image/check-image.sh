@@ -103,6 +103,15 @@ if [ -z "$hits" ]; then
 else bad "CloudPi text is in the image: $(echo "$hits" | head -3 | cut -c1-160 | tr '
 ' ' ')"; fi
 
+# 12. No library telemetry: ONNX Runtime starts its (Microsoft) telemetry when it is imported unless
+#     ORT_DISABLE_TELEMETRY=1; with it off it prints no "telemetry" line. Checked both with the image's own settings
+#     and with the variable cleared, so pico's own default (pico/__init__.py) is checked too.
+if out=$(run python "$IMG" -c 'import pico, onnxruntime' 2>&1) && ! echo "$out" | grep -qi telemetry &&
+   out=$(docker run --rm --network none --read-only --tmpfs /tmp -e ORT_DISABLE_TELEMETRY= --entrypoint sh "$IMG"          -c 'unset ORT_DISABLE_TELEMETRY; exec python -c "import pico, onnxruntime"' 2>&1) &&
+   ! echo "$out" | grep -qi telemetry; then
+  ok "no ONNX Runtime telemetry (image setting and pico default)"
+else bad "ONNX Runtime telemetry is on: $(echo "$out" | grep -i telemetry | head -1 | cut -c1-160)"; fi
+
 echo "---"
 [ "$fails" -eq 0 ] && echo "All checks passed." && exit 0
 echo "$fails check(s) failed." && exit 1

@@ -135,6 +135,9 @@ fi
 if opt_set AGENT_ANSWER_DEADLINE_S; then
     match AGENT_ANSWER_DEADLINE_S '^([3-9][0-9]|[1-8][0-9][0-9]|900)$' "must be a whole number of seconds from 30 to 900"
 fi
+if opt_set AGENT_MODEL_STALL_S; then
+    match AGENT_MODEL_STALL_S '^(1[0-9]|[2-9][0-9]|1[0-6][0-9]|170)$' "must be a whole number of seconds from 10 to 170"
+fi
 if opt_set AGENT_QUESTIONS_PER_HOUR; then
     match AGENT_QUESTIONS_PER_HOUR '^(0|[1-9][0-9]{0,4})$' "must be a whole number (0 = no limit)"
 fi

@@ -50,7 +50,7 @@ Out of scope:
 
 ## What Pico sends outside your AWS account
 
-Pico sends a question, and the rows it read to answer it, to the language model you chose. It sends answers to Slack. It sends nothing to CloudPi or PurpleData. If you find Pico sending data anywhere else, that is a security bug — please report it.
+Pico sends a question, and the rows it read to answer it, to the language model you chose. It sends answers to Slack. It sends nothing to CloudPi or PurpleData, and library telemetry is switched off (ONNX Runtime's, with `ORT_DISABLE_TELEMETRY=1`; an image check fails the build if it comes back). If you find Pico sending data anywhere else, that is a security bug — please report it.
 
 ## Verifying a release image
 

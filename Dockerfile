@@ -67,6 +67,8 @@ RUN printf '#!/bin/sh\nexec python -m pico_finops_agent.cli "$@"\n' > /usr/local
  && chmod 755 /usr/local/bin/pico-finops-agent
 USER pico
 ENV PATH="/app/.venv/bin:$PATH" PYTHONPATH=/app PYTHONUNBUFFERED=1
+# No telemetry from libraries either: ONNX Runtime's sends usage data to Microsoft by default (pico/__init__.py).
+ENV ORT_DISABLE_TELEMETRY=1
 VOLUME /data
 # No EXPOSE: the agent runs no server and opens no port; Slack is reached outbound (Socket Mode).
 # Health: the agent writes a heartbeat every 5 s (scheduler alive, Slack connected or switched off); this reads it.

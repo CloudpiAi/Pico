@@ -499,15 +499,18 @@ def test_slack_guard_installs_with_env_settings(monkeypatch):
 
     seen = {}
     monkeypatch.setenv("AGENT_HISTORY_TURNS", "5")
-    monkeypatch.setattr(slack_guard, "install", lambda settings=None: seen.setdefault("settings", settings))
+    monkeypatch.setattr(slack_guard, "install",
+                        lambda settings=None, **kw: seen.update(settings=settings, **kw))
     agent._install_slack_guard()
     assert seen["settings"].history_turns == 5
+    # with the schedule plugin installed, a question stopped at its deadline can say which tasks it changed
+    assert callable(seen["changes_since"])
 
 
 def test_slack_still_starts_when_the_guard_cannot_install(monkeypatch, capsys):
     from pico_finops_agent import slack_guard
 
-    monkeypatch.setattr(slack_guard, "install", lambda settings=None: 1 / 0)
+    monkeypatch.setattr(slack_guard, "install", lambda settings=None, **kw: 1 / 0)
     agent._install_slack_guard()  # no exception: Slack answers work, unguarded, and the log says so
     assert '"event": "slack_guard_off"' in capsys.readouterr().out
 
