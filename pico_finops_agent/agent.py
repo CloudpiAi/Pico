@@ -320,8 +320,18 @@ def _install_slack_guard():
     pin tests missed), Slack still answers, unguarded, and the log says so."""
     from pico_finops_agent import slack_guard
 
+    changes = None
+    try:  # with the schedule plugin, a question stopped at its deadline says which tasks it had already changed
+        from pico_plugin_schedule import tasks as schedule_tasks
+
+        data = scheduler.data_dir()
+
+        def changes(user, since):
+            return schedule_tasks.changes_since(data, by=user, since=since)
+    except ImportError:
+        pass
     try:
-        slack_guard.install(slack_guard.settings_from_env())
+        slack_guard.install(slack_guard.settings_from_env(), changes_since=changes)
     except Exception as e:  # noqa: BLE001
         _log("slack_guard_off", reason=describe(e, 200))
 
@@ -336,6 +346,14 @@ def _install_llm_log():
         llm_log.install(save_dir=llm_log.save_dir_from_env(data_dir=scheduler.data_dir()))
     except Exception as e:  # noqa: BLE001
         _log("llm_log_off", reason=describe(e, 200))
+    # Over llm_log, so each try of a call has its own line: a model call that stalls is tried once more
+    # (pico_finops_agent/llm_stall.py) instead of using up the whole answer deadline.
+    from pico_finops_agent import llm_stall
+
+    try:
+        llm_stall.install()
+    except Exception as e:  # noqa: BLE001
+        _log("llm_stall_off", reason=describe(e, 200))
 
 
 def _make_signal_handler(stop, exit=os._exit):
