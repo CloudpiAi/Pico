@@ -35,10 +35,13 @@ import inspect
 import logging
 import os
 import re
+import signal
 import time
+import types
 import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from pico_finops_agent import llm_log
 from pico_finops_agent.log import describe, log_event
@@ -66,6 +69,10 @@ _MAX_REMEMBERED = 1000
 # The history an attempt's model calls see: the guard sets it around each attempt; its tasks inherit it.
 HISTORY_MODES = ("full", "text", "none")  # attempt 1, 2, 3
 _HISTORY_MODE = contextvars.ContextVar("pico_finops_agent_history_mode", default="full")
+# The commands one attempt's bash tool started (a set of Popen), so the deadline can stop them: the tool runs them in
+# a worker thread (asyncio.to_thread copies this variable), which cancelling the attempt does not stop.
+_CHILDREN = contextvars.ContextVar("pico_finops_agent_children", default=None)
+_TRACKED = "pico_finops_agent_children"
 _TURNS_SENT: "OrderedDict[str, tuple]" = OrderedDict()  # session id -> (user turns sent, monotonic time)
 
 
@@ -247,6 +254,60 @@ def _make_filter(inner, n, session_id):
             return result
 
     return _filter
+
+
+def install_child_tracking():
+    """Record each command the bash tool starts in the current attempt's set (idempotent). Only the bash tool's own
+    view of `subprocess` changes; Popen itself and every other user of subprocess are untouched."""
+    from pico.tools.func_tool import bash_tool
+
+    real = bash_tool.subprocess
+    if getattr(real, _TRACKED, False):
+        return
+
+    def popen(*args, **kwargs):
+        proc = real.Popen(*args, **kwargs)
+        children = _CHILDREN.get()
+        if children is not None:
+            children.add(proc)
+        return proc
+
+    view = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real) if not k.startswith("__")})
+    view.Popen = popen
+    setattr(view, _TRACKED, True)
+    bash_tool.subprocess = view
+
+
+def kill_children(children):
+    """Stop the commands an attempt started that are still running (their whole process group); how many."""
+    killed = 0
+    for proc in list(children or ()):
+        if proc.poll() is not None:
+            continue
+        try:
+            if os.name == "posix":
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # the bash tool starts each in its own session
+            else:
+                proc.kill()
+            killed += 1
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return killed
+
+
+_DONE_VERB = {"created": "saved", "removed": "removed", "paused": "paused", "resumed": "resumed"}
+
+
+def too_long_text(changes):
+    """TOO_LONG, plus what the stopped question had already changed (so a saved task is never a surprise)."""
+    if not changes:
+        return TOO_LONG
+    done = []
+    for c in changes:
+        item = f"{_DONE_VERB.get(c['action'], 'changed')} task {c['task_id']} ({c['name']})"
+        if item not in done:
+            done.append(item)
+    return f"{TOO_LONG} Before I stopped, I had already {'; '.join(done)}."
 
 
 def install_history_cap(n):
@@ -582,8 +643,10 @@ def _record_fields(record):
     return {"qid": record.qid, "finish_reasons": list(record.finishes)}
 
 
-def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=None, stop_wait_s=5.0):
-    """The wrapper for ChannelBridge.handle_message (``original`` is what was there: Pico's or the ctx wrapper)."""
+def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=None, stop_wait_s=5.0,
+               changes_since=None):
+    """The wrapper for ChannelBridge.handle_message (``original`` is what was there: Pico's or the ctx wrapper).
+    ``changes_since(user, since)`` (the schedule plugin's, when installed) lists what a stopped question changed."""
     log = log or (lambda event, **fields: log_event(event, **fields))
     limiter = limiter or RateLimiter(settings.questions_per_hour, clock=clock)
     seen = OrderedDict()
@@ -633,11 +696,23 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             return
         stats["rolled_back"] = stats.get("rolled_back", 0) + 1
 
-    async def stopped_too_long(bridge, adapter, conv, session_id, stats, checkpoint):
+    def done_so_far(msg, started_at):
+        if changes_since is None or started_at is None or not msg.sender_id:
+            return []
+        try:
+            return changes_since(msg.sender_id, started_at)
+        except Exception:  # noqa: BLE001 - the "too long" reply still goes out
+            logger.warning("changes since the question unreadable", exc_info=True)
+            return []
+
+    async def stopped_too_long(bridge, adapter, conv, session_id, stats, checkpoint, msg=None, started_at=None):
         stats["stop_confirmed"] = await stop_run(bridge, session_id)
         if stats["stop_confirmed"]:  # a run that didn't stop may still be writing: leave its session alone
             await roll_back(bridge, session_id, checkpoint, stats)
-        await _reply(adapter, conv, TOO_LONG)
+        changes = await asyncio.to_thread(done_so_far, msg, started_at) if msg is not None else []
+        if changes:
+            stats["done_before_stop"] = len(changes)
+        await _reply(adapter, conv, too_long_text(changes))
         return "too_long", stats
 
     def add_attempt_stats(stats, proxy, bridge, session_id):
@@ -652,7 +727,7 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
         _add_stats(stats, attempt)
         return attempt
 
-    async def answer(bridge, msg, conv, adapter, channel_config, session_id, start, record):
+    async def answer(bridge, msg, conv, adapter, channel_config, session_id, start, record, started_at=None):
         """Up to len(HISTORY_MODES) attempts; each empty one is rolled back and the next sees a lighter history."""
         deadline = start + settings.deadline_s
         stats = {}
@@ -683,10 +758,17 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             if checkpoint is None:  # no boundary, so this attempt can't be undone: say so in the question line
                 stats["checkpoint_failed"] = stats.get("checkpoint_failed", 0) + 1
             token = _HISTORY_MODE.set(mode)  # _attempt's task copies the context: its model calls see the mode
+            children = set()
+            child_token = _CHILDREN.set(children)  # and its bash tool's worker threads record their commands here
             try:
                 timed_out = await _attempt(original, bridge, attempt_msg, proxy, channel_config, deadline - clock())
             finally:
+                _CHILDREN.reset(child_token)
                 _HISTORY_MODE.reset(token)
+            if timed_out:  # a command still running would finish after the person was told it didn't: stop it now
+                killed = kill_children(children)
+                if killed:
+                    stats["commands_stopped"] = stats.get("commands_stopped", 0) + killed
             stats["attempts"] = n
             attempt = add_attempt_stats(stats, proxy, bridge, session_id)
             # Unknown (None) counts as "a tool may have run": keep the attempt rather than risk doing it twice.
@@ -695,7 +777,7 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             if timed_out:  # a tool call the deadline cut off (no result yet) may have done its work too
                 cut_off = attempt is not None and attempt.get("tool_calls", 0) > 0
                 return await stopped_too_long(bridge, adapter, conv, session_id, stats,
-                                              None if (ran or cut_off) else checkpoint)
+                                              None if (ran or cut_off) else checkpoint, msg, started_at)
             if not proxy.busy and not ran and (proxy.empty or proxy.error):  # busy: another run's session
                 await roll_back(bridge, session_id, checkpoint, stats)
             if not proxy.empty:
@@ -714,6 +796,7 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
             seen.popitem(last=False)
         start = clock()
         since = _now()
+        started_at = datetime.now(timezone.utc)  # wall clock, for what a stopped question already changed
         conv = _conversation(msg)
         session_id = self.build_session_id(conv)
         group = msg.chat_type == "group"
@@ -755,7 +838,8 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
         record = llm_log.Record(uuid.uuid4().hex[:12])
         try:
             with llm_log.recording(record):  # the attempts' tasks inherit it: their model calls land in `record`
-                outcome, stats = await answer(self, msg, conv, adapter, channel_config, session_id, start, record)
+                outcome, stats = await answer(self, msg, conv, adapter, channel_config, session_id, start, record,
+                                              started_at)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -770,7 +854,7 @@ def make_guard(original, settings, *, log=None, clock=time.monotonic, limiter=No
     return handle_message
 
 
-def install(settings=None):
+def install(settings=None, changes_since=None):
     """Wire the history cap and the guard into Pico (idempotent). Call after the ctx wrapper, so this one is
     outermost and sees the text the person typed."""
     from pico.gateway import bridge
@@ -778,11 +862,12 @@ def install(settings=None):
     settings = settings or settings_from_env()
     install_history_cap(settings.history_turns)  # if this fails the caller logs slack_guard_off
     install_no_tool_summary_answer()
+    install_child_tracking()
     original = bridge.ChannelBridge.handle_message
     if getattr(original, "pico_finops_agent_guard", False):
         return
     try:
-        guarded = make_guard(original, settings)
+        guarded = make_guard(original, settings, changes_since=changes_since)
         guarded.pico_finops_agent_guard = True
         bridge.ChannelBridge.handle_message = guarded
     except Exception as e:  # noqa: BLE001
