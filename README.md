@@ -115,7 +115,7 @@ Rather build the image yourself? Use `docker compose -f docker-compose.yml -f do
 | AWS credentials | **None are created** — the agent uses IAM roles |
 | One question and the few rows that answer it | Your language model provider, to write the answer |
 | Answers and summaries | Your Slack |
-| Anything to the Pico maintainers | **Nothing** — no telemetry |
+| Anything to the Pico maintainers, or library telemetry | **Nothing** — no telemetry (library telemetry, such as ONNX Runtime's, is switched off) |
 
 ## Security and privacy
 

@@ -4,6 +4,24 @@ All notable changes to Pico are recorded here. The format follows [Keep a Change
 
 ## [Unreleased]
 
+### Security
+
+- **No telemetry from libraries.** ONNX Runtime 1.31 (brought in by fastembed in 0.3.0) sends usage telemetry to
+  Microsoft by default from the moment it is imported. It is now off: `ORT_DISABLE_TELEMETRY=1` in the image, and
+  importing `pico` sets it unless you set it yourself. A new image check fails the build if it ever comes back.
+  0.3.0 had it on; upgrade.
+
+### Fixed (answers that ran out of time)
+
+- A model call that sends nothing for `AGENT_MODEL_STALL_S` seconds (default 45) is closed and tried once more,
+  instead of using up the whole answer deadline (live 2026-11-13: one Gemini call sent no token for 177 s).
+- A question stopped at its deadline now stops the commands it had started (they kept running in a worker thread),
+  and its reply says what it had already done, e.g. "Before I stopped, I had already saved task t223 (…)".
+- Scheduled tasks: one task per request. Repeating the same `pico schedule add` in one message returns the task
+  already saved (`already_saved`); a task set up for a message can't be removed in that same message
+  (`made_for_this_message`); `pico schedule edit --kind` changes a task's kind. The skill maps common requests
+  ("weekly cost summary") to one template, so the model no longer saves, removes and saves again until the deadline.
+
 ### Added
 
 - Release images are also tagged `vX.Y.Z` (for example `ghcr.io/cloudpiai/pico:v0.4.0`), the same image as `X.Y.Z`.
