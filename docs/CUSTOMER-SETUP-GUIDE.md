@@ -623,6 +623,7 @@ The agent tells you in Slack (and in `docker logs`) what's wrong. Find the messa
 | "the loader Lambda's role isn't allowed to …" | Re-apply `loader-role-policy.json` to `pico-finops-agent-loader-role` (step 3d) |
 | "the loader Lambda's role is missing or can't be used" | Recreate the role exactly as in step 3d, and check `FOCUS_LAMBDA_ROLE_ARN` |
 | "the state bucket doesn't exist" | Create it (step 2b), or fix `FOCUS_STATE_BUCKET` in `.env` |
+| "I don't have permission to post messages there" / `missing_scope` from a scheduled task | A Slack admin adds `channels:read`, `groups:read`, `im:write` and `users:read` to the Slack app (step 5a's manifest has them), then reinstalls it (step 5c) |
 | "the EC2 has no working AWS credentials" | The instance profile isn't attached. Attach the `pico-finops-agent-ec2-role` instance profile: **EC2 → Actions → Security → Modify IAM role** (step 6). Check that hop limit is 1 and IMDSv2 is required |
 | `FOCUS_… is not set` when the agent starts | That line is missing or empty in `.env`. Fix it and run `docker compose up -d` |
 | "No new AWS cost data for N days" | Check **Billing and Cost Management → Data Exports**. The export may be paused or deleted. |
