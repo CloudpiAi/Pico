@@ -22,3 +22,8 @@
 **/credentials.json
 **/__pycache__
 **/.pytest_cache
+
+# Pico's tutorial data (a demo SQLite and DuckDB, ~16 MB). Only `pico`'s first-run setup copies it, and only when no
+# agent.yml exists; the image always has one (deploy/pico-finops-agent.yml), and a missing source is skipped quietly
+# (pico/utils/resource_utils.py copy_data_file).
+pico/sample_data
