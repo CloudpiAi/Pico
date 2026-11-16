@@ -32,6 +32,24 @@ Never put a password, key or token in a task; the command refuses it (`secret_in
 - `ask`: a cost question that needs your reasoning each time ("what changed most last week and why").
   `--question '...'`. Costs an LLM run per send; prefer `report` when a template fits.
 
+**Common requests: use this choice, don't weigh the others**
+| The person asks for | Use |
+|---|---|
+| a cost summary / cost report, daily, weekly or monthly, no service named ("weekly AWS cost summary") | `--kind report --template cost_by_service` |
+| the cost of one service ("EC2 cost every day") | `--kind report --template service_cost --service '<name in focus>'` |
+| the month so far / month-to-date | `--kind report --template month_to_date` |
+| the biggest resources | `--kind report --template top_resources` |
+| cost per account | `--kind report --template account_cost` |
+| why something changed, an explanation, a condition ("only if …") | `--kind ask --question '…'` |
+A report shows the newest full day and the month so far; on a weekly `--cron` it is the weekly summary. Say what
+you chose in one line when you confirm.
+
+**One task per request.** Save it once, with one `add`. Don't list or inspect other tasks first unless the person
+asked about them. After `add` answers `ok`, never remove that task and add another: if something isn't right,
+`edit` it (edit changes the time, place, name, kind or content). `remove` refuses a task made for the same message
+(`made_for_this_message`), and an `add` repeated in the same message answers `already_saved` with the task it saved
+before: just confirm that one.
+
 **Only when something is true** ("every day check EC2; if it's over $200 send me the resources and usage", "tell me
 only if S3 doubled"): use `ask` with the whole request, condition included, as the question
 (`--question 'Check the EC2 cost of yesterday. If it is more than $200, list the EC2 resources with cost,
@@ -84,7 +102,8 @@ pico schedule edit t3 --ctx <ctx> --cron '0 10 * * 1'
 ```
 `list` gives the person's tasks and this channel's; `show` answers "who set this up?"; `history` answers "who changed
 or stopped it?". `edit` takes any of `--cron`/`--at`/`--in`/`--tz`/`--to`/`--name` and the content of its kind
-(`--text` reminder, `--question` ask, `--sql` query, `--template` + filters report). Anyone may ask about any task.
+(`--text` reminder, `--question` ask, `--sql` query, `--template` + filters report). To change the kind, give
+`--kind` with the new kind's content: `pico schedule edit t3 --ctx <ctx> --kind ask --question '…'`. Anyone may ask about any task.
 
 **Someone else's task**: only the creator (or an admin) changes it. For anyone else the command returns
 `confirmation_requested`: the creator got a DM; tell the person it keeps running until the creator answers. When the

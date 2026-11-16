@@ -406,3 +406,42 @@ def test_only_stop_pause_resume_time_and_name_go_through_unanswered(d):
     assert t["target"] == TEAM and t["payload"] == {"text": "stop the dev instances"}
     assert t["schedule"]["cron"] == "0 9 * * *"
     assert "request_expired" in [e["action"] for e in tasks.history(d, "t1")]
+
+
+# ---------- one task per Slack message ----------
+
+def test_add_with_a_message_is_idempotent_for_the_same_task(d):
+    first = add(d, message="1730800000.000001")
+    again = add(d, message="1730800000.000001")
+    assert again["id"] == first["id"] and again["reused"] is True and "reused" not in tasks.get(d, first["id"])
+    assert tasks.get(d, first["id"])["created_for"] == "D0RAVIDM01:1730800000.000001"
+    assert add(d, message="1730800000.000002")["id"] != first["id"]          # another message: a new task
+    assert add(d, message="1730800000.000001", name="Other", payload={"text": "other"})["id"] != first["id"]
+
+
+def test_add_without_a_message_never_reuses(d):
+    assert add(d)["id"] != add(d)["id"] and "created_for" not in tasks.get(d, "t1")
+
+
+def test_edit_can_change_the_kind(d):
+    t = add(d)
+    tasks.change(d, t["id"], "edit", by=RAVI, where="D0RAVIDM01", now=NOW, settings=settings(),
+                 changes={"kind": "ask", "payload": {"question": "Why did EC2 grow?"}})
+    assert tasks.get(d, t["id"])["kind"] == "ask"
+    with pytest.raises(tasks.TaskError) as e:
+        tasks.change(d, t["id"], "edit", by=RAVI, where="D0RAVIDM01", now=NOW, settings=settings(),
+                     changes={"kind": "reminder"})
+    assert e.value.code == "missing_content"
+
+
+def test_changes_since_lists_what_one_person_changed(d):
+    early = add(d)
+    later = NOW + timedelta(minutes=5)
+    t = add(d, now=later, name="Weekly AWS cost summary")
+    tasks.change(d, t["id"], "remove", by=RAVI, where="D0RAVIDM01", now=later, settings=settings())
+    add(d, now=later, owner=MEENA, target={"type": "user", "id": MEENA})  # someone else's change: not listed
+    got = tasks.changes_since(d, by=RAVI, since=later)
+    assert [(c["task_id"], c["action"], c["name"]) for c in got] == [
+        (t["id"], "created", "Weekly AWS cost summary"), (t["id"], "removed", "Weekly AWS cost summary")]
+    assert early["id"] not in {c["task_id"] for c in got}
+    assert tasks.changes_since(d, by=RAVI, since=later + timedelta(hours=1)) == []

@@ -37,7 +37,7 @@ REQUEST_TTL = timedelta(days=7)
 REMIND_BEFORE = timedelta(days=1)
 AUTO_ACCEPT_NEVER = {"target", "payload"}  # where it posts / what it says: only the owner or an admin
 _EDIT_ACTION = {"schedule": "time_changed", "target": "target_changed", "name": "name_changed",
-                "payload": "text_changed"}
+                "kind": "kind_changed", "payload": "text_changed"}
 _REQUEST_ACTION = {"remove": "stop_requested"}  # pause / resume / edit -> change_requested
 _AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
 
@@ -203,6 +203,30 @@ def history(d, task_id):
     return [e for e in _read_history(d) if e["task_id"] == task_id]
 
 
+def changes_since(d, *, by, since):
+    """What `by` changed from `since` on (an aware datetime), oldest first: [{"task_id", "action", "name"}].
+
+    The Slack guard uses it when a question is stopped at its deadline, so the person is told what was already done
+    (a task saved or removed) instead of only "that took too long"."""
+    out = []
+    names = {}
+    for e in _read_history(d):
+        new = e.get("new") or {}
+        if new.get("name"):
+            names[e["task_id"]] = new["name"]
+        try:
+            at = datetime.fromisoformat(e["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if e.get("by") == by and at >= since:
+            out.append({"task_id": e["task_id"], "action": e.get("action", ""), "name": None})
+    if out:
+        current = _load(d)["tasks"]
+        for c in out:
+            c["name"] = names.get(c["task_id"]) or (current.get(c["task_id"]) or {}).get("name") or c["task_id"]
+    return out
+
+
 # ---------------- schedule ----------------
 
 _DOW = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
@@ -338,12 +362,31 @@ def check_target(target, settings, user=None):
 
 # ---------------- store API ----------------
 
-def add(d, *, owner, where, kind, name, target, schedule, payload, now, settings):
+def message_key(where, message):
+    """The Slack message a task was set up for ("<channel>:<message ts>"); None outside a Slack message."""
+    return f"{where}:{message}" if where and message else None
+
+
+def same_task(task, *, kind, target, schedule, payload):
+    """True when `task` already does what a new task with these settings would do."""
+    return (task["kind"] == kind and task["target"] == target and task["schedule"] == dict(schedule)
+            and task["payload"] == payload)
+
+
+def add(d, *, owner, where, kind, name, target, schedule, payload, now, settings, message=None):
+    """Save a new task. With `message` (the Slack message it is set up for), asking twice for the same task in the
+    same message gives back the one already saved ("reused": True) instead of a second copy."""
     payload = check_payload(kind, payload)
     target = check_target(target, settings, owner)
     check_schedule(schedule, now)
+    made_for = message_key(where, message)
     with _locked(d):
         data = _load(d)
+        if made_for:
+            for t in data["tasks"].values():
+                if (t.get("created_for") == made_for and t["status"] in ("active", "paused")
+                        and same_task(t, kind=kind, target=target, schedule=schedule, payload=payload)):
+                    return {**t, "reused": True}
         active = [t for t in data["tasks"].values() if t["owner"] == owner and t["status"] in ("active", "paused")]
         if len(active) >= MAX_ACTIVE_PER_OWNER:
             raise TaskError("too_many_tasks", f"You already have {MAX_ACTIVE_PER_OWNER} tasks; stop one first.")
@@ -351,6 +394,8 @@ def add(d, *, owner, where, kind, name, target, schedule, payload, now, settings
         task = {"id": tid, "kind": kind, "name": (name or kind).strip()[:120], "owner": owner, "created_in": where,
                 "created_at": _iso(now), "target": target, "schedule": dict(schedule), "payload": payload,
                 "status": "active", "last_sent_at": None, "last_data_through": None}
+        if made_for:
+            task["created_for"] = made_for
         data["next_id"] += 1
         data["tasks"][tid] = task
         _save(d, data)
@@ -403,14 +448,20 @@ def _apply(d, data, task, action, by, where, changes, now, settings, acting_for=
             check_schedule(checked["schedule"], now)
         if "target" in checked:
             checked["target"] = check_target(checked["target"], settings, acting_for or by)
+        kind = checked.get("kind", task["kind"])
+        if kind not in KINDS:
+            raise TaskError("bad_kind", "Which kind: reminder, report, query or ask?")
+        if "kind" in checked and checked["kind"] != task["kind"] and "payload" not in checked:
+            raise TaskError("missing_content", f"A {kind} task needs its content too.")
         if "payload" in checked:
-            checked["payload"] = check_payload(task["kind"], checked["payload"])
-        for key in ("schedule", "target", "name", "payload"):
+            checked["payload"] = check_payload(kind, checked["payload"])
+        for key in ("schedule", "target", "name", "kind", "payload"):
             if key in checked and checked[key] != task.get(key):
                 old = task.get(key)
                 task[key] = checked[key]
-                _record(d, task["id"], _EDIT_ACTION[key], by, where, now, old={key: old} if key == "name" else old,
-                        new={key: checked[key]} if key == "name" else checked[key],
+                plain = key in ("name", "kind")  # a string: kept as {key: value} in the history
+                _record(d, task["id"], _EDIT_ACTION[key], by, where, now, old={key: old} if plain else old,
+                        new={key: checked[key]} if plain else checked[key],
                         history_max=settings.history_max)
     else:
         raise TaskError("bad_action", f"Unknown action {action!r}.")
@@ -428,8 +479,11 @@ def _check_change(task, action, changes, now, settings, by=None):
             check_schedule(changes["schedule"], now)
         if "target" in changes:
             check_target(changes["target"], settings, by)
+        kind = changes.get("kind", task["kind"])
+        if "kind" in changes and kind != task["kind"] and "payload" not in changes:
+            raise TaskError("missing_content", f"A {kind} task needs its content too.")
         if "payload" in changes:
-            check_payload(task["kind"], changes["payload"])
+            check_payload(kind, changes["payload"])
 
 
 def change(d, task_id, action, *, by, where, changes=None, now, settings):

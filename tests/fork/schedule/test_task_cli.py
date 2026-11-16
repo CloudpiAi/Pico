@@ -287,3 +287,57 @@ def test_unlisted_person_can_only_schedule_for_their_own_dm(env, monkeypatch):
     rc, out = run("add", "--ctx", ctx("C0TEAM0001", MEENA), "--kind", "reminder", "--to", "me", "--name", "n",
                   "--cron", "0 9 * * *", "--text", "x")
     assert rc == 0
+
+
+# ---------- one task per request (live 2026-11-13: add, remove, add, remove, add for one "weekly summary") ----------
+
+REMIND = ("--kind", "reminder", "--to", "me", "--name", "Stop dev", "--cron", "0 17 * * 5", "--text", "stop dev")
+
+
+def test_the_same_add_twice_in_one_message_saves_one_task(env):
+    run, ctx, _, d = env
+    c = ctx("D0RAVIDM01", RAVI)
+    _, first = run("add", "--ctx", c, *REMIND)
+    _, again = run("add", "--ctx", c, *REMIND)
+    assert first["code"] == "ok" and again["ok"] and again["code"] == "already_saved"
+    assert again["task"]["id"] == first["task"]["id"] and "reused" not in again["task"]
+    assert [t["id"] for t in tasks.active_tasks(d)] == [first["task"]["id"]]
+
+
+def test_the_same_task_from_a_new_message_is_a_new_task(env):
+    run, ctx, _, d = env
+    _, first = run("add", "--ctx", ctx("D0RAVIDM01", RAVI), *REMIND)
+    _, second = run("add", "--ctx", ctx("D0RAVIDM01", RAVI), *REMIND)
+    assert second["code"] == "ok" and second["task"]["id"] != first["task"]["id"]
+
+
+def test_a_task_made_for_this_message_is_edited_not_removed(env):
+    run, ctx, _, d = env
+    c = ctx("D0RAVIDM01", RAVI)
+    _, made = run("add", "--ctx", c, *REMIND)
+    tid = made["task"]["id"]
+    _, refused = run("remove", tid, "--ctx", c)
+    assert not refused["ok"] and refused["code"] == "made_for_this_message" and "edit" in refused["message"]
+    assert tasks.get(d, tid)["status"] == "active"
+    _, removed = run("remove", tid, "--ctx", ctx("D0RAVIDM01", RAVI))  # asked for in a later message: removed
+    assert removed["ok"] and tasks.get(d, tid)["status"] == "removed"
+
+
+def test_edit_changes_the_kind_with_its_new_content(env):
+    run, ctx, _, d = env
+    c = ctx("D0RAVIDM01", RAVI)
+    _, made = run("add", "--ctx", c, *REMIND)
+    tid = made["task"]["id"]
+    _, out = run("edit", tid, "--ctx", c, "--kind", "ask", "--question", "What changed most last week and why?")
+    assert out["ok"], out
+    t = tasks.get(d, tid)
+    assert t["kind"] == "ask" and t["payload"] == {"question": "What changed most last week and why?"}
+    assert [e["action"] for e in tasks.history(d, tid)][-2:] == ["kind_changed", "text_changed"]
+
+
+def test_a_new_kind_without_its_content_is_refused(env):
+    run, ctx, _, d = env
+    c = ctx("D0RAVIDM01", RAVI)
+    _, made = run("add", "--ctx", c, *REMIND)
+    _, out = run("edit", made["task"]["id"], "--ctx", c, "--kind", "ask")
+    assert not out["ok"] and tasks.get(d, made["task"]["id"])["kind"] == "reminder"
